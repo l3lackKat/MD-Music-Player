@@ -25,6 +25,7 @@
   import TrackInfo from "./lib/TrackInfo.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
+  import appIcon from "./assets/app-icon.png";
 
   // ---- Player ----
   let queue = $state<TrackMeta[]>([]);
@@ -519,11 +520,7 @@
   <!-- Top bar: output device and mode -->
   <header class="flex items-center gap-3 border-b border-line bg-panel px-5 py-3">
     <div class="mr-auto flex items-center gap-2.5">
-      <span class="grid h-7 w-7 place-items-center rounded-lg bg-accent/15 text-accent">
-        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="2.5" fill="currentColor" />
-        </svg>
-      </span>
+      <img src={appIcon} alt="" class="h-8 w-8" draggable="false" />
       <span class="text-[15px] font-semibold tracking-tight">MDMusic</span>
     </div>
 
