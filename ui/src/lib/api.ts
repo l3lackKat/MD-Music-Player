@@ -17,6 +17,15 @@ export interface OutputSettings {
   mode: OutputMode;
 }
 
+/** The Windows volume of the selected output device. */
+export interface DeviceVolume {
+  /** 0 to 1, on the same scale as the Windows slider. */
+  level: number;
+  muted: boolean;
+  /** The device applies the level itself, so it also works in exclusive mode. */
+  hardware: boolean;
+}
+
 export type SampleKind = { type: "pcm"; bits: number } | { type: "float" } | { type: "dsd" };
 
 export interface SignalPath {
@@ -112,6 +121,10 @@ export const api = {
   getOutput: () => invoke<OutputSettings>("get_output"),
   setOutput: (deviceId: string | null, mode: OutputMode) =>
     invoke<void>("set_output", { deviceId, mode }),
+  getVolume: () => invoke<DeviceVolume>("get_volume"),
+  /** Change the level (0 to 1), the mute, or both. Returns the new state. */
+  setVolume: (change: { level?: number; muted?: boolean }) =>
+    invoke<DeviceVolume>("set_volume", { level: change.level ?? null, muted: change.muted ?? null }),
   supportedExtensions: () => invoke<string[]>("supported_extensions"),
   playFiles: (paths: string[], index: number) => invoke<void>("play_files", { paths, index }),
   play: () => invoke<void>("play"),

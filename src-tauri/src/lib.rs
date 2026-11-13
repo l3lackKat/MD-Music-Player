@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use mdm_engine::{Command, DeviceInfo, Event, OutputMode, Player, WasapiBackend};
+use mdm_engine::{
+    Command, DeviceInfo, DeviceVolume, Event, OutputMode, Player, VolumeChange, WasapiBackend,
+};
 use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackMeta};
 use serde::Serialize;
 use tauri::http::{header, Response, StatusCode};
@@ -49,6 +51,25 @@ fn get_output(state: State<AppState>) -> OutputSettings {
 fn set_output(state: State<AppState>, device_id: Option<String>, mode: OutputMode) {
     *state.output.lock().unwrap() = OutputSettings { device_id: device_id.clone(), mode };
     state.player.send(Command::SetOutput(Box::new(WasapiBackend { device_id, mode })));
+}
+
+/// The Windows volume of the selected output device.
+#[tauri::command(async)]
+fn get_volume(state: State<'_, AppState>) -> CommandResult<DeviceVolume> {
+    let device_id = state.output.lock().unwrap().device_id.clone();
+    mdm_engine::get_volume(device_id.as_deref()).map_err(text)
+}
+
+/// Change the Windows volume of the selected output device. This sets the
+/// device's own level; the samples sent to it stay unchanged.
+#[tauri::command(async)]
+fn set_volume(
+    state: State<'_, AppState>,
+    level: Option<f32>,
+    muted: Option<bool>,
+) -> CommandResult<DeviceVolume> {
+    let device_id = state.output.lock().unwrap().device_id.clone();
+    mdm_engine::set_volume(device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
 }
 
 // ---- Transport -------------------------------------------------------------
@@ -275,6 +296,8 @@ pub fn run() {
             list_devices,
             get_output,
             set_output,
+            get_volume,
+            set_volume,
             supported_extensions,
             play_files,
             append_files,

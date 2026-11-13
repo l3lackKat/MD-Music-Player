@@ -43,6 +43,10 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 - **DoP markers are written at the device end** (`MarkerStamper`), not by the
   packer, so silence and audio share one unbroken marker sequence.
 - **A track the DAC cannot play is skipped with an error**, not converted.
+- **The volume bar is the device's Windows volume** (`output/volume.rs`,
+  `IAudioEndpointVolume`), never sample scaling, so it keeps bit-perfect.
+  It only works in exclusive mode when the device reports a hardware volume
+  (`DeviceVolume::hardware`); the UI warns otherwise.
 - **A playlist is folders plus single files.** Its tracks are the folders'
   audio (scanned each time, album order), then the single files in the order
   added, with duplicates dropped. A track that comes from a folder cannot be
@@ -108,6 +112,6 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 ## Not built yet
 
 SQLite library index and search, reordering playlists and the queue, removing
-from the queue, multi-select in track lists, repeat modes, cover thumbnails in lists, tags for DSF/DFF, media keys and tray, volume control,
+from the queue, multi-select in track lists, repeat modes, cover thumbnails in lists, tags for DSF/DFF, media keys and tray, software (sample-scaling) volume,
 automatic reconnect when the DAC is replugged, ASIO output for native DSD,
 remembering the output device between launches.

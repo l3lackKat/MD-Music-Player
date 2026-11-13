@@ -2,6 +2,7 @@
   // A list of tracks. Double-click a row to play from there; right-click
   // (or the menu key) for the track menu.
   import { formatTime, type TrackMeta } from "./api";
+  import SourceMark from "./SourceMark.svelte";
 
   let {
     tracks,
@@ -10,6 +11,7 @@
     onplay,
     onmenu,
     menuIndex = null,
+    source,
   }: {
     tracks: TrackMeta[];
     /** Path of the track being heard, to highlight its row. */
@@ -19,6 +21,8 @@
     onmenu: (index: number, x: number, y: number) => void;
     /** Row whose menu is open, kept highlighted while it is. */
     menuIndex?: number | null;
+    /** In a playlist: how each track got there. Draws a mark before the title. */
+    source?: (track: TrackMeta) => "folder" | "file";
   } = $props();
 </script>
 
@@ -52,7 +56,12 @@
       <span class="text-right tabular-nums {active ? 'text-accent' : 'text-muted'}">
         {active && playing ? "▶" : index + 1}
       </span>
-      <span class="truncate {active ? 'font-medium text-accent' : ''}">{track.title}</span>
+      <span class="flex min-w-0 items-center gap-2">
+        {#if source}
+          <SourceMark kind={source(track)} />
+        {/if}
+        <span class="truncate {active ? 'font-medium text-accent' : ''}">{track.title}</span>
+      </span>
       <span class="truncate text-muted">{track.artist ?? ""}</span>
       <span class="truncate text-muted">{track.album ?? ""}</span>
       <span class="text-right tabular-nums text-muted">

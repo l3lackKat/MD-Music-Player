@@ -60,7 +60,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     .map_err(|_| EngineError::Device("device enumeration crashed".into()))?
 }
 
-fn device_err(e: WasapiError) -> EngineError {
+pub(super) fn device_err(e: WasapiError) -> EngineError {
     if let WasapiError::Windows(w) = &e {
         let code = w.code();
         if code == AUDCLNT_E_DEVICE_IN_USE {

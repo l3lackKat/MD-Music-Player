@@ -6,6 +6,8 @@
 
 mod file_sink;
 #[cfg(windows)]
+mod volume;
+#[cfg(windows)]
 mod wasapi;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +21,8 @@ use crate::format::{FormatRequest, StreamFormat};
 use crate::Result;
 
 pub use file_sink::FileSink;
+#[cfg(windows)]
+pub use volume::{get_volume, set_volume, DeviceVolume, VolumeChange};
 #[cfg(windows)]
 pub use wasapi::{list_devices, WasapiBackend};
 

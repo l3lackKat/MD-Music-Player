@@ -18,7 +18,9 @@
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Cover from "./lib/Cover.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
+  import SourceMark from "./lib/SourceMark.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
+  import VolumeControl from "./lib/VolumeControl.svelte";
 
   // ---- Player ----
   let queue = $state<TrackMeta[]>([]);
@@ -32,6 +34,7 @@
   let devices = $state<DeviceInfo[]>([]);
   let deviceId = $state<string | null>(null);
   let mode = $state<OutputMode>("exclusive");
+  let volumeControl = $state<ReturnType<typeof VolumeControl>>();
 
   // ---- Playlists ----
   let playlists = $state<Playlist[]>([]);
@@ -158,6 +161,15 @@
   async function applyOutput() {
     error = null;
     await api.setOutput(deviceId, mode).catch(showError);
+    return volumeControl?.refresh();
+  }
+
+  /** Switch device, and say how loud the new one is set: each device keeps its own Windows volume. */
+  async function changeDevice() {
+    const volume = await applyOutput();
+    if (!volume) return;
+    const name = devices.find((d) => d.id === deviceId)?.name ?? "System default";
+    showNotice(`${name}: volume ${Math.round(volume.level * 100)}%${volume.muted ? ", muted" : ""}`);
   }
 
   async function refreshDevices() {
@@ -418,7 +430,8 @@
   }
 </script>
 
-<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} />
+<!-- Focus re-reads the volume, which may have been changed in Windows meanwhile. -->
+<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => volumeControl?.refresh()} />
 
 <div class="flex h-full flex-col">
   <!-- Top bar: output device and mode -->
@@ -437,7 +450,7 @@
       id="device"
       class="max-w-72 truncate rounded-lg border border-line bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent"
       bind:value={deviceId}
-      onchange={applyOutput}
+      onchange={changeDevice}
       onfocus={refreshDevices}
     >
       <option value={null}>System default</option>
@@ -583,6 +596,14 @@
             {:else if playlistTracks}
               {playlistTracks.length} {playlistTracks.length === 1 ? "track" : "tracks"}
               · {formatTime(playlistTracks.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
+              {#if playlistTracks.length > 0}
+                <span class="ml-3 inline-flex items-center gap-1.5 align-middle">
+                  <SourceMark kind="folder" /> from a folder
+                </span>
+                <span class="ml-3 inline-flex items-center gap-1.5 align-middle">
+                  <SourceMark kind="file" /> single file
+                </span>
+              {/if}
             {/if}
           </p>
 
@@ -637,6 +658,7 @@
             onplay={(index) => playTracks(playlistTracks, index)}
             onmenu={(index, x, y) => openTrackMenu(playlistTracks, index, x, y)}
             menuIndex={menu?.row ?? null}
+            source={(track) => (playlist && holdsFile(playlist, track.path) ? "file" : "folder")}
           />
         {:else if playlistTracks && scanningId !== playlist.id}
           <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found for this playlist.</p>
@@ -797,6 +819,7 @@
             {signalPath.bit_perfect ? "Bit-perfect" : signalPath.exclusive ? "Exclusive" : "Shared"}
           </span>
         {/if}
+        <VolumeControl bind:this={volumeControl} exclusive={mode === "exclusive"} onerror={showError} />
         <button
           class="grid h-8 w-8 shrink-0 place-items-center rounded-lg hover:bg-raised {showPanel
             ? 'text-accent'
