@@ -11,6 +11,7 @@
     type DeviceInfo,
     type EqSettings,
     type OutputMode,
+    type OutputSettings,
     type Playlist,
     type PlayState,
     type SignalPath,
@@ -36,7 +37,12 @@
   // ---- Output ----
   let devices = $state<DeviceInfo[]>([]);
   let deviceId = $state<string | null>(null);
+  /** The mode in use, which is shared while the device cannot do exclusive. */
   let mode = $state<OutputMode>("exclusive");
+  /** The mode the user picked. */
+  let wantedMode = $state<OutputMode>("exclusive");
+  /** Exclusive needs a hardware volume, else the level is stuck at full. */
+  let exclusiveAvailable = $state(true);
   let volumeControl = $state<ReturnType<typeof VolumeControl>>();
 
   // ---- Playlists ----
@@ -166,18 +172,52 @@
 
   // ---- Output ----
 
-  async function applyOutput() {
+  function takeOutput(output: OutputSettings) {
+    deviceId = output.device_id;
+    mode = output.mode;
+    wantedMode = output.wanted;
+    exclusiveAvailable = output.exclusive_available;
+  }
+
+  /** Open the output; `null` if that failed. */
+  async function applyOutput(): Promise<OutputSettings | null> {
     error = null;
-    await api.setOutput(deviceId, mode).catch(showError);
-    return volumeControl?.refresh();
+    try {
+      const output = await api.setOutput(deviceId, wantedMode);
+      takeOutput(output);
+      return output;
+    } catch (e) {
+      showError(e);
+      return null;
+    }
+  }
+
+  /** What to tell the user about a device just opened, if anything stands out. */
+  function outputNotice(output: OutputSettings, name: string): string | null {
+    const parts: string[] = [];
+    if (output.volume_lowered) parts.push("was at 100%, turned down to 10% to be safe");
+    if (output.wanted === "exclusive" && !output.exclusive_available)
+      parts.push("has no adjustable hardware volume, so shared mode is used");
+    return parts.length ? `${name} ${parts.join("; ")}` : null;
   }
 
   /** Switch device, and say how loud the new one is set: each device keeps its own Windows volume. */
   async function changeDevice() {
-    const volume = await applyOutput();
-    if (!volume) return;
+    const output = await applyOutput();
+    const volume = await volumeControl?.refresh();
     const name = devices.find((d) => d.id === deviceId)?.name ?? "System default";
-    showNotice(`${name}: volume ${Math.round(volume.level * 100)}%${volume.muted ? ", muted" : ""}`);
+    const notice = output && outputNotice(output, name);
+    if (notice) showNotice(notice);
+    else if (volume) showNotice(`${name}: volume ${Math.round(volume.level * 100)}%${volume.muted ? ", muted" : ""}`);
+  }
+
+  /** On focus: re-read the volume, and re-check exclusive if the device changed meanwhile (e.g. a new Windows default). */
+  async function onWindowFocus() {
+    const volume = await volumeControl?.refresh();
+    if ((volume?.hardware ?? false) !== exclusiveAvailable) {
+      await applyOutput();
+      await volumeControl?.refresh();
+    }
   }
 
   async function refreshDevices() {
@@ -383,8 +423,9 @@
     const cleanups: (() => void)[] = [];
     (async () => {
       const output = await api.getOutput();
-      deviceId = output.device_id;
-      mode = output.mode;
+      takeOutput(output);
+      const notice = outputNotice(output, "The output device");
+      if (notice) showNotice(notice);
       playlists = await api.playlists();
       try {
         shuffle = localStorage.getItem("shuffle") === "1";
@@ -440,7 +481,7 @@
 </script>
 
 <!-- Focus re-reads the volume, which may have been changed in Windows meanwhile. -->
-<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => volumeControl?.refresh()} />
+<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => void onWindowFocus()} />
 
 <div class="flex h-full flex-col">
   <!-- Top bar: output device and mode -->
@@ -471,15 +512,19 @@
     <div class="flex rounded-lg border border-line bg-raised p-0.5 text-sm" role="group" aria-label="Output mode">
       {#each ["exclusive", "shared"] as const as option}
         <button
-          class="rounded-md px-3 py-1 capitalize transition-colors {mode === option
+          class="rounded-md px-3 py-1 capitalize transition-colors disabled:cursor-not-allowed disabled:opacity-40 {mode ===
+          option
             ? 'bg-accent/20 text-accent'
-            : 'text-muted hover:text-ink'}"
+            : 'text-muted enabled:hover:text-ink'}"
+          disabled={option === "exclusive" && !exclusiveAvailable}
           title={option === "exclusive"
-            ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
+            ? exclusiveAvailable
+              ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
+              : "Unavailable: this device has no adjustable hardware volume, so in exclusive mode it would play at full volume. Choose a device with a hardware volume to use exclusive mode."
             : "Goes through the Windows mixer, other apps keep playing"}
           onclick={() => {
-            mode = option;
-            void applyOutput();
+            wantedMode = option;
+            void applyOutput().then(() => volumeControl?.refresh());
           }}
         >
           {option}

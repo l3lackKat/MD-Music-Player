@@ -51,8 +51,17 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 - **A track the DAC cannot play is skipped with an error**, not converted.
 - **The volume bar is the device's Windows volume** (`output/volume.rs`,
   `IAudioEndpointVolume`), never sample scaling, so it keeps bit-perfect.
-  It only works in exclusive mode when the device reports a hardware volume
-  (`DeviceVolume::hardware`); the UI warns otherwise.
+  It only works in exclusive mode when the device reports an adjustable
+  hardware volume (`DeviceVolume::hardware`; a range fixed at one level counts
+  as none). Without one, `set_output` (`OutputSettings::resolve`) uses shared
+  mode instead and the UI disables Exclusive. The user's pick (`wanted`) is
+  kept, so exclusive comes back on a device that has a hardware volume.
+  Changes made outside the app (Windows mixer, volume keys, the DAC) reach the
+  UI through `watch_volume` (`IAudioEndpointVolumeCallback`) as the
+  `volume://changed` event; `set_output` moves the watch to the new device.
+  A device found at 100% at launch or when switched to is turned down to 10%
+  before its stream opens (`FULL_LEVEL`/`SAFE_LEVEL` in `src-tauri/src/lib.rs`),
+  since Windows often resets USB DACs to 100%. Changing only the mode does not.
 - **A playlist is folders plus single files.** Its tracks are the folders'
   audio (scanned each time, album order), then the single files in the order
   added, with duplicates dropped. A track that comes from a folder cannot be
