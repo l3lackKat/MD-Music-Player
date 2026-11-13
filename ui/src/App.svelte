@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
@@ -11,6 +11,7 @@
     type DeviceInfo,
     type EqSettings,
     type OutputMode,
+    type OutputSettings,
     type Playlist,
     type PlayState,
     type SignalPath,
@@ -24,6 +25,7 @@
   import TrackInfo from "./lib/TrackInfo.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
+  import appIcon from "./assets/app-icon.png";
 
   // ---- Player ----
   let queue = $state<TrackMeta[]>([]);
@@ -36,7 +38,12 @@
   // ---- Output ----
   let devices = $state<DeviceInfo[]>([]);
   let deviceId = $state<string | null>(null);
+  /** The mode in use, which is shared while the device cannot do exclusive. */
   let mode = $state<OutputMode>("exclusive");
+  /** The mode the user picked. */
+  let wantedMode = $state<OutputMode>("exclusive");
+  /** Exclusive needs a hardware volume, else the level is stuck at full. */
+  let exclusiveAvailable = $state(true);
   let volumeControl = $state<ReturnType<typeof VolumeControl>>();
 
   // ---- Playlists ----
@@ -68,7 +75,39 @@
   // While the thumb is held, the bar follows the pointer, not the player.
   let scrubMs = $state<number | null>(null);
 
-  const shownMs = $derived(scrubMs ?? positionMs);
+  // The player reports the position every 100 ms. Between reports the bar runs on
+  // the clock from the last one, so it moves every frame instead of in steps.
+  /** The last reported position and when it arrived (`performance.now()`). */
+  let anchor = { ms: 0, at: 0 };
+  let smoothMs = $state(0);
+  /** How far past the last report the bar may run before it waits for the next one. */
+  const AHEAD_LIMIT_MS = 250;
+  /** A report this far behind the bar is jitter: the bar holds instead of stepping back. */
+  const JITTER_MS = 400;
+
+  function placePosition(ms: number, jump = false) {
+    positionMs = ms;
+    anchor = { ms, at: performance.now() };
+    if (jump || playState !== "playing") smoothMs = ms;
+  }
+
+  $effect(() => {
+    if (playState !== "playing") {
+      smoothMs = positionMs;
+      return;
+    }
+    anchor = { ms: untrack(() => positionMs), at: performance.now() };
+    let frame = requestAnimationFrame(function step(now) {
+      const next = anchor.ms + Math.min(now - anchor.at, AHEAD_LIMIT_MS);
+      const end = durationMs ?? Infinity;
+      const held = next < smoothMs && smoothMs - next < JITTER_MS;
+      smoothMs = Math.min(held ? smoothMs : next, end);
+      frame = requestAnimationFrame(step);
+    });
+    return () => cancelAnimationFrame(frame);
+  });
+
+  const shownMs = $derived(scrubMs ?? smoothMs);
   const fill = $derived(durationMs ? Math.min(100, (shownMs / durationMs) * 100) : 0);
   const currentTrack = $derived(currentIndex !== null ? (queue[currentIndex] ?? null) : null);
   const playlist = $derived(view === "queue" ? null : (playlists.find((p) => p.id === view) ?? null));
@@ -148,12 +187,12 @@
     queue = [];
     currentIndex = null;
     signalPath = null;
-    positionMs = 0;
+    placePosition(0, true);
     durationMs = null;
   }
 
   async function seekTo(ms: number) {
-    positionMs = ms;
+    placePosition(ms, true);
     await api.seek(ms).catch(showError);
   }
 
@@ -166,18 +205,52 @@
 
   // ---- Output ----
 
-  async function applyOutput() {
+  function takeOutput(output: OutputSettings) {
+    deviceId = output.device_id;
+    mode = output.mode;
+    wantedMode = output.wanted;
+    exclusiveAvailable = output.exclusive_available;
+  }
+
+  /** Open the output; `null` if that failed. */
+  async function applyOutput(): Promise<OutputSettings | null> {
     error = null;
-    await api.setOutput(deviceId, mode).catch(showError);
-    return volumeControl?.refresh();
+    try {
+      const output = await api.setOutput(deviceId, wantedMode);
+      takeOutput(output);
+      return output;
+    } catch (e) {
+      showError(e);
+      return null;
+    }
+  }
+
+  /** What to tell the user about a device just opened, if anything stands out. */
+  function outputNotice(output: OutputSettings, name: string): string | null {
+    const parts: string[] = [];
+    if (output.volume_lowered) parts.push("was at 100%, turned down to 10% to be safe");
+    if (output.wanted === "exclusive" && !output.exclusive_available)
+      parts.push("has no adjustable hardware volume, so shared mode is used");
+    return parts.length ? `${name} ${parts.join("; ")}` : null;
   }
 
   /** Switch device, and say how loud the new one is set: each device keeps its own Windows volume. */
   async function changeDevice() {
-    const volume = await applyOutput();
-    if (!volume) return;
+    const output = await applyOutput();
+    const volume = await volumeControl?.refresh();
     const name = devices.find((d) => d.id === deviceId)?.name ?? "System default";
-    showNotice(`${name}: volume ${Math.round(volume.level * 100)}%${volume.muted ? ", muted" : ""}`);
+    const notice = output && outputNotice(output, name);
+    if (notice) showNotice(notice);
+    else if (volume) showNotice(`${name}: volume ${Math.round(volume.level * 100)}%${volume.muted ? ", muted" : ""}`);
+  }
+
+  /** On focus: re-read the volume, and re-check exclusive if the device changed meanwhile (e.g. a new Windows default). */
+  async function onWindowFocus() {
+    const volume = await volumeControl?.refresh();
+    if ((volume?.hardware ?? false) !== exclusiveAvailable) {
+      await applyOutput();
+      await volumeControl?.refresh();
+    }
   }
 
   async function refreshDevices() {
@@ -383,8 +456,9 @@
     const cleanups: (() => void)[] = [];
     (async () => {
       const output = await api.getOutput();
-      deviceId = output.device_id;
-      mode = output.mode;
+      takeOutput(output);
+      const notice = outputNotice(output, "The output device");
+      if (notice) showNotice(notice);
       playlists = await api.playlists();
       try {
         shuffle = localStorage.getItem("shuffle") === "1";
@@ -401,11 +475,11 @@
             signalPath = t.signal_path;
           },
           position: (p) => {
-            positionMs = p.ms;
+            placePosition(p.ms);
             if (p.duration_ms !== null || playState !== "stopped") durationMs = p.duration_ms;
           },
           error: showError,
-          queueEnded: () => (positionMs = 0),
+          queueEnded: () => placePosition(0, true),
         }),
       );
       cleanups.push(
@@ -440,17 +514,13 @@
 </script>
 
 <!-- Focus re-reads the volume, which may have been changed in Windows meanwhile. -->
-<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => volumeControl?.refresh()} />
+<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => void onWindowFocus()} />
 
 <div class="flex h-full flex-col">
   <!-- Top bar: output device and mode -->
   <header class="flex items-center gap-3 border-b border-line bg-panel px-5 py-3">
     <div class="mr-auto flex items-center gap-2.5">
-      <span class="grid h-7 w-7 place-items-center rounded-lg bg-accent/15 text-accent">
-        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="2.5" fill="currentColor" />
-        </svg>
-      </span>
+      <img src={appIcon} alt="" class="h-8 w-8" draggable="false" />
       <span class="text-[15px] font-semibold tracking-tight">MDMusic</span>
     </div>
 
@@ -471,15 +541,19 @@
     <div class="flex rounded-lg border border-line bg-raised p-0.5 text-sm" role="group" aria-label="Output mode">
       {#each ["exclusive", "shared"] as const as option}
         <button
-          class="rounded-md px-3 py-1 capitalize transition-colors {mode === option
+          class="rounded-md px-3 py-1 capitalize transition-colors disabled:cursor-not-allowed disabled:opacity-40 {mode ===
+          option
             ? 'bg-accent/20 text-accent'
-            : 'text-muted hover:text-ink'}"
+            : 'text-muted enabled:hover:text-ink'}"
+          disabled={option === "exclusive" && !exclusiveAvailable}
           title={option === "exclusive"
-            ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
+            ? exclusiveAvailable
+              ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
+              : "Unavailable: this device has no adjustable hardware volume, so in exclusive mode it would play at full volume. Choose a device with a hardware volume to use exclusive mode."
             : "Goes through the Windows mixer, other apps keep playing"}
           onclick={() => {
-            mode = option;
-            void applyOutput();
+            wantedMode = option;
+            void applyOutput().then(() => volumeControl?.refresh());
           }}
         >
           {option}
@@ -742,12 +816,12 @@
         type="range"
         min="0"
         max={durationMs ?? 0}
-        step="100"
+        step="any"
         value={shownMs}
         style="--fill: {fill}%"
         disabled={!durationMs || playState === "stopped"}
         aria-label="Seek"
-        oninput={(e) => (scrubMs = Number(e.currentTarget.value))}
+        oninput={(e) => (scrubMs = Math.round(Number(e.currentTarget.value)))}
         onchange={commitSeek}
       />
       <span class="w-12 text-xs tabular-nums text-muted">{durationMs ? formatTime(durationMs) : "–:––"}</span>

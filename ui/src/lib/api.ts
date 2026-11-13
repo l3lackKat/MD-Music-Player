@@ -14,7 +14,14 @@ export interface DeviceInfo {
 
 export interface OutputSettings {
   device_id: string | null;
+  /** The mode in use. */
   mode: OutputMode;
+  /** The mode the user picked; differs from `mode` while exclusive is unavailable. */
+  wanted: OutputMode;
+  /** The device's volume works in exclusive mode. Without it, shared mode is used. */
+  exclusive_available: boolean;
+  /** The device was at 100% when chosen (or at launch) and was turned down to 10% first. */
+  volume_lowered: boolean;
 }
 
 /** The Windows volume of the selected output device. */
@@ -165,7 +172,7 @@ export const api = {
   listDevices: () => invoke<DeviceInfo[]>("list_devices"),
   getOutput: () => invoke<OutputSettings>("get_output"),
   setOutput: (deviceId: string | null, mode: OutputMode) =>
-    invoke<void>("set_output", { deviceId, mode }),
+    invoke<OutputSettings>("set_output", { deviceId, mode }),
   getVolume: () => invoke<DeviceVolume>("get_volume"),
   /** Change the level (0 to 1), the mute, or both. Returns the new state. */
   setVolume: (change: { level?: number; muted?: boolean }) =>
@@ -198,6 +205,11 @@ export async function listenPlayer(handlers: PlayerHandlers): Promise<UnlistenFn
     listen("player://queue-ended", () => handlers.queueEnded()),
   ]);
   return () => unlisten.forEach((u) => u());
+}
+
+/** Called whenever the selected device's Windows volume changes, wherever it was changed. */
+export function listenVolume(handler: (volume: DeviceVolume) => void): Promise<UnlistenFn> {
+  return listen<DeviceVolume>("volume://changed", (e) => handler(e.payload));
 }
 
 /** "3:07" or "1:02:45". */

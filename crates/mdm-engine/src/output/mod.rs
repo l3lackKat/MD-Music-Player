@@ -22,7 +22,7 @@ use crate::Result;
 
 pub use file_sink::FileSink;
 #[cfg(windows)]
-pub use volume::{get_volume, set_volume, DeviceVolume, VolumeChange};
+pub use volume::{get_volume, set_volume, watch_volume, DeviceVolume, VolumeChange, VolumeWatch};
 #[cfg(windows)]
 pub use wasapi::{list_devices, WasapiBackend};
 

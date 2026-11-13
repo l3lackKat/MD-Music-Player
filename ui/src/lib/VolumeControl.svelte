@@ -3,7 +3,7 @@
   // own level, the one in the Windows volume mixer, so the samples sent to
   // the DAC stay untouched and bit-perfect playback is kept.
   import { onMount } from "svelte";
-  import { api, type DeviceVolume } from "./api";
+  import { api, listenVolume, type DeviceVolume } from "./api";
 
   let { exclusive, onerror }: { exclusive: boolean; onerror: (e: unknown) => void } = $props();
 
@@ -28,7 +28,15 @@
     return volume;
   }
 
-  onMount(() => void refresh());
+  onMount(() => {
+    void refresh();
+    // Follow changes made in Windows, by volume keys or on the DAC. While the
+    // thumb is held, the drag decides; the last event after release still lands.
+    const unlisten = listenVolume((v) => {
+      if (dragLevel === null) volume = v;
+    });
+    return () => void unlisten.then((u) => u());
+  });
 
   // Dragging fires many inputs: keep one request in flight and send only the latest level.
   let pending: number | null = null;

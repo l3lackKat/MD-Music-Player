@@ -20,7 +20,10 @@ pub use format::{Container, FormatRequest, StreamFormat};
 pub use mdm_decode::{SampleKind, SourceInfo};
 pub use output::{Backend, DeviceInfo, FileSink, OutputMode};
 #[cfg(windows)]
-pub use output::{get_volume, list_devices, set_volume, DeviceVolume, VolumeChange, WasapiBackend};
+pub use output::{
+    get_volume, list_devices, set_volume, watch_volume, DeviceVolume, VolumeChange, VolumeWatch,
+    WasapiBackend,
+};
 pub use player::{Command, Event, PlayState, Player, SignalPath};
 
 #[derive(Debug, thiserror::Error)]

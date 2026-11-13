@@ -2,31 +2,84 @@
 //! `mdm-library`.
 //!
 //! The UI calls the commands below, listens for `player://…` events
-//! forwarded from the player thread, and loads cover art through the
-//! `cover` URL scheme.
+//! forwarded from the player thread, listens for `volume://changed` when the
+//! device's Windows volume changes, and loads cover art through the `cover`
+//! URL scheme.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mdm_engine::{
     Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, VolumeChange,
-    WasapiBackend,
+    VolumeWatch, WasapiBackend,
 };
 use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
 use serde::Serialize;
 use tauri::http::{header, Response, StatusCode};
-use tauri::{Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Debug, Clone, Serialize)]
 struct OutputSettings {
     /// `None` follows the Windows default device.
     device_id: Option<String>,
+    /// The mode in use.
     mode: OutputMode,
+    /// The mode the user picked. It differs from `mode` while exclusive is
+    /// unavailable, and comes back when a device that allows it is chosen.
+    wanted: OutputMode,
+    /// The device has a volume control that works in exclusive mode. Without
+    /// one, the volume would be stuck at full in exclusive mode, so shared
+    /// mode is used instead.
+    exclusive_available: bool,
+    /// The device was at full volume when it was chosen (or at launch), so it
+    /// was turned down to `SAFE_LEVEL` before anything played.
+    volume_lowered: bool,
+}
+
+/// At or above this, a device just chosen counts as being at full volume.
+/// Windows often puts USB DACs back to 100% (on replug, driver reload or
+/// reboot), which is far too loud for headphones on a DAC with real gain.
+const FULL_LEVEL: f32 = 0.995;
+/// What a device found at full volume is turned down to.
+const SAFE_LEVEL: f32 = 0.10;
+
+impl OutputSettings {
+    /// Settings for `device_id`, falling back to shared mode when the device
+    /// has no adjustable hardware volume (or its volume cannot be read).
+    ///
+    /// With `guard_full`, a device at full volume is first turned down to
+    /// `SAFE_LEVEL`, before the stream opens.
+    fn resolve(device_id: Option<String>, wanted: OutputMode, guard_full: bool) -> Self {
+        let mut volume = mdm_engine::get_volume(device_id.as_deref());
+        let mut volume_lowered = false;
+        if let Ok(v) = &volume {
+            if guard_full && v.level >= FULL_LEVEL {
+                let change = VolumeChange { level: Some(SAFE_LEVEL), muted: None };
+                match mdm_engine::set_volume(device_id.as_deref(), change) {
+                    Ok(lowered) => {
+                        volume = Ok(lowered);
+                        volume_lowered = true;
+                    }
+                    Err(e) => tracing::warn!("could not turn down a device at full volume: {e}"),
+                }
+            }
+        }
+        let exclusive_available = volume.map(|v| v.hardware).unwrap_or(false);
+        let mode = if exclusive_available { wanted } else { OutputMode::Shared };
+        OutputSettings { device_id, mode, wanted, exclusive_available, volume_lowered }
+    }
+
+    fn backend(&self) -> WasapiBackend {
+        WasapiBackend { device_id: self.device_id.clone(), mode: self.mode }
+    }
 }
 
 struct AppState {
     player: Player,
     output: Mutex<OutputSettings>,
+    /// Follows the selected device's Windows volume, so the UI moves when it
+    /// is changed in Windows, by volume keys or on the DAC.
+    volume_watch: Mutex<Option<VolumeWatch>>,
     playlists: Mutex<PlaylistStore>,
     eq: Mutex<EqSettings>,
     eq_path: PathBuf,
@@ -50,10 +103,42 @@ fn get_output(state: State<AppState>) -> OutputSettings {
     state.output.lock().unwrap().clone()
 }
 
-#[tauri::command]
-fn set_output(state: State<AppState>, device_id: Option<String>, mode: OutputMode) {
-    *state.output.lock().unwrap() = OutputSettings { device_id: device_id.clone(), mode };
-    state.player.send(Command::SetOutput(Box::new(WasapiBackend { device_id, mode })));
+/// Choose the output. Exclusive mode is only used on a device whose volume
+/// works in it; otherwise shared mode is used, and the returned settings say so.
+/// Switching to a device at full volume turns it down first; changing only
+/// the mode leaves the level alone.
+#[tauri::command(async)]
+fn set_output(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    device_id: Option<String>,
+    mode: OutputMode,
+) -> OutputSettings {
+    let device_changed = state.output.lock().unwrap().device_id != device_id;
+    let output = OutputSettings::resolve(device_id, mode, device_changed);
+    state.player.send(Command::SetOutput(Box::new(output.backend())));
+    watch_volume(&app, &state, output.device_id.as_deref());
+    *state.output.lock().unwrap() = output.clone();
+    output
+}
+
+/// Emit `volume://changed` whenever `device_id`'s volume changes, replacing
+/// the watch on the previous device.
+fn watch_volume(app: &AppHandle, state: &AppState, device_id: Option<&str>) {
+    let mut watch = state.volume_watch.lock().unwrap();
+    // Unregister from the old device before listening to the new one.
+    *watch = None;
+    let handle = app.clone();
+    let emit = move |volume: DeviceVolume| {
+        if let Err(e) = handle.emit("volume://changed", volume) {
+            tracing::warn!("could not emit a volume event: {e}");
+        }
+    };
+    match mdm_engine::watch_volume(device_id, emit) {
+        Ok(w) => *watch = Some(w),
+        // The UI still re-reads the volume on focus.
+        Err(e) => tracing::warn!("not following the device volume: {e}"),
+    }
 }
 
 /// The Windows volume of the selected output device.
@@ -312,24 +397,24 @@ pub fn run() {
             std::thread::spawn(move || responder.respond(cover_response(&uri_path)));
         })
         .setup(|app| {
-            let output = OutputSettings { device_id: None, mode: OutputMode::Exclusive };
-            let player = Player::new(Box::new(WasapiBackend {
-                device_id: output.device_id.clone(),
-                mode: output.mode,
-            }));
+            let output = OutputSettings::resolve(None, OutputMode::Exclusive, true);
+            let player = Player::new(Box::new(output.backend()));
             let events = player.events();
             let data_dir = app.path().app_data_dir()?;
             let playlists = open_playlists(&data_dir.join("playlists.json"));
             let eq_path = data_dir.join("eq.json");
             let eq = load_eq(&eq_path);
             player.send(Command::SetEq(eq.clone()));
+            let device_id = output.device_id.clone();
             app.manage(AppState {
                 player,
                 output: Mutex::new(output),
+                volume_watch: Mutex::new(None),
                 playlists: Mutex::new(playlists),
                 eq: Mutex::new(eq),
                 eq_path,
             });
+            watch_volume(app.handle(), &app.state::<AppState>(), device_id.as_deref());
 
             // Forward player events to the UI for as long as the player lives.
             let handle = app.handle().clone();
@@ -378,7 +463,9 @@ pub fn run() {
         .run(|app, event| {
             // Release the audio device before the process goes away.
             if let tauri::RunEvent::Exit = event {
-                app.state::<AppState>().player.send(Command::Stop);
+                let state = app.state::<AppState>();
+                state.player.send(Command::Stop);
+                state.volume_watch.lock().unwrap().take();
             }
         });
 }
