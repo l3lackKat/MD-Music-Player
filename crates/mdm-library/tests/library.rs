@@ -6,7 +6,9 @@ use lofty::config::WriteOptions;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::tag::{Tag, TagType};
-use mdm_library::{expand_paths, read_cover, read_lyrics, read_meta, scan_folder, PlaylistStore};
+use mdm_library::{
+    expand_paths, read_cover, read_details, read_lyrics, read_meta, scan_folder, PlaylistStore,
+};
 
 /// A fresh, empty folder under the system temp directory.
 fn temp_dir(name: &str) -> PathBuf {
@@ -106,6 +108,51 @@ fn tags_cover_and_lyrics_are_read() {
     assert!(lyrics.synced);
     assert_eq!(lyrics.lines[0].time_ms, Some(1000));
     assert_eq!(lyrics.lines[0].text, "Timed line");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn details_list_format_tags_and_pictures() {
+    let dir = temp_dir("details");
+    let tagged = dir.join("x.wav");
+    write_tagged(
+        &tagged,
+        Tags {
+            title: "Blue Song",
+            artist: "The Band",
+            album: "First",
+            track: 3,
+            lyrics: Some("Line one\nLine two"),
+            cover: Some(b"\x89PNG fake image bytes"),
+        },
+    );
+
+    let d = read_details(&tagged);
+    assert_eq!(d.file_name, "x.wav");
+    assert!(d.size_bytes.unwrap() > 32_000);
+    assert!(d.modified_ms.is_some());
+    assert_eq!(d.audio.container.as_deref(), Some("WAV"));
+    assert!(d.audio.codec.as_deref().is_some_and(|c| c.starts_with("PCM")), "{:?}", d.audio);
+    assert_eq!(d.audio.bits, Some(16));
+    assert_eq!(d.audio.sample_rate, Some(8000));
+    assert_eq!(d.audio.channels, Some(2));
+    assert_eq!(d.audio.duration_ms, Some(1000));
+
+    let fields: Vec<(&str, &str)> =
+        d.tags.iter().flat_map(|t| &t.fields).map(|f| (f.key.as_str(), f.value.as_str())).collect();
+    assert!(fields.contains(&("Track title", "Blue Song")), "{fields:?}");
+    assert!(fields.contains(&("Track artist", "The Band")), "{fields:?}");
+    assert_eq!(d.pictures.len(), 1);
+    assert_eq!(d.pictures[0].mime.as_deref(), Some("image/png"));
+    assert_eq!(d.lyrics.as_ref().map(|l| l.lines), Some(2));
+
+    // A file nobody can read still gets details, just fewer of them.
+    let broken = dir.join("broken.flac");
+    std::fs::write(&broken, b"not audio").unwrap();
+    let d = read_details(&broken);
+    assert_eq!(d.file_name, "broken.flac");
+    assert!(d.audio.error.is_some());
+    assert!(d.tags.is_empty());
     std::fs::remove_dir_all(dir).ok();
 }
 

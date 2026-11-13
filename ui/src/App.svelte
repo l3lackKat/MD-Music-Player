@@ -9,6 +9,7 @@
     formatRate,
     formatTime,
     type DeviceInfo,
+    type EqSettings,
     type OutputMode,
     type Playlist,
     type PlayState,
@@ -17,8 +18,10 @@
   } from "./lib/api";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Cover from "./lib/Cover.svelte";
+  import EqPanel from "./lib/EqPanel.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
   import SourceMark from "./lib/SourceMark.svelte";
+  import TrackInfo from "./lib/TrackInfo.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
 
@@ -47,6 +50,9 @@
   let renaming = $state<string | null>(null);
 
   let shuffle = $state(false);
+  /** The equalizer, as last saved. `null` until loaded. */
+  let eq = $state<EqSettings | null>(null);
+  let showEq = $state(false);
 
   // ---- Window ----
   /** The open track menu: where, what, and which row it belongs to. */
@@ -55,6 +61,8 @@
   let notice = $state<string | null>(null);
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let error = $state<string | null>(null);
+  /** The track whose info dialog is open. */
+  let infoTrack = $state<TrackMeta | null>(null);
   let dragging = $state(false);
   let showPanel = $state(true);
   // While the thumb is held, the bar follows the pointer, not the player.
@@ -343,7 +351,7 @@
         action: () => removeFromPlaylist(here.id, track.path),
       });
     }
-    items.push("separator", {
+    items.push("separator", { label: "Track info", action: () => (infoTrack = track) }, {
       label: "Show in File Explorer",
       action: () => api.showInFolder(track.path).catch(showError),
     });
@@ -382,6 +390,7 @@
         shuffle = localStorage.getItem("shuffle") === "1";
       } catch {}
       await api.setShuffle(shuffle);
+      eq = await api.getEq();
       await refreshDevices();
 
       cleanups.push(
@@ -812,13 +821,34 @@
               : 'bg-warn/15 text-warn'}"
             title={signalPath.bit_perfect
               ? "Every sample reaches the DAC unchanged"
-              : signalPath.exclusive
-                ? "The source is lossy or floating point, so there are no original samples to preserve"
-                : "Shared mode: Windows resamples and mixes the audio"}
+              : signalPath.eq
+                ? "The equalizer is changing the samples. Turn it off for bit-perfect playback"
+                : signalPath.exclusive
+                  ? "The source is lossy or floating point, so there are no original samples to preserve"
+                  : "Shared mode: Windows resamples and mixes the audio"}
           >
-            {signalPath.bit_perfect ? "Bit-perfect" : signalPath.exclusive ? "Exclusive" : "Shared"}
+            {signalPath.bit_perfect
+              ? "Bit-perfect"
+              : signalPath.eq
+                ? "EQ on"
+                : signalPath.exclusive
+                  ? "Exclusive"
+                  : "Shared"}
           </span>
         {/if}
+        <button
+          class="relative grid h-8 shrink-0 place-items-center rounded-lg px-2 text-xs font-semibold tracking-wide hover:bg-raised disabled:opacity-40 {showEq ||
+          eq?.enabled
+            ? 'text-accent'
+            : 'text-muted hover:text-ink'}"
+          disabled={eq === null}
+          aria-pressed={showEq}
+          title={eq?.enabled ? "Equalizer is on: PCM is not bit-perfect" : "Equalizer (off)"}
+          onclick={() => (showEq = !showEq)}
+        >
+          EQ
+          {#if eq?.enabled}<span class="absolute bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
+        </button>
         <VolumeControl bind:this={volumeControl} exclusive={mode === "exclusive"} onerror={showError} />
         <button
           class="grid h-8 w-8 shrink-0 place-items-center rounded-lg hover:bg-raised {showPanel
@@ -836,6 +866,14 @@
     </div>
   </footer>
 </div>
+
+{#if showEq && eq}
+  <EqPanel bind:settings={eq} onclose={() => (showEq = false)} onerror={showError} />
+{/if}
+
+{#if infoTrack}
+  <TrackInfo track={infoTrack} onclose={() => (infoTrack = null)} onerror={showError} />
+{/if}
 
 {#if menu}
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />

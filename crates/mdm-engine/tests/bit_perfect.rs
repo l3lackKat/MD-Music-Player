@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use mdm_engine::{Command, Container, Event, FileSink, Player};
+use mdm_engine::{Command, Container, EqSettings, Event, FileSink, Player, SignalPath};
 
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mdm-engine-{}-{name}", std::process::id()))
@@ -43,19 +43,31 @@ fn write_wav(path: &Path, bits: u16, rate: u32, samples: &[i32]) {
 /// Play `paths` to the end and return the bytes the sink received plus the
 /// queue indexes announced on the way.
 fn play_to_file(paths: Vec<PathBuf>, sink: FileSink) -> (Vec<u8>, Vec<usize>) {
+    let (bytes, tracks) = play_to_file_with(paths, sink, Vec::new());
+    assert!(tracks.iter().all(|(_, p)| p.bit_perfect && !p.eq));
+    (bytes, tracks.into_iter().map(|(index, _)| index).collect())
+}
+
+/// Like `play_to_file`, sending `setup` before the queue starts, and
+/// returning each announced track with its signal path.
+fn play_to_file_with(
+    paths: Vec<PathBuf>,
+    sink: FileSink,
+    setup: Vec<Command>,
+) -> (Vec<u8>, Vec<(usize, SignalPath)>) {
     let out = sink.path.clone();
     std::fs::remove_file(&out).ok();
     let player = Player::new(Box::new(sink));
     let events = player.events();
+    for command in setup {
+        player.send(command);
+    }
     player.send(Command::Load { paths, index: 0 });
 
     let mut tracks = Vec::new();
     loop {
         match events.recv_timeout(Duration::from_secs(20)).expect("playback did not finish") {
-            Event::Track { index, signal_path, .. } => {
-                assert!(signal_path.bit_perfect);
-                tracks.push(index);
-            }
+            Event::Track { index, signal_path, .. } => tracks.push((index, signal_path)),
             Event::Error { message } => panic!("player error: {message}"),
             Event::QueueEnded => break,
             _ => {}
@@ -197,18 +209,57 @@ fn dsd_goes_out_as_dop() {
     let dff = temp("dop.dff");
     std::fs::write(&dff, &file).unwrap();
 
-    let (bytes, _) = play_to_file(vec![dff.clone()], FileSink::new(temp("dop.raw")));
+    // The equalizer cannot filter DSD, so turning it on must change nothing.
+    let mut eq_on = EqSettings { enabled: true, preamp_db: -6.0, ..EqSettings::default() };
+    eq_on.bands[3].gain_db = 4.0;
+    for setup in [Vec::new(), vec![Command::SetEq(eq_on)]] {
+        let (bytes, tracks) =
+            play_to_file_with(vec![dff.clone()], FileSink::new(temp("dop.raw")), setup);
+        assert!(tracks.iter().all(|(_, p)| p.bit_perfect && !p.eq));
 
-    // 24-bit stereo frames at 176.4 kHz: one PCM frame per two DSD frames.
-    assert_eq!(bytes.len(), frames / 2 * 2 * 3);
-    for (n, frame) in bytes.chunks_exact(6).enumerate() {
-        let marker = if n % 2 == 0 { 0x05 } else { 0xFA };
-        for ch in 0..2 {
-            let s = &frame[ch * 3..ch * 3 + 3];
-            assert_eq!(s[2], marker, "marker of frame {n}");
-            assert_eq!(s[1], data[(2 * n) * 2 + ch], "older DSD byte of frame {n}");
-            assert_eq!(s[0], data[(2 * n + 1) * 2 + ch], "newer DSD byte of frame {n}");
+        // 24-bit stereo frames at 176.4 kHz: one PCM frame per two DSD frames.
+        assert_eq!(bytes.len(), frames / 2 * 2 * 3);
+        for (n, frame) in bytes.chunks_exact(6).enumerate() {
+            let marker = if n % 2 == 0 { 0x05 } else { 0xFA };
+            for ch in 0..2 {
+                let s = &frame[ch * 3..ch * 3 + 3];
+                assert_eq!(s[2], marker, "marker of frame {n}");
+                assert_eq!(s[1], data[(2 * n) * 2 + ch], "older DSD byte of frame {n}");
+                assert_eq!(s[0], data[(2 * n + 1) * 2 + ch], "newer DSD byte of frame {n}");
+            }
         }
     }
     std::fs::remove_file(dff).ok();
+}
+
+#[test]
+fn the_equalizer_changes_pcm_and_says_so() {
+    // Flat bands and a -6.02 dB preamp: every sample halves, in a 24-bit
+    // container even though the file is 16-bit.
+    let samples = pattern(16, 30_000, 0xBEEF);
+    let wav = temp("eq.wav");
+    write_wav(&wav, 16, 44_100, &samples);
+    let eq = EqSettings { enabled: true, preamp_db: -6.0206, ..EqSettings::default() };
+
+    let (bytes, tracks) =
+        play_to_file_with(vec![wav.clone()], FileSink::new(temp("eq.raw")), vec![Command::SetEq(eq)]);
+    let (_, path) = &tracks[0];
+    assert!(path.eq && !path.bit_perfect);
+    assert_eq!(path.output.valid_bits, 24);
+
+    let out = unpack(&bytes, Container::I24, 24);
+    assert_eq!(out.len(), samples.len());
+    for (o, s) in out.iter().zip(&samples) {
+        // A 16-bit sample is worth 256 steps of 24 bits; half of it is 128.
+        assert!((o - s * 128).abs() <= 1, "{o} vs {}", s * 128);
+    }
+
+    // Turned off again, the same file is bit-perfect once more.
+    let (bytes, _) = play_to_file_with(
+        vec![wav.clone()],
+        FileSink::new(temp("eq-off.raw")),
+        vec![Command::SetEq(EqSettings::default())],
+    );
+    assert!(unpack(&bytes, Container::I16, 16) == samples);
+    std::fs::remove_file(wav).ok();
 }

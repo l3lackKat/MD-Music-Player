@@ -12,6 +12,7 @@ use mdm_decode::{Chunk, SampleKind, Source, SourceInfo};
 use serde::Serialize;
 
 use crate::dop::DopPacker;
+use crate::eq::{EqSettings, Equalizer};
 use crate::format::{pack, FormatRequest, StreamFormat};
 use crate::output::{Backend, Stream};
 use crate::{EngineError, Result};
@@ -39,6 +40,10 @@ pub enum Command {
     Previous,
     /// Switch output. Playback carries on from the same position.
     SetOutput(Box<dyn Backend>),
+    /// Change the equalizer. Turning it on or off restarts the current track
+    /// at the same position, since the stream format may change; other
+    /// changes apply to the audio not yet queued for the device.
+    SetEq(EqSettings),
     Shutdown,
 }
 
@@ -60,6 +65,8 @@ pub struct SignalPath {
     pub exclusive: bool,
     /// Every sample of the file reaches the device unchanged.
     pub bit_perfect: bool,
+    /// The equalizer is changing this track's samples.
+    pub eq: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +126,8 @@ struct Decoding {
     source: Box<dyn Source>,
     req: FormatRequest,
     packer: Option<DopPacker>,
+    /// Samples go through the equalizer.
+    eq: bool,
 }
 
 /// Where a track starts in the stream of frames pushed to the device.
@@ -128,6 +137,7 @@ struct Mark {
     /// Track position at `start_frame` (non-zero after a seek).
     base_ms: u64,
     info: SourceInfo,
+    eq: bool,
 }
 
 struct Engine {
@@ -167,6 +177,7 @@ struct Engine {
     /// The last track the decoder finished, so tracks appended after the
     /// end of the queue was reached can still follow on.
     last_decoded: Option<usize>,
+    eq: Equalizer,
 }
 
 /// xorshift64*: plenty for picking a play order, no extra dependency.
@@ -196,10 +207,18 @@ impl Rng {
     }
 }
 
-fn open_source(path: &Path) -> Result<(Box<dyn Source>, FormatRequest)> {
+/// Open a track and work out the stream it needs. With the equalizer on,
+/// PCM gets at least 24 bits so the filtered samples keep their detail, and
+/// may fall back to a narrower container since they are no longer exact.
+fn open_source(path: &Path, eq: bool) -> Result<(Box<dyn Source>, FormatRequest, bool)> {
     let source = mdm_decode::open(path)?;
-    let req = FormatRequest::for_source(source.info())?;
-    Ok((source, req))
+    let mut req = FormatRequest::for_source(source.info())?;
+    let eq = eq && source.info().kind != SampleKind::Dsd;
+    if eq {
+        req.bits = req.bits.max(24);
+        req.exact = false;
+    }
+    Ok((source, req, eq))
 }
 
 impl Engine {
@@ -226,6 +245,7 @@ impl Engine {
             shuffle: false,
             rng: Rng::from_clock(),
             last_decoded: None,
+            eq: Equalizer::new(EqSettings::default()),
         }
     }
 
@@ -416,6 +436,18 @@ impl Engine {
                     self.play_from(index, ms);
                 }
             }
+            Command::SetEq(settings) => {
+                let was = self.eq.enabled();
+                self.eq.set(settings);
+                if self.eq.enabled() != was {
+                    if let Some(index) = self.heard.as_ref().map(|h| h.index) {
+                        let ms = self.position_ms();
+                        // Reopen even the track being heard: its format depends on the EQ.
+                        self.decoding = None;
+                        self.play_from(index, ms);
+                    }
+                }
+            }
             Command::Shutdown => {}
         }
     }
@@ -479,9 +511,9 @@ impl Engine {
     fn start_track(&mut self, index: usize, ms: u64) -> Result<()> {
         let same_track = matches!(&self.decoding, Some(d) if d.index == index);
         if !same_track {
-            let (source, req) = open_source(&self.queue[index])?;
+            let (source, req, eq) = open_source(&self.queue[index], self.eq.enabled())?;
             let packer = req.dop.then(|| DopPacker::new(req.channels));
-            self.decoding = Some(Decoding { index, source, req, packer });
+            self.decoding = Some(Decoding { index, source, req, packer, eq });
         }
         let decoding = self.decoding.as_mut().expect("decoding was just set");
         let base_ms = if ms > 0 || same_track { decoding.source.seek(ms)? } else { 0 };
@@ -489,7 +521,12 @@ impl Engine {
             p.reset();
         }
         let req = decoding.req;
+        let eq = decoding.eq;
         let info = decoding.source.info().clone();
+        if eq {
+            self.eq.configure(req.sample_rate, req.channels);
+            self.eq.reset();
+        }
 
         let reusable = match &self.stream {
             Some(s) => self.stream_req == Some(req) && !s.shared.failed.load(Ordering::Acquire),
@@ -515,7 +552,7 @@ impl Engine {
         self.upcoming.clear();
         self.switch_to = None;
         self.drained_at = None;
-        self.heard = Some(Mark { index, start_frame: 0, base_ms, info });
+        self.heard = Some(Mark { index, start_frame: 0, base_ms, info, eq });
         self.announce_track();
         Ok(())
     }
@@ -540,7 +577,8 @@ impl Engine {
             output: s.format,
             device: s.device_name.clone(),
             exclusive: s.exclusive,
-            bit_perfect: s.exclusive && h.info.kind != SampleKind::Float,
+            bit_perfect: s.exclusive && h.info.kind != SampleKind::Float && !h.eq,
+            eq: h.eq,
         };
         self.emit(Event::Track {
             index: h.index,
@@ -588,6 +626,12 @@ impl Engine {
         let container = stream.format.container;
         let mut finished = false;
         match decoding.source.next_chunk() {
+            Ok(Some(Chunk::Pcm(samples))) if decoding.eq => {
+                self.samples.clear();
+                self.samples.extend_from_slice(samples);
+                self.eq.process(&mut self.samples, container);
+                pack(&self.samples, container, &mut self.pending);
+            }
             Ok(Some(Chunk::Pcm(samples))) => pack(samples, container, &mut self.pending),
             Ok(Some(Chunk::Dsd(bytes))) => {
                 self.samples.clear();
@@ -631,17 +675,19 @@ impl Engine {
     fn line_up_after(&mut self, index: usize) {
         let mut candidate = self.after(index);
         while let Some(next) = candidate {
-            match open_source(&self.queue[next]) {
-                Ok((source, req)) if Some(req) == self.stream_req => {
+            match open_source(&self.queue[next], self.eq.enabled()) {
+                Ok((source, req, eq)) if Some(req) == self.stream_req => {
                     // Same format: keep feeding the same stream, with no gap.
+                    // The EQ's state carries on too, so there is no click.
                     let info = source.info().clone();
                     let packer = req.dop.then(|| DopPacker::new(req.channels));
-                    self.decoding = Some(Decoding { index: next, source, req, packer });
+                    self.decoding = Some(Decoding { index: next, source, req, packer, eq });
                     self.upcoming.push_back(Mark {
                         index: next,
                         start_frame: self.pushed_frames,
                         base_ms: 0,
                         info,
+                        eq,
                     });
                     return;
                 }

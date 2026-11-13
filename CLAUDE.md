@@ -42,6 +42,12 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   `output/wasapi.rs::render` must not allocate, lock or log per buffer.
 - **DoP markers are written at the device end** (`MarkerStamper`), not by the
   packer, so silence and audio share one unbroken marker sequence.
+- **The equalizer (`eq.rs`) is the one opt-in sample change.** It is off by
+  default, runs on the player thread before `pack` (never in the render
+  loop), sets `SignalPath::eq` and clears `bit_perfect`. With it on, PCM asks
+  for at least 24 bits and `exact: false`; DSD is never equalized. Toggling
+  it restarts the current track at the same position. Settings are saved in
+  `%APPDATA%\com.mdmusic.app\eq.json`.
 - **A track the DAC cannot play is skipped with an error**, not converted.
 - **The volume bar is the device's Windows volume** (`output/volume.rs`,
   `IAudioEndpointVolume`), never sample scaling, so it keeps bit-perfect.

@@ -46,6 +46,47 @@ export interface SignalPath {
   device: string;
   exclusive: boolean;
   bit_perfect: boolean;
+  /** The equalizer is changing this track's samples. */
+  eq: boolean;
+}
+
+export interface EqBand {
+  freq_hz: number;
+  gain_db: number;
+  q: number;
+}
+
+/** The opt-in equalizer. While it is on, PCM tracks are not bit-perfect; DSD passes untouched. */
+export interface EqSettings {
+  enabled: boolean;
+  /** Gain before the bands. Lower it to make room for boosts. */
+  preamp_db: number;
+  bands: EqBand[];
+}
+
+/** Everything known about one file, for the track info panel. */
+export interface TrackDetails {
+  path: string;
+  file_name: string;
+  folder: string;
+  size_bytes: number | null;
+  /** Milliseconds since 1970. */
+  modified_ms: number | null;
+  audio: {
+    container: string | null;
+    codec: string | null;
+    bits: number | null;
+    lossy_or_float: boolean;
+    dsd: boolean;
+    sample_rate: number | null;
+    channels: number | null;
+    duration_ms: number | null;
+    bitrate_kbps: number | null;
+    error: string | null;
+  };
+  tags: { kind: string; fields: { key: string; value: string }[] }[];
+  pictures: { kind: string; mime: string | null; width: number | null; height: number | null; size_bytes: number }[];
+  lyrics: { synced: boolean; lines: number } | null;
 }
 
 export interface TrackEvent {
@@ -101,6 +142,10 @@ export function coverUrl(path: string): string {
 export const api = {
   expandPaths: (paths: string[]) => invoke<TrackMeta[]>("expand_paths", { paths }),
   getLyrics: (path: string) => invoke<Lyrics | null>("get_lyrics", { path }),
+  trackDetails: (path: string) => invoke<TrackDetails>("track_details", { path }),
+  getEq: () => invoke<EqSettings>("get_eq"),
+  /** Apply and save. Returns the settings as applied (values clamped into range). */
+  setEq: (settings: EqSettings) => invoke<EqSettings>("set_eq", { settings }),
   playlists: () => invoke<Playlist[]>("playlists"),
   playlistCreate: (name: string) => invoke<Playlist>("playlist_create", { name }),
   playlistRename: (id: number, name: string) => invoke<Playlist>("playlist_rename", { id, name }),

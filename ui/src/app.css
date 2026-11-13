@@ -59,6 +59,32 @@ input[type="range"].seek:disabled {
   cursor: default;
 }
 
+/* Equalizer band: a vertical track filled from the 0 dB line to the thumb. */
+input[type="range"].eq-slider {
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 4px;
+  height: 128px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to top,
+    var(--color-line) var(--lo, 50%),
+    var(--color-accent) var(--lo, 50%),
+    var(--color-accent) var(--hi, 50%),
+    var(--color-line) var(--hi, 50%)
+  );
+  cursor: pointer;
+}
+input[type="range"].eq-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--color-ink);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
+}
+
 ::-webkit-scrollbar {
   width: 10px;
 }

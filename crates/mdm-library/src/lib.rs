@@ -1,11 +1,15 @@
 //! Everything MDMusic knows about music files besides how to play them:
 //! tags, cover art, lyrics, folder scanning and playlists.
 
+mod details;
 mod lyrics;
 mod meta;
 mod playlist;
 mod scan;
 
+pub use details::{
+    read_details, AudioDetails, LyricsDetails, PictureDetails, TagDetails, TagField, TrackDetails,
+};
 pub use lyrics::{parse_lyrics, read_lyrics, LyricLine, Lyrics};
 pub use meta::{read_cover, read_meta, Cover, TrackMeta};
 pub use playlist::{Playlist, PlaylistStore};

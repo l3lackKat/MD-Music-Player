@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mdm_engine::{
-    Command, DeviceInfo, DeviceVolume, Event, OutputMode, Player, VolumeChange, WasapiBackend,
+    Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, VolumeChange,
+    WasapiBackend,
 };
-use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackMeta};
+use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
 use serde::Serialize;
 use tauri::http::{header, Response, StatusCode};
 use tauri::{Emitter, Manager, State};
@@ -27,6 +28,8 @@ struct AppState {
     player: Player,
     output: Mutex<OutputSettings>,
     playlists: Mutex<PlaylistStore>,
+    eq: Mutex<EqSettings>,
+    eq_path: PathBuf,
 }
 
 type CommandResult<T> = Result<T, String>;
@@ -70,6 +73,37 @@ fn set_volume(
 ) -> CommandResult<DeviceVolume> {
     let device_id = state.output.lock().unwrap().device_id.clone();
     mdm_engine::set_volume(device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
+}
+
+// ---- Equalizer -------------------------------------------------------------
+
+#[tauri::command]
+fn get_eq(state: State<AppState>) -> EqSettings {
+    state.eq.lock().unwrap().clone()
+}
+
+/// Change the equalizer and remember it. Returns the settings as applied,
+/// after out-of-range values were brought into range.
+#[tauri::command]
+fn set_eq(state: State<AppState>, settings: EqSettings) -> CommandResult<EqSettings> {
+    let settings = settings.sanitized();
+    *state.eq.lock().unwrap() = settings.clone();
+    state.player.send(Command::SetEq(settings.clone()));
+    let json = serde_json::to_vec_pretty(&settings).map_err(text)?;
+    if let Some(dir) = state.eq_path.parent() {
+        std::fs::create_dir_all(dir).map_err(text)?;
+    }
+    std::fs::write(&state.eq_path, json).map_err(text)?;
+    Ok(settings)
+}
+
+/// The saved equalizer, or the default (off, flat) when there is none.
+fn load_eq(path: &Path) -> EqSettings {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<EqSettings>(&bytes).ok())
+        .map(EqSettings::sanitized)
+        .unwrap_or_default()
 }
 
 // ---- Transport -------------------------------------------------------------
@@ -134,6 +168,16 @@ fn previous(state: State<AppState>) {
 fn expand_paths(paths: Vec<String>) -> Vec<TrackMeta> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     mdm_library::expand_paths(&paths)
+}
+
+/// Everything known about one file, for the track info panel.
+#[tauri::command(async)]
+fn track_details(path: String) -> CommandResult<TrackDetails> {
+    let path = Path::new(&path);
+    if !path.is_file() {
+        return Err("The file no longer exists.".into());
+    }
+    Ok(mdm_library::read_details(path))
 }
 
 #[tauri::command(async)]
@@ -274,11 +318,17 @@ pub fn run() {
                 mode: output.mode,
             }));
             let events = player.events();
-            let playlists = open_playlists(&app.path().app_data_dir()?.join("playlists.json"));
+            let data_dir = app.path().app_data_dir()?;
+            let playlists = open_playlists(&data_dir.join("playlists.json"));
+            let eq_path = data_dir.join("eq.json");
+            let eq = load_eq(&eq_path);
+            player.send(Command::SetEq(eq.clone()));
             app.manage(AppState {
                 player,
                 output: Mutex::new(output),
                 playlists: Mutex::new(playlists),
+                eq: Mutex::new(eq),
+                eq_path,
             });
 
             // Forward player events to the UI for as long as the player lives.
@@ -298,6 +348,8 @@ pub fn run() {
             set_output,
             get_volume,
             set_volume,
+            get_eq,
+            set_eq,
             supported_extensions,
             play_files,
             append_files,
@@ -310,6 +362,7 @@ pub fn run() {
             previous,
             expand_paths,
             get_lyrics,
+            track_details,
             playlists,
             playlist_create,
             playlist_rename,
