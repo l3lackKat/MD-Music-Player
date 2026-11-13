@@ -43,8 +43,17 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 - **DoP markers are written at the device end** (`MarkerStamper`), not by the
   packer, so silence and audio share one unbroken marker sequence.
 - **A track the DAC cannot play is skipped with an error**, not converted.
-- **Playlists are folders, not track lists.** Tracks come from scanning the
-  folders. Deleting a playlist never touches music files.
+- **A playlist is folders plus single files.** Its tracks are the folders'
+  audio (scanned each time, album order), then the single files in the order
+  added, with duplicates dropped. A track that comes from a folder cannot be
+  removed on its own; only single files can. Deleting a playlist never touches
+  music files. `files` is `#[serde(default)]` so older playlist files still load.
+- **The play order lives in the engine** (`Engine::order`). Shuffle, Next,
+  Previous, skipping bad tracks and gapless line-up all go through `after()` /
+  `before()`; never step through the queue with `index + 1`.
+- **The UI's queue and the engine's queue must match.** Replace with
+  `play_files`, extend with `append_files`. Changing `queue` in the UI alone
+  leaves the player playing the old list.
 - **Tag reading never fails.** `read_meta` falls back to the file name. The tag
   reader (lofty) does not know DSF/DFF, so DSD files show file names only.
 
@@ -77,6 +86,13 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   crate source under `~/.cargo/registry/src` instead of guessing.
 - In lofty, ID3v2 lyrics (USLT) are `ItemKey::UnsyncLyrics`; Vorbis and MP4
   lyrics are `ItemKey::Lyrics`. Read both.
+- The browser's own right-click menu is turned off app-wide (`onContextMenu`
+  in `App.svelte`), except in text fields and over selected text. Track rows
+  open `ContextMenu.svelte`; its items are built in `trackMenu()`.
+- `ContextMenu` submenus are `position: fixed` inside the parent menu. Never
+  give the menu a `transform`, `filter` or `backdrop-filter` (Tailwind
+  `backdrop-blur-*`, `scale-*`, ...): that makes it the containing block and
+  the submenu lands in the wrong place.
 - Cover art reaches the UI through the `cover://` scheme (`coverUrl()` in
   `api.ts`), served by `cover_response` in `src-tauri/src/lib.rs`. A new image
   source needs its host added to `img-src` in `tauri.conf.json`.
@@ -91,7 +107,7 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 
 ## Not built yet
 
-SQLite library index and search, per-track playlists and reordering, cover
-thumbnails in lists, tags for DSF/DFF, media keys and tray, volume control,
+SQLite library index and search, reordering playlists and the queue, removing
+from the queue, multi-select in track lists, repeat modes, cover thumbnails in lists, tags for DSF/DFF, media keys and tray, volume control,
 automatic reconnect when the DAC is replugged, ASIO output for native DSD,
 remembering the output device between launches.

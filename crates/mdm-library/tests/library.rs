@@ -194,3 +194,59 @@ fn playlists_persist_and_scan_their_folders() {
     assert!(dir.join("music/rock/a.wav").exists());
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn playlists_mix_folders_and_single_files() {
+    let dir = temp_dir("files");
+    write_wav(&dir.join("album/one.wav"));
+    write_wav(&dir.join("album/two.wav"));
+    write_wav(&dir.join("loose/single.wav"));
+    write_wav(&dir.join("loose/another.wav"));
+    std::fs::write(dir.join("loose/readme.txt"), "not music").unwrap();
+    let store_path = dir.join("playlists.json");
+
+    // A file written before playlists could hold single files still loads.
+    std::fs::write(&store_path, r#"{"next_id":1,"playlists":[{"id":0,"name":"Old","folders":[]}]}"#).unwrap();
+    let mut store = PlaylistStore::open(&store_path).unwrap();
+    assert!(store.get(0).unwrap().files.is_empty());
+
+    let id = store.create("Mixed").unwrap().id;
+    store.add_file(id, &dir.join("loose/single.wav")).unwrap();
+    // The same file again, spelled differently, is not added twice.
+    let odd_spelling = dir.join("loose").join(".").join("SINGLE.wav");
+    store.add_file(id, &odd_spelling).unwrap();
+    assert!(store.add_file(id, &dir.join("loose/readme.txt")).is_err());
+    assert!(store.add_file(id, &dir.join("loose/missing.wav")).is_err());
+
+    // A drop of a folder, a file inside that folder, a file and a text file.
+    let (playlist, skipped) = store
+        .add_paths(
+            id,
+            &[
+                dir.join("album"),
+                dir.join("album/two.wav"),
+                dir.join("loose/another.wav"),
+                dir.join("loose/readme.txt"),
+            ],
+        )
+        .unwrap();
+    assert_eq!(playlist.folders.len(), 1);
+    assert_eq!(playlist.files.len(), 3);
+    assert_eq!(skipped.len(), 1);
+
+    // Folder tracks first, then single files in the order added, no duplicates.
+    let titles: Vec<String> = playlist.scan().into_iter().map(|t| t.title).collect();
+    assert_eq!(titles, ["one", "two", "single", "another"]);
+
+    // Removing a single file; a file that came from the folder stays.
+    let single = playlist.files[0].clone();
+    let p = store.remove_file(id, &single).unwrap();
+    assert_eq!(p.files.len(), 2);
+    let titles: Vec<String> = p.scan().into_iter().map(|t| t.title).collect();
+    assert_eq!(titles, ["one", "two", "another"]);
+
+    // A single file deleted from disk drops out of the scan quietly.
+    std::fs::remove_file(dir.join("loose/another.wav")).unwrap();
+    assert_eq!(store.get(id).unwrap().scan().len(), 2);
+    std::fs::remove_dir_all(dir).ok();
+}

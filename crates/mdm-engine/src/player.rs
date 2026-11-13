@@ -26,6 +26,11 @@ const PREVIOUS_RESTARTS_AFTER_MS: u64 = 3000;
 pub enum Command {
     /// Replace the queue and start playing at `index`.
     Load { paths: Vec<PathBuf>, index: usize },
+    /// Add tracks to the end of the queue without interrupting playback.
+    Append(Vec<PathBuf>),
+    /// Play the queue in random order. The current track keeps playing and
+    /// the order of the rest is drawn again each time this is turned on.
+    SetShuffle(bool),
     Play,
     Pause,
     Stop,
@@ -153,6 +158,42 @@ struct Engine {
     /// Where `Play` starts from when stopped: queue index and position.
     resume: (usize, u64),
     last_position: Instant,
+
+    /// The order tracks play in: queue indexes, each exactly once. In order
+    /// when shuffle is off.
+    order: Vec<usize>,
+    shuffle: bool,
+    rng: Rng,
+    /// The last track the decoder finished, so tracks appended after the
+    /// end of the queue was reached can still follow on.
+    last_decoded: Option<usize>,
+}
+
+/// xorshift64*: plenty for picking a play order, no extra dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn from_clock() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Rng(nanos | 1)
+    }
+
+    /// A number in `0..n`. `n` must be above zero.
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
+    }
+
+    fn shuffle(&mut self, items: &mut [usize]) {
+        for i in (1..items.len()).rev() {
+            items.swap(i, self.below(i + 1));
+        }
+    }
 }
 
 fn open_source(path: &Path) -> Result<(Box<dyn Source>, FormatRequest)> {
@@ -181,7 +222,47 @@ impl Engine {
             drained_at: None,
             resume: (0, 0),
             last_position: Instant::now(),
+            order: Vec::new(),
+            shuffle: false,
+            rng: Rng::from_clock(),
+            last_decoded: None,
         }
+    }
+
+    /// Redraw the play order. `keep` goes first, in the order given: the
+    /// track being heard, then one the decoder may already be on.
+    fn rebuild_order(&mut self, keep: &[usize]) {
+        let mut rest: Vec<usize> =
+            (0..self.queue.len()).filter(|i| !keep.contains(i)).collect();
+        if self.shuffle {
+            self.rng.shuffle(&mut rest);
+            let mut order: Vec<usize> = Vec::with_capacity(self.queue.len());
+            order.extend(keep.iter().copied().filter(|i| *i < self.queue.len()));
+            order.extend(rest);
+            // Dedupe in case `keep` named the same track twice.
+            let mut seen = vec![false; self.queue.len()];
+            order.retain(|i| !std::mem::replace(&mut seen[*i], true));
+            self.order = order;
+        } else {
+            self.order = (0..self.queue.len()).collect();
+        }
+    }
+
+    /// The track that plays after `index`.
+    fn after(&self, index: usize) -> Option<usize> {
+        let pos = self.order.iter().position(|i| *i == index)?;
+        self.order.get(pos + 1).copied()
+    }
+
+    /// The track that played before `index`.
+    fn before(&self, index: usize) -> Option<usize> {
+        let pos = self.order.iter().position(|i| *i == index)?;
+        pos.checked_sub(1).map(|p| self.order[p])
+    }
+
+    /// The track the player is on, or would start from when stopped.
+    fn current(&self) -> usize {
+        self.heard.as_ref().map(|h| h.index).unwrap_or(self.resume.0)
     }
 
     fn run(mut self, rx: Receiver<Command>) {
@@ -228,12 +309,47 @@ impl Engine {
                 self.close_stream();
                 self.queue = paths;
                 self.resume = (0, 0);
+                self.last_decoded = None;
+                self.rebuild_order(&[index]);
                 if index < self.queue.len() {
                     self.set_state(PlayState::Playing);
                     self.play_from(index, 0);
                 } else {
                     self.set_state(PlayState::Stopped);
                 }
+            }
+            Command::Append(paths) => {
+                let start = self.queue.len();
+                self.queue.extend(paths);
+                let mut added: Vec<usize> = (start..self.queue.len()).collect();
+                if self.shuffle {
+                    self.rng.shuffle(&mut added);
+                }
+                self.order.extend(added);
+                // The decoder already ran out of queue: carry on into the new tracks.
+                let ran_out = self.stream.is_some()
+                    && self.decoding.is_none()
+                    && self.switch_to.is_none()
+                    && self.pending_pos >= self.pending.len();
+                if let (true, Some(last)) = (ran_out, self.last_decoded) {
+                    if let Some(s) = &self.stream {
+                        s.shared.draining.store(false, Ordering::Release);
+                    }
+                    self.drained_at = None;
+                    self.line_up_after(last);
+                }
+            }
+            Command::SetShuffle(on) => {
+                self.shuffle = on;
+                let mut keep = vec![self.current()];
+                if let Some(d) = &self.decoding {
+                    keep.push(d.index);
+                }
+                if let Some(next) = self.switch_to {
+                    keep.push(next);
+                }
+                keep.extend(self.upcoming.iter().map(|m| m.index));
+                self.rebuild_order(&keep);
             }
             Command::Play => match self.state {
                 PlayState::Paused => {
@@ -270,10 +386,7 @@ impl Engine {
                 _ => {}
             },
             Command::Next => {
-                let next = self.heard.as_ref().map(|h| h.index + 1).unwrap_or(self.resume.0 + 1);
-                if next >= self.queue.len() {
-                    return;
-                }
+                let Some(next) = self.after(self.current()) else { return };
                 if self.state == PlayState::Stopped {
                     self.resume = (next, 0);
                     self.announce_stopped_track();
@@ -282,9 +395,11 @@ impl Engine {
                 }
             }
             Command::Previous => {
-                let index = self.heard.as_ref().map(|h| h.index).unwrap_or(self.resume.0);
-                let restart = self.position_ms() > PREVIOUS_RESTARTS_AFTER_MS || index == 0;
-                let target = if restart { index } else { index - 1 };
+                let index = self.current();
+                let target = match self.before(index) {
+                    Some(prev) if self.position_ms() <= PREVIOUS_RESTARTS_AFTER_MS => prev,
+                    _ => index,
+                };
                 if self.state == PlayState::Stopped {
                     self.resume = (target, 0);
                     self.announce_stopped_track();
@@ -333,9 +448,9 @@ impl Engine {
     /// Start playing at `index`, skipping tracks that cannot be played.
     /// Keeps a paused player paused.
     fn play_from(&mut self, index: usize, ms: u64) {
-        let mut index = index;
+        let mut next = (index < self.queue.len()).then_some(index);
         let mut ms = ms;
-        while index < self.queue.len() {
+        while let Some(index) = next {
             match self.start_track(index, ms) {
                 Ok(()) => return,
                 // The device itself is unusable: no point trying other tracks.
@@ -351,7 +466,7 @@ impl Engine {
                         .unwrap_or_default();
                     self.error(format!("{name}: {e}"));
                     self.decoding = None;
-                    index += 1;
+                    next = self.after(index);
                     ms = 0;
                 }
             }
@@ -505,8 +620,17 @@ impl Engine {
 
     /// The decoder reached the end of a track: line up the next one.
     fn track_finished(&mut self) {
-        let mut next = self.decoding.take().map(|d| d.index + 1).unwrap_or(usize::MAX);
-        while next < self.queue.len() {
+        if let Some(d) = self.decoding.take() {
+            self.last_decoded = Some(d.index);
+            self.line_up_after(d.index);
+        }
+    }
+
+    /// Point the decoder at the track after `index`, skipping unplayable
+    /// ones. With nothing left, let the stream drain.
+    fn line_up_after(&mut self, index: usize) {
+        let mut candidate = self.after(index);
+        while let Some(next) = candidate {
             match open_source(&self.queue[next]) {
                 Ok((source, req)) if Some(req) == self.stream_req => {
                     // Same format: keep feeding the same stream, with no gap.
@@ -533,7 +657,7 @@ impl Engine {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     self.error(format!("{name}: {e}"));
-                    next += 1;
+                    candidate = self.after(next);
                 }
             }
         }

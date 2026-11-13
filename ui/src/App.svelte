@@ -4,6 +4,7 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     api,
+    holdsFile,
     listenPlayer,
     formatRate,
     formatTime,
@@ -14,6 +15,7 @@
     type SignalPath,
     type TrackMeta,
   } from "./lib/api";
+  import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Cover from "./lib/Cover.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
@@ -41,7 +43,14 @@
   let newName = $state<string | null>(null);
   let renaming = $state<string | null>(null);
 
+  let shuffle = $state(false);
+
   // ---- Window ----
+  /** The open track menu: where, what, and which row it belongs to. */
+  let menu = $state<{ x: number; y: number; items: MenuItem[]; row: number } | null>(null);
+  /** A short confirmation, such as "Added to Favourites". */
+  let notice = $state<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let error = $state<string | null>(null);
   let dragging = $state(false);
   let showPanel = $state(true);
@@ -71,6 +80,12 @@
     error = String(message);
   }
 
+  function showNotice(message: string) {
+    notice = message;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (notice = null), 2500);
+  }
+
   // ---- Queue and transport ----
 
   async function playQueue(index: number) {
@@ -92,6 +107,16 @@
     const wasIdle = playState === "stopped";
     queue = [...queue, ...tracks];
     if (wasIdle) await playQueue(startAt);
+    else await api.appendFiles(tracks.map((t) => t.path)).catch(showError);
+    return tracks.length;
+  }
+
+  async function toggleShuffle() {
+    shuffle = !shuffle;
+    try {
+      localStorage.setItem("shuffle", shuffle ? "1" : "0");
+    } catch {}
+    await api.setShuffle(shuffle).catch(showError);
   }
 
   async function pickFiles() {
@@ -201,26 +226,128 @@
     }
   }
 
-  /** Add folders to a playlist, then rescan it. Returns how many were added. */
-  async function addFolders(id: number, folders: string[]) {
-    let added = 0;
-    let failure: unknown = null;
-    for (const folder of folders) {
-      try {
-        replacePlaylist(await api.playlistAddFolder(id, folder));
-        added++;
-      } catch (e) {
-        failure = e;
+  /** Add folders and files to a playlist and refresh its track list. */
+  async function addToPlaylist(id: number, paths: string[]): Promise<boolean> {
+    try {
+      const { playlist: updated, skipped } = await api.playlistAdd(id, paths);
+      replacePlaylist(updated);
+      if (skipped.length > 0) {
+        const names = skipped.map((p) => p.split(/[\\/]/).pop()).join(", ");
+        showError(`Not added, not a folder or a playable file: ${names}`);
       }
+      // Rescan what is on screen; anything else rescans when next opened.
+      if (view === id) await scan(id);
+      else delete scanned[id];
+      return skipped.length < paths.length;
+    } catch (e) {
+      showError(e);
+      return false;
     }
-    if (failure !== null) showError(failure);
-    if (added > 0) await scan(id);
   }
 
   async function pickFolders() {
     if (!playlist) return;
     const picked = await open({ directory: true, multiple: true, title: "Add folders to the playlist" });
-    if (picked) await addFolders(playlist.id, picked);
+    if (picked) await addToPlaylist(playlist.id, picked);
+  }
+
+  async function pickPlaylistFiles() {
+    if (!playlist) return;
+    const extensions = await api.supportedExtensions();
+    const picked = await open({
+      multiple: true,
+      title: "Add files to the playlist",
+      filters: [{ name: "Audio", extensions }],
+    });
+    if (picked) await addToPlaylist(playlist.id, picked);
+  }
+
+  /** Make a playlist holding `paths`, open it and start renaming it. */
+  async function newPlaylistWith(paths: string[]) {
+    const taken = new Set(playlists.map((p) => p.name.toLowerCase()));
+    let name = "New playlist";
+    for (let n = 2; taken.has(name.toLowerCase()); n++) name = `New playlist ${n}`;
+    try {
+      const created = await api.playlistCreate(name);
+      playlists = [...playlists, created];
+      view = created.id;
+      await addToPlaylist(created.id, paths);
+      renaming = name;
+    } catch (e) {
+      showError(e);
+    }
+  }
+
+  async function removeFromPlaylist(id: number, path: string) {
+    try {
+      replacePlaylist(await api.playlistRemoveFile(id, path));
+      await scan(id);
+    } catch (e) {
+      showError(e);
+    }
+  }
+
+  // ---- Track menu ----
+
+  /** The right-click menu for `tracks[index]` in the list on screen. */
+  function trackMenu(tracks: TrackMeta[], index: number): MenuItem[] {
+    const track = tracks[index];
+    const inQueue = view === "queue";
+    const here = playlist;
+
+    const playlistItems: MenuItem[] = playlists.map((p) => {
+      const already = holdsFile(p, track.path);
+      return {
+        label: p.name,
+        disabled: already,
+        hint: already ? "Already in" : undefined,
+        action: async () => {
+          if (await addToPlaylist(p.id, [track.path])) showNotice(`Added to ${p.name}`);
+        },
+      };
+    });
+    if (playlistItems.length > 0) playlistItems.push("separator");
+    playlistItems.push({ label: "New playlist…", action: () => newPlaylistWith([track.path]) });
+
+    const items: MenuItem[] = [
+      { label: "Play", action: () => (inQueue ? playQueue(index) : playTracks(tracks, index)) },
+    ];
+    if (!inQueue) {
+      items.push({
+        label: "Add to queue",
+        action: async () => {
+          if (await addToQueue([track.path])) showNotice("Added to the queue");
+        },
+      });
+    }
+    items.push({ label: "Add to playlist", children: playlistItems });
+    if (here) {
+      const own = holdsFile(here, track.path);
+      items.push({
+        label: "Remove from playlist",
+        danger: own,
+        disabled: !own,
+        hint: own ? undefined : "From a folder",
+        action: () => removeFromPlaylist(here.id, track.path),
+      });
+    }
+    items.push("separator", {
+      label: "Show in File Explorer",
+      action: () => api.showInFolder(track.path).catch(showError),
+    });
+    return items;
+  }
+
+  function openTrackMenu(tracks: TrackMeta[], index: number, x: number, y: number) {
+    menu = { x, y, items: trackMenu(tracks, index), row: index };
+  }
+
+  /** Keep the browser's own menu where it is useful: text fields and selected text. */
+  function onContextMenu(event: MouseEvent) {
+    const target = event.target as HTMLElement;
+    const editable = target.closest("input, textarea, [contenteditable=true]");
+    const selected = (window.getSelection()?.toString() ?? "").length > 0;
+    if (!editable && !selected) event.preventDefault();
   }
 
   async function removeFolder(folder: string) {
@@ -239,6 +366,10 @@
       deviceId = output.device_id;
       mode = output.mode;
       playlists = await api.playlists();
+      try {
+        shuffle = localStorage.getItem("shuffle") === "1";
+      } catch {}
+      await api.setShuffle(shuffle);
       await refreshDevices();
 
       cleanups.push(
@@ -262,9 +393,9 @@
           else if (event.payload.type === "leave") dragging = false;
           else if (event.payload.type === "drop") {
             dragging = false;
-            // On a playlist, a drop adds folders to it; on the queue, it adds tracks.
+            // On a playlist, a drop adds folders and files to it; on the queue, it adds tracks.
             if (view === "queue") void addToQueue(event.payload.paths);
-            else void addFolders(view, event.payload.paths);
+            else void addToPlaylist(view, event.payload.paths);
           }
         }),
       );
@@ -287,7 +418,7 @@
   }
 </script>
 
-<svelte:window onkeydown={onKey} />
+<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} />
 
 <div class="flex h-full flex-col">
   <!-- Top bar: output device and mode -->
@@ -421,6 +552,12 @@
                 Add folder
               </button>
               <button
+                class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink"
+                onclick={pickPlaylistFiles}
+              >
+                Add files
+              </button>
+              <button
                 class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink disabled:opacity-40"
                 disabled={scanningId === playlist.id}
                 title="Look in the folders again for new or removed files"
@@ -468,19 +605,28 @@
           {/if}
         </div>
 
-        {#if playlist.folders.length === 0}
+        {#if playlist.folders.length === 0 && playlist.files.length === 0}
           <div class="grid place-items-center px-8 py-16 text-center">
             <div class="max-w-sm">
-              <p class="text-lg font-medium">This playlist has no folders</p>
+              <p class="text-lg font-medium">This playlist is empty</p>
               <p class="mt-1.5 text-sm text-muted">
-                Add a folder and every audio file inside it, including subfolders, becomes part of the playlist.
+                Add a folder and every audio file inside it, subfolders included, becomes part of the playlist. Add
+                single tracks with Add files, by dropping them here, or by right-clicking any track.
               </p>
-              <button
-                class="mt-5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-base hover:brightness-110"
-                onclick={pickFolders}
-              >
-                Add folder
-              </button>
+              <div class="mt-5 flex justify-center gap-2">
+                <button
+                  class="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-base hover:brightness-110"
+                  onclick={pickFolders}
+                >
+                  Add folder
+                </button>
+                <button
+                  class="rounded-lg border border-line px-4 py-2 text-sm font-medium hover:bg-raised"
+                  onclick={pickPlaylistFiles}
+                >
+                  Add files
+                </button>
+              </div>
             </div>
           </div>
         {:else if playlistTracks && playlistTracks.length > 0}
@@ -489,9 +635,11 @@
             currentPath={currentTrack?.path ?? null}
             playing={playState === "playing"}
             onplay={(index) => playTracks(playlistTracks, index)}
+            onmenu={(index, x, y) => openTrackMenu(playlistTracks, index, x, y)}
+            menuIndex={menu?.row ?? null}
           />
         {:else if playlistTracks && scanningId !== playlist.id}
-          <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found in these folders.</p>
+          <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found for this playlist.</p>
         {/if}
       {:else if queue.length === 0}
         <div class="grid h-full place-items-center p-8">
@@ -526,14 +674,25 @@
           currentPath={currentTrack?.path ?? null}
           playing={playState === "playing"}
           onplay={playQueue}
+          onmenu={(index, x, y) => openTrackMenu(queue, index, x, y)}
+          menuIndex={menu?.row ?? null}
         />
       {/if}
 
       {#if dragging}
         <div class="pointer-events-none absolute inset-3 grid place-items-center rounded-2xl border-2 border-dashed border-accent bg-accent/10">
           <p class="font-medium text-accent">
-            {playlist ? `Drop folders to add them to "${playlist.name}"` : "Drop to add to the queue"}
+            {playlist ? `Drop folders or files to add them to "${playlist.name}"` : "Drop to add to the queue"}
           </p>
+        </div>
+      {/if}
+
+      {#if notice}
+        <div
+          class="pointer-events-none sticky bottom-4 mx-auto w-fit rounded-full border border-line bg-raised px-4 py-2 text-sm shadow-lg shadow-black/40"
+          role="status"
+        >
+          {notice}
         </div>
       {/if}
     </main>
@@ -576,6 +735,20 @@
 
       <div class="flex items-center gap-2">
         <button
+          class="relative grid h-9 w-9 place-items-center rounded-full hover:bg-raised {shuffle
+            ? 'text-accent'
+            : 'text-muted hover:text-ink'}"
+          onclick={toggleShuffle}
+          aria-pressed={shuffle}
+          aria-label="Shuffle"
+          title={shuffle ? "Shuffle is on: next plays a random track" : "Shuffle is off"}
+        >
+          <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
+          </svg>
+          {#if shuffle}<span class="absolute bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
+        </button>
+        <button
           class="grid h-9 w-9 place-items-center rounded-full text-muted hover:bg-raised hover:text-ink disabled:opacity-40"
           onclick={() => api.previous().catch(showError)}
           disabled={queue.length === 0}
@@ -603,6 +776,8 @@
         >
           <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z" /></svg>
         </button>
+        <!-- Balances the shuffle button so play stays centred. -->
+        <span class="w-9" aria-hidden="true"></span>
       </div>
 
       <!-- Signal path: what the file is, what the device receives -->
@@ -638,3 +813,7 @@
     </div>
   </footer>
 </div>
+
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+{/if}

@@ -68,6 +68,14 @@ export interface Playlist {
   id: number;
   name: string;
   folders: string[];
+  /** Tracks added one by one, after the folders' tracks. */
+  files: string[];
+}
+
+/** Does the playlist hold this file on its own (not through a folder)? */
+export function holdsFile(playlist: Playlist, path: string): boolean {
+  const wanted = path.toLowerCase();
+  return playlist.files.some((f) => f.toLowerCase() === wanted);
 }
 
 export interface Lyrics {
@@ -88,8 +96,14 @@ export const api = {
   playlistCreate: (name: string) => invoke<Playlist>("playlist_create", { name }),
   playlistRename: (id: number, name: string) => invoke<Playlist>("playlist_rename", { id, name }),
   playlistDelete: (id: number) => invoke<void>("playlist_delete", { id }),
-  playlistAddFolder: (id: number, folder: string) =>
-    invoke<Playlist>("playlist_add_folder", { id, folder }),
+  /** Add folders and audio files; `skipped` lists paths that were neither. */
+  playlistAdd: (id: number, paths: string[]) =>
+    invoke<{ playlist: Playlist; skipped: string[] }>("playlist_add", { id, paths }),
+  playlistRemoveFile: (id: number, file: string) =>
+    invoke<Playlist>("playlist_remove_file", { id, file }),
+  showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
+  appendFiles: (paths: string[]) => invoke<void>("append_files", { paths }),
+  setShuffle: (on: boolean) => invoke<void>("set_shuffle", { on }),
   playlistRemoveFolder: (id: number, folder: string) =>
     invoke<Playlist>("playlist_remove_folder", { id, folder }),
   playlistScan: (id: number) => invoke<TrackMeta[]>("playlist_scan", { id }),

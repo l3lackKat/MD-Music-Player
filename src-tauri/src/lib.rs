@@ -64,6 +64,17 @@ fn play_files(state: State<AppState>, paths: Vec<String>, index: usize) {
     state.player.send(Command::Load { paths, index });
 }
 
+/// Add tracks to the end of the queue without interrupting playback.
+#[tauri::command]
+fn append_files(state: State<AppState>, paths: Vec<String>) {
+    state.player.send(Command::Append(paths.into_iter().map(PathBuf::from).collect()));
+}
+
+#[tauri::command]
+fn set_shuffle(state: State<AppState>, on: bool) {
+    state.player.send(Command::SetShuffle(on));
+}
+
 #[tauri::command]
 fn play(state: State<AppState>) {
     state.player.send(Command::Play);
@@ -129,9 +140,40 @@ fn playlist_delete(state: State<AppState>, id: u64) -> CommandResult<()> {
     state.playlists.lock().unwrap().delete(id).map_err(text)
 }
 
+#[derive(Serialize)]
+struct PlaylistAdded {
+    playlist: Playlist,
+    /// Paths that were neither a folder nor a playable file.
+    skipped: Vec<String>,
+}
+
+/// Add folders and audio files to a playlist.
 #[tauri::command]
-fn playlist_add_folder(state: State<AppState>, id: u64, folder: String) -> CommandResult<Playlist> {
-    state.playlists.lock().unwrap().add_folder(id, Path::new(&folder)).map_err(text)
+fn playlist_add(state: State<AppState>, id: u64, paths: Vec<String>) -> CommandResult<PlaylistAdded> {
+    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let (playlist, skipped) = state.playlists.lock().unwrap().add_paths(id, &paths).map_err(text)?;
+    Ok(PlaylistAdded { playlist, skipped })
+}
+
+#[tauri::command]
+fn playlist_remove_file(state: State<AppState>, id: u64, file: String) -> CommandResult<Playlist> {
+    state.playlists.lock().unwrap().remove_file(id, &file).map_err(text)
+}
+
+/// Open File Explorer with the track selected.
+#[tauri::command]
+fn show_in_folder(path: String) -> CommandResult<()> {
+    let path = Path::new(&path);
+    if !path.is_file() {
+        return Err("The file no longer exists.".into());
+    }
+    // Explorer wants backslashes, and takes "/select," and the path as one argument.
+    let path: PathBuf = path.components().collect();
+    std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(text)
 }
 
 #[tauri::command]
@@ -235,6 +277,8 @@ pub fn run() {
             set_output,
             supported_extensions,
             play_files,
+            append_files,
+            set_shuffle,
             play,
             pause,
             stop,
@@ -247,7 +291,9 @@ pub fn run() {
             playlist_create,
             playlist_rename,
             playlist_delete,
-            playlist_add_folder,
+            playlist_add,
+            playlist_remove_file,
+            show_in_folder,
             playlist_remove_folder,
             playlist_scan,
         ])
