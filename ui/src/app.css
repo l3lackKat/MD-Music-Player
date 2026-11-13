@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+@theme {
+  --color-base: #0d0e12;
+  --color-panel: #15171c;
+  --color-raised: #1d2027;
+  --color-line: #2a2e37;
+  --color-ink: #eceef2;
+  --color-muted: #8b919e;
+  --color-accent: #a78bfa;
+  --color-good: #6ee7b7;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-base);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Seek bar: a thin track that fills up to the thumb. */
+input[type="range"].seek {
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    var(--color-accent) var(--fill, 0%),
+    var(--color-line) var(--fill, 0%)
+  );
+  cursor: pointer;
+}
+input[type="range"].seek::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--color-ink);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+input[type="range"].seek:hover::-webkit-slider-thumb,
+input[type="range"].seek:focus-visible::-webkit-slider-thumb {
+  opacity: 1;
+}
+input[type="range"].seek:disabled {
+  cursor: default;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 5px;
+  border: 2px solid var(--color-base);
+}

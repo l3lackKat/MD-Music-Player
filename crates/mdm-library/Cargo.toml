@@ -1,0 +1,17 @@
+[package]
+name = "mdm-library"
+description = "Tags, artwork, lyrics, folder scanning and playlists for MDMusic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mdm-decode.workspace = true
+lofty = "0.25"
+walkdir = "2.5"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+lofty = "0.25"

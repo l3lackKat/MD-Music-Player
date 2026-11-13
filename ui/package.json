@@ -1,0 +1,24 @@
+{
+  "name": "mdmusic-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.0.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@tailwindcss/vite": "^4.3.5",
+    "svelte": "^5.57.3",
+    "svelte-check": "^4.0.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^5.6.0",
+    "vite": "^8.3.8"
+  }
+}

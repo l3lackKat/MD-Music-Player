@@ -1,0 +1,25 @@
+[package]
+name = "mdm-engine"
+description = "Bit-perfect playback engine for MDMusic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mdm-decode.workspace = true
+rtrb = "0.4"
+crossbeam-channel = "0.5"
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.27"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+hound = "3.5"

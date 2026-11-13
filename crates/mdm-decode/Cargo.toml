@@ -1,0 +1,14 @@
+[package]
+name = "mdm-decode"
+description = "Audio file decoding for MDMusic: PCM via symphonia, raw DSD from DSF/DFF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+symphonia = { version = "0.6", features = ["all"] }
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+hound = "3.5"
