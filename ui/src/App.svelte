@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
@@ -74,7 +74,39 @@
   // While the thumb is held, the bar follows the pointer, not the player.
   let scrubMs = $state<number | null>(null);
 
-  const shownMs = $derived(scrubMs ?? positionMs);
+  // The player reports the position every 100 ms. Between reports the bar runs on
+  // the clock from the last one, so it moves every frame instead of in steps.
+  /** The last reported position and when it arrived (`performance.now()`). */
+  let anchor = { ms: 0, at: 0 };
+  let smoothMs = $state(0);
+  /** How far past the last report the bar may run before it waits for the next one. */
+  const AHEAD_LIMIT_MS = 250;
+  /** A report this far behind the bar is jitter: the bar holds instead of stepping back. */
+  const JITTER_MS = 400;
+
+  function placePosition(ms: number, jump = false) {
+    positionMs = ms;
+    anchor = { ms, at: performance.now() };
+    if (jump || playState !== "playing") smoothMs = ms;
+  }
+
+  $effect(() => {
+    if (playState !== "playing") {
+      smoothMs = positionMs;
+      return;
+    }
+    anchor = { ms: untrack(() => positionMs), at: performance.now() };
+    let frame = requestAnimationFrame(function step(now) {
+      const next = anchor.ms + Math.min(now - anchor.at, AHEAD_LIMIT_MS);
+      const end = durationMs ?? Infinity;
+      const held = next < smoothMs && smoothMs - next < JITTER_MS;
+      smoothMs = Math.min(held ? smoothMs : next, end);
+      frame = requestAnimationFrame(step);
+    });
+    return () => cancelAnimationFrame(frame);
+  });
+
+  const shownMs = $derived(scrubMs ?? smoothMs);
   const fill = $derived(durationMs ? Math.min(100, (shownMs / durationMs) * 100) : 0);
   const currentTrack = $derived(currentIndex !== null ? (queue[currentIndex] ?? null) : null);
   const playlist = $derived(view === "queue" ? null : (playlists.find((p) => p.id === view) ?? null));
@@ -154,12 +186,12 @@
     queue = [];
     currentIndex = null;
     signalPath = null;
-    positionMs = 0;
+    placePosition(0, true);
     durationMs = null;
   }
 
   async function seekTo(ms: number) {
-    positionMs = ms;
+    placePosition(ms, true);
     await api.seek(ms).catch(showError);
   }
 
@@ -442,11 +474,11 @@
             signalPath = t.signal_path;
           },
           position: (p) => {
-            positionMs = p.ms;
+            placePosition(p.ms);
             if (p.duration_ms !== null || playState !== "stopped") durationMs = p.duration_ms;
           },
           error: showError,
-          queueEnded: () => (positionMs = 0),
+          queueEnded: () => placePosition(0, true),
         }),
       );
       cleanups.push(
@@ -787,12 +819,12 @@
         type="range"
         min="0"
         max={durationMs ?? 0}
-        step="100"
+        step="any"
         value={shownMs}
         style="--fill: {fill}%"
         disabled={!durationMs || playState === "stopped"}
         aria-label="Seek"
-        oninput={(e) => (scrubMs = Number(e.currentTarget.value))}
+        oninput={(e) => (scrubMs = Math.round(Number(e.currentTarget.value)))}
         onchange={commitSeek}
       />
       <span class="w-12 text-xs tabular-nums text-muted">{durationMs ? formatTime(durationMs) : "–:––"}</span>
