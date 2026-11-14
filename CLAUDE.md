@@ -67,6 +67,12 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   added, with duplicates dropped. A track that comes from a folder cannot be
   removed on its own; only single files can. Deleting a playlist never touches
   music files. `files` is `#[serde(default)]` so older playlist files still load.
+- **Sorting a playlist is a view, done in the UI** (`ui/src/lib/sort.ts`). It
+  never changes `playlists.json` or what `scan()` returns. `playlistTracks` in
+  `App.svelte` is the sorted list, and the table, the track menu's row index
+  and `playTracks` must all use that same list. The sort of each playlist is
+  kept in localStorage (`playlistSort`). The queue is not sortable: its order
+  belongs to the engine.
 - **The play order lives in the engine** (`Engine::order`). Shuffle, Next,
   Previous, skipping bad tracks and gapless line-up all go through `after()` /
   `before()`; never step through the queue with `index + 1`.
@@ -115,6 +121,9 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 - Cover art reaches the UI through the `cover://` scheme (`coverUrl()` in
   `api.ts`), served by `cover_response` in `src-tauri/src/lib.rs`. A new image
   source needs its host added to `img-src` in `tauri.conf.json`.
+- `Cover.svelte` in disc mode turns only the inner `.picture`; the outer
+  `.frame` holds the round clip and the shadow and must stay still, or the
+  shadow circles the cover. The mode is saved in localStorage (`coverDisc`).
 - Serde names: Rust struct fields stay snake_case in JSON (`duration_ms`);
   command arguments are camelCase on the JS side (`deviceId`).
 - Tauri is pinned to v2. v3 exists only as an alpha.

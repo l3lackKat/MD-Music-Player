@@ -60,6 +60,10 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   buttons, by dropping folders or files onto the playlist, or from the track
   menu. Press Rescan after files change on disk. Deleting a playlist never
   deletes music.
+- **Sort a playlist** by clicking a column heading (Title, Artist, Album or
+  Time): once for A to Z, again for Z to A, a third time (or the # heading)
+  for the playlist's own order. Play follows the order on screen, and each
+  playlist remembers its sort.
 - **Right-click a track** for its menu: play it, add it to the queue, add it
   to a playlist (or to a new one), remove it from the playlist, or show it in
   File Explorer. Tracks that are in a playlist because of a folder can only be
@@ -69,7 +73,8 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   ends, and tracks of the same format still play gapless.
 - **Cover art** comes from the picture embedded in the file. Without one, an
   image named `cover`, `folder`, `front` or `album` (jpg, png or webp) in the
-  same folder is used.
+  same folder is used. Click the cover to turn it into a round record that
+  spins while the music plays; click again for the square cover.
 - **Lyrics** come from a `.lrc` file with the same name as the track, or else
   from the lyrics tag. Timed lyrics follow the music, and clicking a line
   jumps to it.
@@ -80,8 +85,9 @@ Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`.
 
 Working: playback of a queue of files and folders, pause, seek, next and
 previous, shuffle, gapless, device and mode selection, DSD over DoP, a
-signal-path badge, playlists of folders and tracks, a track menu, tags, cover
-art and lyrics.
+signal-path badge, playlists of folders and tracks, sorting a playlist by
+column, a track menu, tags, cover art (square or as a spinning record) and
+lyrics.
 
 Not built yet: search and a full library index, reordering playlists and the
 queue, repeat, tags for DSF/DFF files (they show file names), media keys and tray,

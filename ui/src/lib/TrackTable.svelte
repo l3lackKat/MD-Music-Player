@@ -1,7 +1,9 @@
 <script lang="ts">
   // A list of tracks. Double-click a row to play from there; right-click
-  // (or the menu key) for the track menu.
+  // (or the menu key) for the track menu. With `onsort`, the column headers
+  // are buttons that sort the list.
   import { formatTime, type TrackMeta } from "./api";
+  import type { SortKey, TrackSort } from "./sort";
   import SourceMark from "./SourceMark.svelte";
 
   let {
@@ -12,6 +14,8 @@
     onmenu,
     menuIndex = null,
     source,
+    sort = null,
+    onsort,
   }: {
     tracks: TrackMeta[];
     /** Path of the track being heard, to highlight its row. */
@@ -23,18 +27,56 @@
     menuIndex?: number | null;
     /** In a playlist: how each track got there. Draws a mark before the title. */
     source?: (track: TrackMeta) => "folder" | "file";
+    /** The column `tracks` is sorted by, to mark its header. `null` is the list's own order. */
+    sort?: TrackSort | null;
+    /** A header was clicked: a column to sort by, or `null` (the # column) for the list's own order. */
+    onsort?: (key: SortKey | null) => void;
   } = $props();
 </script>
+
+{#snippet heading(label: string, key: SortKey, right = false)}
+  {#if onsort}
+    {@const active = sort?.key === key}
+    <button
+      class="flex min-w-0 items-center gap-1 uppercase tracking-wider hover:text-ink {right
+        ? 'justify-end'
+        : ''} {active ? 'text-ink' : ''}"
+      title={active
+        ? sort?.desc
+          ? "Sorted, reversed. Click for the playlist's own order"
+          : "Sorted. Click to reverse"
+        : `Sort by ${label.toLowerCase()}`}
+      onclick={() => onsort(key)}
+    >
+      <span class="truncate">{label}</span>
+      {#if active}<span class="text-[9px] text-accent" aria-hidden="true">{sort?.desc ? "▼" : "▲"}</span>{/if}
+    </button>
+  {:else}
+    <span class={right ? "text-right" : ""}>{label}</span>
+  {/if}
+{/snippet}
 
 <div class="px-3 pb-4">
   <div
     class="grid grid-cols-[2rem_minmax(0,5fr)_minmax(0,3fr)_minmax(0,3fr)_3.5rem] gap-4 border-b border-line px-3 pb-2 text-xs uppercase tracking-wider text-muted"
   >
-    <span class="text-right">#</span>
-    <span>Title</span>
-    <span>Artist</span>
-    <span>Album</span>
-    <span class="text-right">Time</span>
+    {#if onsort}
+      <button
+        class="text-right hover:text-ink disabled:hover:text-muted"
+        title={sort ? "Back to the playlist's own order" : "In the playlist's own order"}
+        aria-label="Playlist order"
+        disabled={!sort}
+        onclick={() => onsort(null)}
+      >
+        #
+      </button>
+    {:else}
+      <span class="text-right">#</span>
+    {/if}
+    {@render heading("Title", "title")}
+    {@render heading("Artist", "artist")}
+    {@render heading("Album", "album")}
+    {@render heading("Time", "time", true)}
   </div>
   {#each tracks as track, index (index)}
     {@const active = track.path === currentPath}

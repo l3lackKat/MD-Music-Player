@@ -7,10 +7,18 @@
     track,
     positionMs,
     onseek,
+    disc,
+    playing,
+    ontoggledisc,
   }: {
     track: TrackMeta | null;
     positionMs: number;
     onseek: (ms: number) => void;
+    /** Show the cover as a round record that turns while `playing`. */
+    disc: boolean;
+    playing: boolean;
+    /** The cover was clicked. */
+    ontoggledisc: () => void;
   } = $props();
 
   let lyrics = $state<Lyrics | null>(null);
@@ -62,7 +70,14 @@
 
 <aside class="flex w-80 shrink-0 flex-col border-l border-line bg-panel">
   <div class="p-5 pb-4">
-    <Cover path={track?.path ?? null} class="aspect-square w-full rounded-xl shadow-lg shadow-black/40" />
+    <Cover
+      path={track?.path ?? null}
+      class="aspect-square w-full rounded-xl shadow-lg shadow-black/40"
+      {disc}
+      spinning={playing}
+      onclick={ontoggledisc}
+      title={disc ? "Click for the square cover" : "Click to spin the cover like a record"}
+    />
     <p class="mt-4 select-text truncate text-[15px] font-semibold" title={track?.title}>
       {track?.title ?? "Not playing"}
     </p>

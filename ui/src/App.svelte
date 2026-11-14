@@ -21,6 +21,7 @@
   import Cover from "./lib/Cover.svelte";
   import EqPanel from "./lib/EqPanel.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
+  import { loadSorts, nextSort, saveSorts, sortTracks, type PlaylistSorts, type SortKey } from "./lib/sort";
   import SourceMark from "./lib/SourceMark.svelte";
   import TrackInfo from "./lib/TrackInfo.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
@@ -53,6 +54,8 @@
   /** Tracks found by the last scan of each playlist, by playlist id. */
   let scanned = $state<Record<number, TrackMeta[]>>({});
   let scanningId = $state<number | null>(null);
+  /** The column each playlist is sorted by; a playlist not listed is in its own order. */
+  let sorts = $state<PlaylistSorts>(loadSorts());
   let newName = $state<string | null>(null);
   let renaming = $state<string | null>(null);
 
@@ -72,6 +75,8 @@
   let infoTrack = $state<TrackMeta | null>(null);
   let dragging = $state(false);
   let showPanel = $state(true);
+  /** The cover is shown as a round record that turns while playing. Clicking a cover switches it. */
+  let disc = $state(loadDisc());
   // While the thumb is held, the bar follows the pointer, not the player.
   let scrubMs = $state<number | null>(null);
 
@@ -111,7 +116,12 @@
   const fill = $derived(durationMs ? Math.min(100, (shownMs / durationMs) * 100) : 0);
   const currentTrack = $derived(currentIndex !== null ? (queue[currentIndex] ?? null) : null);
   const playlist = $derived(view === "queue" ? null : (playlists.find((p) => p.id === view) ?? null));
-  const playlistTracks = $derived(playlist ? (scanned[playlist.id] ?? null) : null);
+  const playlistSort = $derived(playlist ? (sorts[playlist.id] ?? null) : null);
+  /** The open playlist's tracks as listed and played: the last scan, in the chosen sort. */
+  const playlistTracks = $derived.by(() => {
+    const found = playlist ? (scanned[playlist.id] ?? null) : null;
+    return found && sortTracks(found, playlistSort);
+  });
 
   const sourceLabel = $derived.by(() => {
     if (!signalPath) return "";
@@ -134,6 +144,21 @@
     notice = message;
     clearTimeout(noticeTimer);
     noticeTimer = setTimeout(() => (notice = null), 2500);
+  }
+
+  function loadDisc(): boolean {
+    try {
+      return localStorage.getItem("coverDisc") === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function toggleDisc() {
+    disc = !disc;
+    try {
+      localStorage.setItem("coverDisc", disc ? "1" : "0");
+    } catch {}
   }
 
   // ---- Queue and transport ----
@@ -313,6 +338,8 @@
       await api.playlistDelete(id);
       playlists = playlists.filter((p) => p.id !== id);
       delete scanned[id];
+      delete sorts[id];
+      saveSorts(sorts);
       view = "queue";
     } catch (e) {
       showError(e);
@@ -369,6 +396,21 @@
     } catch (e) {
       showError(e);
     }
+  }
+
+  /**
+   * A column header was clicked in the open playlist: sort by it, reverse it,
+   * or (third click, or the # column) go back to the playlist's own order.
+   * Only the list and what Play starts change; a queue already playing keeps its order.
+   */
+  function sortPlaylist(key: SortKey | null) {
+    if (!playlist) return;
+    const next = key === null ? null : nextSort(playlistSort, key);
+    if (next) sorts[playlist.id] = next;
+    else delete sorts[playlist.id];
+    saveSorts(sorts);
+    // The rows moved, so an open track menu no longer belongs to its row.
+    menu = null;
   }
 
   async function removeFromPlaylist(id: number, path: string) {
@@ -742,6 +784,8 @@
             onmenu={(index, x, y) => openTrackMenu(playlistTracks, index, x, y)}
             menuIndex={menu?.row ?? null}
             source={(track) => (playlist && holdsFile(playlist, track.path) ? "file" : "folder")}
+            sort={playlistSort}
+            onsort={sortPlaylist}
           />
         {:else if playlistTracks && scanningId !== playlist.id}
           <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found for this playlist.</p>
@@ -803,7 +847,14 @@
     </main>
 
     {#if showPanel}
-      <NowPlaying track={currentTrack} {positionMs} onseek={seekTo} />
+      <NowPlaying
+        track={currentTrack}
+        {positionMs}
+        onseek={seekTo}
+        {disc}
+        playing={playState === "playing"}
+        ontoggledisc={toggleDisc}
+      />
     {/if}
   </div>
 
@@ -829,7 +880,14 @@
 
     <div class="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-4">
       <div class="flex min-w-0 items-center gap-3">
-        <Cover path={currentTrack?.path ?? null} class="h-11 w-11 shrink-0 rounded-md" />
+        <Cover
+          path={currentTrack?.path ?? null}
+          class="h-11 w-11 shrink-0 rounded-md"
+          {disc}
+          spinning={playState === "playing"}
+          onclick={toggleDisc}
+          title={disc ? "Click for the square cover" : "Click to spin the cover like a record"}
+        />
         <div class="min-w-0">
           <p class="truncate text-sm font-medium">{currentTrack?.title ?? "Not playing"}</p>
           {#if currentTrack?.artist}
