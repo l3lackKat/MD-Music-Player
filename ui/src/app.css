@@ -101,6 +101,16 @@ input[type="range"].eq-slider::-webkit-slider-thumb {
   box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
 }
 
+/* Loading marks wait a moment before they show, so a quick load does not flash one. */
+@keyframes appear-late {
+  from {
+    opacity: 0;
+  }
+}
+.appear-late {
+  animation: appear-late 0.2s ease-out 0.15s backwards;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
 }

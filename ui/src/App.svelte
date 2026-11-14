@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import { SvelteSet } from "svelte/reactivity";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
@@ -23,6 +24,7 @@
   import NowPlaying from "./lib/NowPlaying.svelte";
   import { loadSorts, nextSort, saveSorts, sortTracks, type PlaylistSorts, type SortKey } from "./lib/sort";
   import SourceMark from "./lib/SourceMark.svelte";
+  import Spinner from "./lib/Spinner.svelte";
   import TrackInfo from "./lib/TrackInfo.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
@@ -53,7 +55,10 @@
   let view = $state<"queue" | number>("queue");
   /** Tracks found by the last scan of each playlist, by playlist id. */
   let scanned = $state<Record<number, TrackMeta[]>>({});
-  let scanningId = $state<number | null>(null);
+  /** Ids of the playlists being scanned right now. */
+  const scanning = new SvelteSet<number>();
+  /** The newest scan started for each playlist. One that finishes after a newer one began is dropped. */
+  const scanRun = new Map<number, number>();
   /** The column each playlist is sorted by; a playlist not listed is in its own order. */
   let sorts = $state<PlaylistSorts>(loadSorts());
   let newName = $state<string | null>(null);
@@ -122,6 +127,8 @@
     const found = playlist ? (scanned[playlist.id] ?? null) : null;
     return found && sortTracks(found, playlistSort);
   });
+  /** The open playlist is being scanned. */
+  const playlistLoading = $derived(playlist !== null && scanning.has(playlist.id));
 
   const sourceLabel = $derived.by(() => {
     if (!signalPath) return "";
@@ -289,20 +296,23 @@
   }
 
   async function scan(id: number) {
-    scanningId = id;
+    const run = (scanRun.get(id) ?? 0) + 1;
+    scanRun.set(id, run);
+    scanning.add(id);
     try {
-      scanned[id] = await api.playlistScan(id);
+      const found = await api.playlistScan(id);
+      if (scanRun.get(id) === run) scanned[id] = found;
     } catch (e) {
-      showError(e);
+      if (scanRun.get(id) === run) showError(e);
     } finally {
-      if (scanningId === id) scanningId = null;
+      if (scanRun.get(id) === run) scanning.delete(id);
     }
   }
 
   function openPlaylist(id: number) {
     view = id;
     renaming = null;
-    if (!(id in scanned)) void scan(id);
+    if (!(id in scanned) && !scanning.has(id)) void scan(id);
   }
 
   async function createPlaylist() {
@@ -338,6 +348,9 @@
       await api.playlistDelete(id);
       playlists = playlists.filter((p) => p.id !== id);
       delete scanned[id];
+      // A scan still running for it is dropped when it comes back.
+      scanRun.delete(id);
+      scanning.delete(id);
       delete sorts[id];
       saveSorts(sorts);
       view = "queue";
@@ -627,13 +640,16 @@
       <p class="px-3 pb-1 pt-4 text-xs font-medium uppercase tracking-wider text-muted">Playlists</p>
       {#each playlists as item (item.id)}
         <button
-          class="truncate rounded-lg px-3 py-2 text-left {view === item.id
+          class="flex items-center gap-2 rounded-lg px-3 py-2 text-left {view === item.id
             ? 'bg-raised font-medium text-ink'
             : 'text-muted hover:bg-raised hover:text-ink'}"
           onclick={() => openPlaylist(item.id)}
           title={item.name}
         >
-          {item.name}
+          <span class="min-w-0 flex-1 truncate">{item.name}</span>
+          {#if scanning.has(item.id)}
+            <span class="appear-late flex"><Spinner /></span>
+          {/if}
         </button>
       {/each}
 
@@ -697,7 +713,7 @@
               </button>
               <button
                 class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink disabled:opacity-40"
-                disabled={scanningId === playlist.id}
+                disabled={playlistLoading}
                 title="Look in the folders again for new or removed files"
                 onclick={() => playlist && scan(playlist.id)}
               >
@@ -715,9 +731,15 @@
             </div>
           </div>
 
-          <p class="mt-1 text-xs text-muted">
-            {#if scanningId === playlist.id}
-              Scanning folders…
+          <!-- `min-h-4` keeps the line's height while it is blank during the first load. -->
+          <p class="mt-1 min-h-4 text-xs text-muted">
+            {#if playlistLoading}
+              <!-- The first load is shown in the list area below; this is a rescan over the old list. -->
+              {#if playlistTracks && playlistTracks.length > 0}
+                <span class="inline-flex items-center gap-1.5 align-middle" role="status">
+                  <Spinner /> Scanning folders…
+                </span>
+              {/if}
             {:else if playlistTracks}
               {playlistTracks.length} {playlistTracks.length === 1 ? "track" : "tracks"}
               · {formatTime(playlistTracks.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
@@ -787,7 +809,12 @@
             sort={playlistSort}
             onsort={sortPlaylist}
           />
-        {:else if playlistTracks && scanningId !== playlist.id}
+        {:else if playlistLoading}
+          <div class="appear-late flex flex-col items-center gap-3 px-6 py-16 text-sm text-muted" role="status">
+            <Spinner class="h-6 w-6" />
+            <p>Loading tracks…</p>
+          </div>
+        {:else if playlistTracks}
           <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found for this playlist.</p>
         {/if}
       {:else if queue.length === 0}
