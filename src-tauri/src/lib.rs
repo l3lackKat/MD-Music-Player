@@ -3,20 +3,25 @@
 //!
 //! The UI calls the commands below, listens for `player://…` events
 //! forwarded from the player thread, listens for `volume://changed` when the
-//! device's Windows volume changes, and loads cover art through the `cover`
-//! URL scheme.
+//! device's Windows volume changes and `output://…` while a device that went
+//! away is waited for, and loads cover art through the `cover` URL scheme.
+
+mod media_controls;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use mdm_engine::{
-    Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, VolumeChange,
-    VolumeWatch, WasapiBackend,
+    Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, Repeat,
+    VolumeChange, VolumeWatch, WasapiBackend,
 };
 use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::http::{header, Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use media_controls::{Button, MediaControls};
 
 #[derive(Debug, Clone, Serialize)]
 struct OutputSettings {
@@ -34,6 +39,9 @@ struct OutputSettings {
     /// The device was at full volume when it was chosen (or at launch), so it
     /// was turned down to `SAFE_LEVEL` before anything played.
     volume_lowered: bool,
+    /// At launch: the name of the saved device, which was not connected, so
+    /// the Windows default is used for now. The saved choice is kept.
+    missing_device: Option<String>,
 }
 
 /// At or above this, a device just chosen counts as being at full volume.
@@ -66,7 +74,14 @@ impl OutputSettings {
         }
         let exclusive_available = volume.map(|v| v.hardware).unwrap_or(false);
         let mode = if exclusive_available { wanted } else { OutputMode::Shared };
-        OutputSettings { device_id, mode, wanted, exclusive_available, volume_lowered }
+        OutputSettings {
+            device_id,
+            mode,
+            wanted,
+            exclusive_available,
+            volume_lowered,
+            missing_device: None,
+        }
     }
 
     fn backend(&self) -> WasapiBackend {
@@ -74,12 +89,81 @@ impl OutputSettings {
     }
 }
 
+/// The output the user last picked, kept in `output.json` between launches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedOutput {
+    /// `None` follows the Windows default device.
+    #[serde(default)]
+    device_id: Option<String>,
+    /// For telling the user which device is missing.
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default = "exclusive")]
+    mode: OutputMode,
+}
+
+fn exclusive() -> OutputMode {
+    OutputMode::Exclusive
+}
+
+impl Default for SavedOutput {
+    fn default() -> Self {
+        SavedOutput { device_id: None, device_name: None, mode: OutputMode::Exclusive }
+    }
+}
+
+fn load_saved_output(path: &Path) -> SavedOutput {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_output(path: &Path, saved: &SavedOutput) {
+    let result = serde_json::to_vec_pretty(saved).map_err(text).and_then(|json| {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(text)?;
+        }
+        std::fs::write(path, json).map_err(text)
+    });
+    if let Err(e) = result {
+        tracing::warn!("could not save the output device: {e}");
+    }
+}
+
+/// The output to start with: the saved device if it is connected, else the
+/// Windows default (keeping the saved mode).
+fn startup_output(saved: &SavedOutput) -> OutputSettings {
+    let mut missing = None;
+    let device_id = match &saved.device_id {
+        Some(id) => {
+            let connected = mdm_engine::list_devices()
+                .map(|list| list.iter().any(|d| &d.id == id))
+                .unwrap_or(false);
+            if connected {
+                Some(id.clone())
+            } else {
+                missing = Some(saved.device_name.clone().unwrap_or_else(|| "The saved output device".into()));
+                None
+            }
+        }
+        None => None,
+    };
+    let mut output = OutputSettings::resolve(device_id, saved.mode, true);
+    output.missing_device = missing;
+    output
+}
+
 struct AppState {
     player: Player,
     output: Mutex<OutputSettings>,
+    output_path: PathBuf,
     /// Follows the selected device's Windows volume, so the UI moves when it
     /// is changed in Windows, by volume keys or on the DAC.
     volume_watch: Mutex<Option<VolumeWatch>>,
+    /// Bumped to call off a wait for a device that went away (see
+    /// `reconnect_when_back`).
+    reconnect: Mutex<u64>,
     playlists: Mutex<PlaylistStore>,
     eq: Mutex<EqSettings>,
     eq_path: PathBuf,
@@ -114,12 +198,107 @@ fn set_output(
     device_id: Option<String>,
     mode: OutputMode,
 ) -> OutputSettings {
+    cancel_reconnect(&state);
     let device_changed = state.output.lock().unwrap().device_id != device_id;
     let output = OutputSettings::resolve(device_id, mode, device_changed);
     state.player.send(Command::SetOutput(Box::new(output.backend())));
     watch_volume(&app, &state, output.device_id.as_deref());
     *state.output.lock().unwrap() = output.clone();
+
+    let device_name = output.device_id.as_ref().and_then(|id| {
+        mdm_engine::list_devices().ok()?.into_iter().find(|d| &d.id == id).map(|d| d.name)
+    });
+    let saved = SavedOutput { device_id: output.device_id.clone(), device_name, mode: output.wanted };
+    save_output(&state.output_path, &saved);
     output
+}
+
+// ---- Reconnecting ----------------------------------------------------------
+
+/// How often to look for a device that went away.
+const RECONNECT_POLL: Duration = Duration::from_secs(1);
+/// A device still listed this long after it failed was not unplugged
+/// (driver error, taken by another app): stop waiting for it.
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(4);
+/// Time for a replugged device's driver to settle before it is opened.
+const RECONNECT_SETTLE: Duration = Duration::from_millis(700);
+
+#[derive(Clone, Serialize)]
+struct Reconnected {
+    output: OutputSettings,
+    /// The device that came back.
+    device: String,
+}
+
+/// Stop waiting for a device that went away: the user took over.
+fn cancel_reconnect(state: &AppState) {
+    *state.reconnect.lock().unwrap() += 1;
+}
+
+/// The device playing `device_name` stopped mid-stream. Wait for it to come
+/// back and resume there.
+fn start_reconnect(app: &AppHandle, device_name: String) {
+    let state = app.state::<AppState>();
+    let generation = {
+        let mut g = state.reconnect.lock().unwrap();
+        *g += 1;
+        *g
+    };
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("mdm-reconnect".into())
+        .spawn(move || reconnect_when_back(app, generation, device_name));
+    if let Err(e) = spawned {
+        tracing::warn!("not waiting for the device to come back: {e}");
+    }
+}
+
+/// Poll the device list. Once the device has been gone and is back (and, when
+/// following the Windows default, is the default again), reopen it with the
+/// full-volume guard, since Windows tends to reset a replugged DAC to 100%,
+/// and play on from where it stopped. A device that never leaves the list was
+/// not unplugged, and is left alone.
+fn reconnect_when_back(app: AppHandle, generation: u64, device_name: String) {
+    let state = app.state::<AppState>();
+    let current = || *state.reconnect.lock().unwrap() == generation;
+    let started = Instant::now();
+    let mut gone = false;
+    loop {
+        std::thread::sleep(RECONNECT_POLL);
+        if !current() {
+            return;
+        }
+        let output = state.output.lock().unwrap().clone();
+        let devices = mdm_engine::list_devices().unwrap_or_default();
+        let back = devices.iter().any(|d| match &output.device_id {
+            Some(id) => &d.id == id,
+            None => d.is_default && d.name == device_name,
+        });
+        if !back {
+            if !gone {
+                gone = true;
+                let _ = app.emit("output://waiting", &device_name);
+            }
+            continue;
+        }
+        if !gone {
+            if started.elapsed() >= RECONNECT_GIVE_UP {
+                return;
+            }
+            continue;
+        }
+        std::thread::sleep(RECONNECT_SETTLE);
+        if !current() {
+            return;
+        }
+        let output = OutputSettings::resolve(output.device_id, output.wanted, true);
+        state.player.send(Command::SetOutput(Box::new(output.backend())));
+        watch_volume(&app, &state, output.device_id.as_deref());
+        *state.output.lock().unwrap() = output.clone();
+        state.player.send(Command::Play);
+        let _ = app.emit("output://reconnected", Reconnected { output, device: device_name });
+        return;
+    }
 }
 
 /// Emit `volume://changed` whenever `device_id`'s volume changes, replacing
@@ -200,6 +379,7 @@ fn supported_extensions() -> Vec<&'static str> {
 
 #[tauri::command]
 fn play_files(state: State<AppState>, paths: Vec<String>, index: usize) {
+    cancel_reconnect(&state);
     let paths = paths.into_iter().map(PathBuf::from).collect();
     state.player.send(Command::Load { paths, index });
 }
@@ -210,13 +390,31 @@ fn append_files(state: State<AppState>, paths: Vec<String>) {
     state.player.send(Command::Append(paths.into_iter().map(PathBuf::from).collect()));
 }
 
+/// Take one track out of the queue. The UI removes it from its own list too.
+#[tauri::command]
+fn queue_remove(state: State<AppState>, index: usize) {
+    state.player.send(Command::Remove(index));
+}
+
+/// Move a queue track so it ends up at `to`. The UI moves it in its own list too.
+#[tauri::command]
+fn queue_move(state: State<AppState>, from: usize, to: usize) {
+    state.player.send(Command::Move { from, to });
+}
+
 #[tauri::command]
 fn set_shuffle(state: State<AppState>, on: bool) {
     state.player.send(Command::SetShuffle(on));
 }
 
 #[tauri::command]
+fn set_repeat(state: State<AppState>, repeat: Repeat) {
+    state.player.send(Command::SetRepeat(repeat));
+}
+
+#[tauri::command]
 fn play(state: State<AppState>) {
+    cancel_reconnect(&state);
     state.player.send(Command::Play);
 }
 
@@ -227,6 +425,7 @@ fn pause(state: State<AppState>) {
 
 #[tauri::command]
 fn stop(state: State<AppState>) {
+    cancel_reconnect(&state);
     state.player.send(Command::Stop);
 }
 
@@ -370,11 +569,35 @@ fn event_name(event: &Event) -> &'static str {
     match event {
         Event::State { .. } => "player://state",
         Event::Track { .. } => "player://track",
+        Event::Current { .. } => "player://current",
         Event::Position { .. } => "player://position",
         Event::Error { .. } => "player://error",
+        Event::DeviceLost { .. } => "player://device-lost",
         Event::QueueEnded => "player://queue-ended",
     }
 }
+
+/// A media key or the Windows media overlay was used.
+fn on_media_button(app: &AppHandle, button: Button) {
+    let state = app.state::<AppState>();
+    let command = match button {
+        Button::Play => {
+            cancel_reconnect(&state);
+            Command::Play
+        }
+        Button::Pause => Command::Pause,
+        Button::Stop => {
+            cancel_reconnect(&state);
+            Command::Stop
+        }
+        Button::Next => Command::Next,
+        Button::Previous => Command::Previous,
+    };
+    state.player.send(command);
+}
+
+/// How long closing the app waits for the fade-out and the device to be let go.
+const EXIT_WAIT: Duration = Duration::from_millis(1500);
 
 /// Open the playlist file. If it cannot be read, set it aside and start
 /// empty rather than refusing to launch.
@@ -397,10 +620,11 @@ pub fn run() {
             std::thread::spawn(move || responder.respond(cover_response(&uri_path)));
         })
         .setup(|app| {
-            let output = OutputSettings::resolve(None, OutputMode::Exclusive, true);
+            let data_dir = app.path().app_data_dir()?;
+            let output_path = data_dir.join("output.json");
+            let output = startup_output(&load_saved_output(&output_path));
             let player = Player::new(Box::new(output.backend()));
             let events = player.events();
-            let data_dir = app.path().app_data_dir()?;
             let playlists = open_playlists(&data_dir.join("playlists.json"));
             let eq_path = data_dir.join("eq.json");
             let eq = load_eq(&eq_path);
@@ -409,17 +633,45 @@ pub fn run() {
             app.manage(AppState {
                 player,
                 output: Mutex::new(output),
+                output_path,
                 volume_watch: Mutex::new(None),
+                reconnect: Mutex::new(0),
                 playlists: Mutex::new(playlists),
                 eq: Mutex::new(eq),
                 eq_path,
             });
             watch_volume(app.handle(), &app.state::<AppState>(), device_id.as_deref());
 
+            // Media keys and the Windows media overlay. The app works without them.
+            let media = app.get_webview_window("main").and_then(|window| {
+                let hwnd = window.hwnd().ok()?;
+                let handle = app.handle().clone();
+                MediaControls::new(hwnd, move |button| on_media_button(&handle, button))
+                    .map_err(|e| tracing::warn!("no media controls: {e}"))
+                    .ok()
+            });
+
             // Forward player events to the UI for as long as the player lives.
             let handle = app.handle().clone();
             std::thread::Builder::new().name("mdm-events".into()).spawn(move || {
+                // The device of the track being heard, to wait for if it goes away.
+                let mut device = String::new();
                 for event in events {
+                    match &event {
+                        Event::State { state } => {
+                            if let Some(m) = &media {
+                                m.set_state(*state);
+                            }
+                        }
+                        Event::Track { path, signal_path, .. } => {
+                            device = signal_path.device.clone();
+                            if let Some(m) = &media {
+                                m.set_track(path);
+                            }
+                        }
+                        Event::DeviceLost { .. } => start_reconnect(&handle, device.clone()),
+                        _ => {}
+                    }
                     if let Err(e) = handle.emit(event_name(&event), &event) {
                         tracing::warn!("could not emit a player event: {e}");
                     }
@@ -438,7 +690,10 @@ pub fn run() {
             supported_extensions,
             play_files,
             append_files,
+            queue_remove,
+            queue_move,
             set_shuffle,
+            set_repeat,
             play,
             pause,
             stop,
@@ -461,10 +716,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to start MDMusic")
         .run(|app, event| {
-            // Release the audio device before the process goes away.
+            // The window is gone: fade out and release the audio device
+            // before the process goes away.
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
-                state.player.send(Command::Stop);
+                cancel_reconnect(&state);
+                state.player.quit(EXIT_WAIT);
                 state.volume_watch.lock().unwrap().take();
             }
         });

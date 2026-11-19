@@ -6,6 +6,7 @@
   import {
     api,
     holdsFile,
+    listenOutput,
     listenPlayer,
     formatRate,
     formatTime,
@@ -15,6 +16,7 @@
     type OutputSettings,
     type Playlist,
     type PlayState,
+    type Repeat,
     type SignalPath,
     type TrackMeta,
   } from "./lib/api";
@@ -48,6 +50,8 @@
   /** Exclusive needs a hardware volume, else the level is stuck at full. */
   let exclusiveAvailable = $state(true);
   let volumeControl = $state<ReturnType<typeof VolumeControl>>();
+  /** The device that was unplugged mid-track; playback resumes when it is back. */
+  let waitingFor = $state<string | null>(null);
 
   // ---- Playlists ----
   let playlists = $state<Playlist[]>([]);
@@ -65,6 +69,7 @@
   let renaming = $state<string | null>(null);
 
   let shuffle = $state(false);
+  let repeat = $state<Repeat>("off");
   /** The equalizer, as last saved. `null` until loaded. */
   let eq = $state<EqSettings | null>(null);
   let showEq = $state(false);
@@ -172,6 +177,7 @@
 
   async function playQueue(index: number) {
     error = null;
+    waitingFor = null;
     await api.playFiles(queue.map((t) => t.path), index).catch(showError);
   }
 
@@ -201,6 +207,63 @@
     await api.setShuffle(shuffle).catch(showError);
   }
 
+  const REPEAT_NEXT: Record<Repeat, Repeat> = { off: "all", all: "one", one: "off" };
+  const REPEAT_TITLE: Record<Repeat, string> = {
+    off: "Repeat is off",
+    all: "Repeat all: the queue starts over after the last track",
+    one: "Repeat one: the current track plays again",
+  };
+
+  function loadRepeat(): Repeat {
+    try {
+      const saved = localStorage.getItem("repeat");
+      if (saved === "all" || saved === "one") return saved;
+    } catch {}
+    return "off";
+  }
+
+  /** Off, then all, then one. */
+  async function cycleRepeat() {
+    repeat = REPEAT_NEXT[repeat];
+    try {
+      localStorage.setItem("repeat", repeat);
+    } catch {}
+    await api.setRepeat(repeat).catch(showError);
+  }
+
+  /** Take a track out of the queue, here and in the engine. */
+  async function removeFromQueue(index: number) {
+    if (index < 0 || index >= queue.length) return;
+    queue = queue.filter((_, i) => i !== index);
+    if (queue.length === 0) {
+      // Nothing left: the engine stops on its own.
+      currentIndex = null;
+      signalPath = null;
+      placePosition(0, true);
+      durationMs = null;
+    } else if (currentIndex !== null && currentIndex > index) {
+      currentIndex -= 1;
+    }
+    // Removing the track being heard: the engine moves on and announces the next one.
+    await api.queueRemove(index).catch(showError);
+  }
+
+  /** Move a queue track so it ends up at `to`, here and in the engine. */
+  async function moveInQueue(from: number, to: number) {
+    const moved = [...queue];
+    const [track] = moved.splice(from, 1);
+    moved.splice(to, 0, track);
+    queue = moved;
+    const c = currentIndex;
+    if (c !== null) {
+      if (c === from) currentIndex = to;
+      else if (from < c && c <= to) currentIndex = c - 1;
+      else if (to <= c && c < from) currentIndex = c + 1;
+    }
+    menu = null;
+    await api.queueMove(from, to).catch(showError);
+  }
+
   async function pickFiles() {
     const extensions = await api.supportedExtensions();
     const picked = await open({ multiple: true, filters: [{ name: "Audio", extensions }] });
@@ -209,6 +272,7 @@
 
   async function togglePlay() {
     error = null;
+    if (playState !== "playing") waitingFor = null;
     if (playState === "playing") await api.pause().catch(showError);
     else if (playState === "paused") await api.play().catch(showError);
     else if (queue.length > 0) await playQueue(currentIndex ?? 0);
@@ -216,6 +280,7 @@
 
   async function clearQueue() {
     await api.stop().catch(showError);
+    waitingFor = null;
     queue = [];
     currentIndex = null;
     signalPath = null;
@@ -247,6 +312,8 @@
   /** Open the output; `null` if that failed. */
   async function applyOutput(): Promise<OutputSettings | null> {
     error = null;
+    // Choosing an output calls off waiting for an unplugged device.
+    waitingFor = null;
     try {
       const output = await api.setOutput(deviceId, wantedMode);
       takeOutput(output);
@@ -279,6 +346,8 @@
   /** On focus: re-read the volume, and re-check exclusive if the device changed meanwhile (e.g. a new Windows default). */
   async function onWindowFocus() {
     const volume = await volumeControl?.refresh();
+    // While an unplugged device is awaited, re-applying would give up on it.
+    if (waitingFor !== null) return;
     if ((volume?.hardware ?? false) !== exclusiveAvailable) {
       await applyOutput();
       await volumeControl?.refresh();
@@ -460,7 +529,9 @@
     const items: MenuItem[] = [
       { label: "Play", action: () => (inQueue ? playQueue(index) : playTracks(tracks, index)) },
     ];
-    if (!inQueue) {
+    if (inQueue) {
+      items.push({ label: "Remove from queue", danger: true, action: () => removeFromQueue(index) });
+    } else {
       items.push({
         label: "Add to queue",
         action: async () => {
@@ -512,13 +583,17 @@
     (async () => {
       const output = await api.getOutput();
       takeOutput(output);
-      const notice = outputNotice(output, "The output device");
+      const notice = output.missing_device
+        ? `${output.missing_device} is not connected, so the system default is used for now`
+        : outputNotice(output, "The output device");
       if (notice) showNotice(notice);
       playlists = await api.playlists();
       try {
         shuffle = localStorage.getItem("shuffle") === "1";
       } catch {}
       await api.setShuffle(shuffle);
+      repeat = loadRepeat();
+      await api.setRepeat(repeat);
       eq = await api.getEq();
       await refreshDevices();
 
@@ -529,12 +604,35 @@
             currentIndex = t.index;
             signalPath = t.signal_path;
           },
+          current: (index) => (currentIndex = index),
           position: (p) => {
             placePosition(p.ms);
             if (p.duration_ms !== null || playState !== "stopped") durationMs = p.duration_ms;
           },
           error: showError,
+          deviceLost: showError,
           queueEnded: () => placePosition(0, true),
+        }),
+      );
+      cleanups.push(
+        await listenOutput({
+          waiting: (device) => {
+            waitingFor = device;
+            showError(`${device} was disconnected. Playback resumes when it is plugged back in.`);
+            void refreshDevices();
+          },
+          reconnected: async ({ output, device }) => {
+            waitingFor = null;
+            error = null;
+            takeOutput(output);
+            await refreshDevices();
+            await volumeControl?.refresh();
+            showNotice(
+              output.volume_lowered
+                ? `${device} is back at 100%, turned down to 10% to be safe`
+                : `${device} is back, playing again`,
+            );
+          },
         }),
       );
       cleanups.push(
@@ -852,6 +950,7 @@
           onplay={playQueue}
           onmenu={(index, x, y) => openTrackMenu(queue, index, x, y)}
           menuIndex={menu?.row ?? null}
+          onmove={moveInQueue}
         />
       {/if}
 
@@ -966,8 +1065,22 @@
         >
           <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z" /></svg>
         </button>
-        <!-- Balances the shuffle button so play stays centred. -->
-        <span class="w-9" aria-hidden="true"></span>
+        <button
+          class="relative grid h-9 w-9 place-items-center rounded-full hover:bg-raised {repeat !== 'off'
+            ? 'text-accent'
+            : 'text-muted hover:text-ink'}"
+          onclick={cycleRepeat}
+          aria-label="Repeat: {repeat}"
+          title={REPEAT_TITLE[repeat]}
+        >
+          <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m17 2 4 4-4 4M3 11V10a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v1a4 4 0 0 1-4 4H3" />
+          </svg>
+          {#if repeat === "one"}
+            <span class="absolute right-1 top-1 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent text-[9px] font-bold leading-none text-base">1</span>
+          {/if}
+          {#if repeat !== "off"}<span class="absolute bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
+        </button>
       </div>
 
       <!-- Signal path: what the file is, what the device receives -->

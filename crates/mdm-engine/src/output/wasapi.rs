@@ -283,4 +283,11 @@ impl Backend for WasapiBackend {
             thread: Some(thread),
         })
     }
+
+    /// The device's Windows volume, which in exclusive mode is the DAC's own
+    /// control. In shared mode it also dips other apps on the device for the
+    /// length of the fade.
+    fn fader(&self) -> Option<Box<dyn super::Fader>> {
+        Some(Box::new(super::EndpointFader::new(self.device_id.clone())))
+    }
 }

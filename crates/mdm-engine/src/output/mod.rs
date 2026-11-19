@@ -22,7 +22,9 @@ use crate::Result;
 
 pub use file_sink::FileSink;
 #[cfg(windows)]
-pub use volume::{get_volume, set_volume, watch_volume, DeviceVolume, VolumeChange, VolumeWatch};
+pub use volume::{
+    get_volume, set_volume, watch_volume, DeviceVolume, EndpointFader, VolumeChange, VolumeWatch,
+};
 #[cfg(windows)]
 pub use wasapi::{list_devices, WasapiBackend};
 
@@ -49,6 +51,24 @@ pub enum OutputMode {
 pub trait Backend: Send {
     /// Open a stream for the request, negotiating the container with the device.
     fn open(&self, req: &FormatRequest) -> Result<Stream>;
+
+    /// A level control after the samples, used to fade around pause, resume
+    /// and exit. `None` pauses and resumes at once.
+    fn fader(&self) -> Option<Box<dyn Fader>> {
+        None
+    }
+}
+
+/// Turns the level down and back up without touching a sample: the device's
+/// own volume for WASAPI. Calls must not block for long; they run on the
+/// player thread.
+pub trait Fader: Send {
+    /// Take the level as it is now as the full level of the fades that follow.
+    fn capture(&mut self);
+    /// Set the level to `fraction` (0 to 1) of the captured level.
+    fn set(&mut self, fraction: f32);
+    /// Wait until the changes sent so far have been applied.
+    fn sync(&mut self) {}
 }
 
 /// State shared between the player and a backend thread.

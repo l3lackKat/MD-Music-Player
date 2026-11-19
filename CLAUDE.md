@@ -62,6 +62,27 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   A device found at 100% at launch or when switched to is turned down to 10%
   before its stream opens (`FULL_LEVEL`/`SAFE_LEVEL` in `src-tauri/src/lib.rs`),
   since Windows often resets USB DACs to 100%. Changing only the mode does not.
+  The chosen device and mode are saved in `%APPDATA%\com.mdmusic.app\output.json`
+  (only by `set_output`). A saved device that is not connected at launch falls
+  back to the Windows default for that run (`missing_device`), keeping the file.
+- **Fades move the device volume, never the samples.** Pause fades out
+  (`FADE_OUT`), resume fades in, closing the app fades out (`Player::quit`).
+  The engine drives a `Fader` from `Backend::fader()`; for WASAPI that is
+  `EndpointFader` (`output/volume.rs`), which sets the Windows volume with the
+  `FADE_CONTEXT` GUID so `watch_volume` ignores those steps and the slider
+  stays put. After a fade-out the level goes back up behind the silence
+  (`FADE_SETTLE`), so a pause never leaves the device turned down. In shared
+  mode a fade briefly dips other apps on the same device too.
+- **A device unplugged mid-track is waited for** (`reconnect_when_back` in
+  `src-tauri/src/lib.rs`): the engine stops with `Event::DeviceLost`, and once
+  the device has left the device list and come back (as the default again when
+  following the default) it is reopened through `OutputSettings::resolve` with
+  the full-volume guard and plays on. A device that never leaves the list is
+  not waited for. Any user choice (play, stop, new queue, new output) calls the
+  wait off (`cancel_reconnect`).
+- **Media keys** go through the Windows media controls
+  (`src-tauri/src/media_controls.rs`, SMTC on the main window). Their buttons
+  send engine commands directly; the UI follows from the engine's events.
 - **A playlist is folders plus single files.** Its tracks are the folders'
   audio (scanned each time, album order), then the single files in the order
   added, with duplicates dropped. A track that comes from a folder cannot be
@@ -73,12 +94,18 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   and `playTracks` must all use that same list. The sort of each playlist is
   kept in localStorage (`playlistSort`). The queue is not sortable: its order
   belongs to the engine.
-- **The play order lives in the engine** (`Engine::order`). Shuffle, Next,
-  Previous, skipping bad tracks and gapless line-up all go through `after()` /
-  `before()`; never step through the queue with `index + 1`.
+- **The play order lives in the engine** (`Engine::order`). Shuffle, repeat,
+  Next, Previous, skipping bad tracks and gapless line-up all go through
+  `following()` / `preceding()` (which apply repeat on top of `after()` /
+  `before()`); never step through the queue with `index + 1`. Skipping loops
+  are bounded by the queue length, since with repeat on the order never ends.
 - **The UI's queue and the engine's queue must match.** Replace with
-  `play_files`, extend with `append_files`. Changing `queue` in the UI alone
-  leaves the player playing the old list.
+  `play_files`, extend with `append_files`, edit with `queue_remove` /
+  `queue_move` (the UI changes its own `queue` and `currentIndex` the same way;
+  the engine confirms with `player://current`). Changing `queue` in the UI
+  alone leaves the player playing the old list. After any edit the engine runs
+  `fix_line_up()`: audio already in the ring for a track that should no longer
+  come next is dropped by restarting the current track where it is.
 - **Tag reading never fails.** `read_meta` falls back to the file name. The tag
   reader (lofty) does not know DSF/DFF, so DSD files show file names only.
 
@@ -89,6 +116,9 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   keep these passing; add a case there for new formats or paths.
 - Tests build their own WAV/DSF/DFF/tagged files in the temp folder. Do not
   commit audio fixtures.
+- For tests that act while a track plays (pause, fades, queue edits), set
+  `FileSink::paced` so it takes audio at the real rate, and `fader_log` to
+  record the fader's levels (`capture` is logged as `-1.0`).
 - **Never play audible audio on this machine to test.** Use silent files
   (all-zero samples); they exercise the full WASAPI path with no sound.
 - Devices here: "Speakers (DX1 II)" is the USB DAC (accepts only 32-bit words
@@ -99,7 +129,16 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   Chrome DevTools Protocol to the page at `localhost:1420`. Native dialogs
   (file and folder pickers) cannot be driven; call the command behind them.
   Clean up any playlists a test creates: they live in
-  `%APPDATA%\com.mdmusic.app\playlists.json`, the user's real data.
+  `%APPDATA%\com.mdmusic.app\playlists.json`, the user's real data. Picking a
+  device writes `output.json` there too.
+- Synthetic events need `bubbles: true`: Svelte 5 delegates `onchange`,
+  `onclick` and the like to the root. Queue rows are dragged with real input
+  (`Input.dispatchMouseEvent`), since they use pointer events. A file drop can
+  be faked with `invoke("plugin:event|emit", { event: "tauri://drag-drop",
+  payload: { paths, position } })`.
+- The media controls can be read and pressed from outside, as Windows does:
+  `GlobalSystemMediaTransportControlsSessionManager` (WinRT, usable from
+  PowerShell) lists MDMusic as `mdmusic.exe`.
 
 ## Gotchas
 
@@ -135,7 +174,8 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 
 ## Not built yet
 
-SQLite library index and search, reordering playlists and the queue, removing
-from the queue, multi-select in track lists, repeat modes, cover thumbnails in lists, tags for DSF/DFF, media keys and tray, software (sample-scaling) volume,
-automatic reconnect when the DAC is replugged, ASIO output for native DSD,
-remembering the output device between launches.
+SQLite library index and search, reordering playlists, multi-select in track
+lists, cover thumbnails in lists, tags for DSF/DFF, a tray icon, a timeline
+(seek bar) in the Windows media overlay, software (sample-scaling) volume,
+ASIO output for native DSD, a setting to turn the fades off or change their
+length.

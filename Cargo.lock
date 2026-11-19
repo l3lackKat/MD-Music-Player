@@ -1864,6 +1864,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tracing",
+ "windows",
 ]
 
 [[package]]

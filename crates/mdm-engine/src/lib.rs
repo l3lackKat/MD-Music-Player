@@ -18,13 +18,13 @@ mod player;
 pub use eq::{EqBand, EqSettings};
 pub use format::{Container, FormatRequest, StreamFormat};
 pub use mdm_decode::{SampleKind, SourceInfo};
-pub use output::{Backend, DeviceInfo, FileSink, OutputMode};
+pub use output::{Backend, DeviceInfo, Fader, FileSink, OutputMode};
 #[cfg(windows)]
 pub use output::{
-    get_volume, list_devices, set_volume, watch_volume, DeviceVolume, VolumeChange, VolumeWatch,
-    WasapiBackend,
+    get_volume, list_devices, set_volume, watch_volume, DeviceVolume, EndpointFader, VolumeChange,
+    VolumeWatch, WasapiBackend,
 };
-pub use player::{Command, Event, PlayState, Player, SignalPath};
+pub use player::{Command, Event, PlayState, Player, Repeat, SignalPath};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

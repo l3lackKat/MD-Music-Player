@@ -41,6 +41,18 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   device, which gives a short gap.
 - **Shared mode** is there for when other apps must keep playing. Windows then
   resamples and mixes, and the UI says so.
+- **Pause, resume and closing the app fade** the sound out and in. The fade
+  moves the device's own Windows volume, not the samples, so playback stays
+  bit-perfect and DSD fades too. After a pause the level goes back to where you
+  set it, behind the silence. In shared mode a fade also dips other apps on the
+  same device for a moment.
+- **The output device is remembered.** If it is not connected at launch, the
+  system default is used for that run.
+- **Unplug the DAC mid-track** and playback stops; plug it back in and it
+  carries on from the same spot. A DAC that comes back at 100% is turned down
+  to 10% first.
+- **Media keys** and the Windows media overlay (next to the volume flyout and
+  on the lock screen) show the track and its cover, and control playback.
 
 ## Layout
 
@@ -71,6 +83,11 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
 - **Shuffle** (the button left of Previous) plays the queue in random order,
   starting from the track you picked. Every track plays once before the queue
   ends, and tracks of the same format still play gapless.
+- **Repeat** (the button right of Next) goes off, all, one. Repeat all starts
+  the queue over after the last track; repeat one plays the current track again,
+  gapless. Next and Previous still move between tracks.
+- **Edit the queue**: drag a track to move it, or right-click it and choose
+  Remove from queue. Playback carries on.
 - **Cover art** comes from the picture embedded in the file. Without one, an
   image named `cover`, `folder`, `front` or `album` (jpg, png or webp) in the
   same folder is used. Click the cover to turn it into a round record that
@@ -79,17 +96,20 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   from the lyrics tag. Timed lyrics follow the music, and clicking a line
   jumps to it.
 
-Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`.
+Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`, the
+equalizer in `eq.json` and the output device in `output.json` next to it.
 
 ## Status
 
-Working: playback of a queue of files and folders, pause, seek, next and
-previous, shuffle, gapless, device and mode selection, DSD over DoP, a
+Working: playback of a queue of files and folders, pause and resume with
+fades, seek, next and previous, shuffle, repeat (all or one), gapless, moving
+and removing tracks in the queue, device and mode selection (remembered),
+resuming after the DAC is replugged, media keys and the Windows media overlay,
+the device's volume (bit-perfect), an opt-in equalizer, DSD over DoP, a
 signal-path badge, playlists of folders and tracks, sorting a playlist by
 column, a track menu, tags, cover art (square or as a spinning record) and
 lyrics.
 
-Not built yet: search and a full library index, reordering playlists and the
-queue, repeat, tags for DSF/DFF files (they show file names), media keys and tray,
-automatic recovery when a DAC is replugged (playback stops with an error; press
-play to resume), volume control, and an ASIO output for native DSD.
+Not built yet: search and a full library index, reordering playlists, tags for
+DSF/DFF files (they show file names), a tray icon, and an ASIO output for
+native DSD.

@@ -5,9 +5,10 @@
 //! the samples written into the source files.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mdm_engine::{Command, Container, EqSettings, Event, FileSink, Player, SignalPath};
+use mdm_engine::{Command, Container, EqSettings, Event, FileSink, PlayState, Player, SignalPath};
 
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mdm-engine-{}-{name}", std::process::id()))
@@ -230,6 +231,128 @@ fn dsd_goes_out_as_dop() {
         }
     }
     std::fs::remove_file(dff).ok();
+}
+
+/// Wait for the player to report `state`, failing on errors.
+fn wait_state(events: &crossbeam_channel::Receiver<Event>, state: PlayState) {
+    loop {
+        match events.recv_timeout(Duration::from_secs(10)).expect("no state change") {
+            Event::State { state: s } if s == state => return,
+            Event::Error { message } => panic!("player error: {message}"),
+            _ => {}
+        }
+    }
+}
+
+/// The fader's log split at each capture: one entry per fade.
+fn fades(log: &[f32]) -> Vec<Vec<f32>> {
+    let mut out: Vec<Vec<f32>> = Vec::new();
+    for &v in log {
+        if v < 0.0 {
+            out.push(Vec::new());
+        } else if let Some(last) = out.last_mut() {
+            last.push(v);
+        }
+    }
+    out
+}
+
+#[test]
+fn pause_and_resume_fade_the_level_and_leave_the_samples_alone() {
+    let samples = pattern(16, 44_100 * 2, 0xFADE);
+    let wav = temp("fade.wav");
+    write_wav(&wav, 16, 44_100, &samples);
+    let out = temp("fade.raw");
+    std::fs::remove_file(&out).ok();
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = FileSink::new(&out);
+    sink.paced = true;
+    sink.fader_log = Some(log.clone());
+    let player = Player::new(Box::new(sink));
+    let events = player.events();
+    player.send(Command::Load { paths: vec![wav.clone()], index: 0 });
+    wait_state(&events, PlayState::Playing);
+
+    std::thread::sleep(Duration::from_millis(300));
+    player.send(Command::Pause);
+    wait_state(&events, PlayState::Paused);
+    // Fade-out (400 ms) and the settle before the level goes back (150 ms).
+    std::thread::sleep(Duration::from_millis(800));
+    {
+        let log = log.lock().unwrap();
+        let fade = fades(&log);
+        assert_eq!(fade.len(), 1, "one fade so far: {log:?}");
+        let down = &fade[0];
+        assert!(down.len() >= 5, "the fade-out moves in steps: {down:?}");
+        assert!(down.windows(2).take(down.len() - 2).all(|w| w[1] <= w[0]), "it only goes down: {down:?}");
+        assert_eq!(down[down.len() - 2], 0.0, "it reaches silence: {down:?}");
+        assert_eq!(down[down.len() - 1], 1.0, "then the level goes back behind the pause: {down:?}");
+    }
+
+    player.send(Command::Play);
+    wait_state(&events, PlayState::Playing);
+    std::thread::sleep(Duration::from_millis(500));
+    {
+        let log = log.lock().unwrap();
+        let fade = fades(&log);
+        assert_eq!(fade.len(), 2, "{log:?}");
+        let up = &fade[1];
+        assert_eq!(up[0], 0.0, "resuming starts silent: {up:?}");
+        assert!(up.windows(2).all(|w| w[1] >= w[0]), "it only goes up: {up:?}");
+        assert_eq!(*up.last().unwrap(), 1.0, "and ends at the user's level: {up:?}");
+    }
+
+    loop {
+        match events.recv_timeout(Duration::from_secs(10)).expect("playback did not finish") {
+            Event::QueueEnded => break,
+            Event::Error { message } => panic!("player error: {message}"),
+            _ => {}
+        }
+    }
+    drop(player);
+    let bytes = std::fs::read(&out).unwrap();
+    std::fs::remove_file(&out).ok();
+    std::fs::remove_file(&wav).ok();
+    assert!(unpack(&bytes, Container::I16, 16) == samples, "the fades changed samples");
+}
+
+#[test]
+fn quitting_fades_out_and_puts_the_level_back() {
+    let samples = pattern(16, 44_100 * 3, 0xE817);
+    let wav = temp("quit.wav");
+    write_wav(&wav, 16, 44_100, &samples);
+    let out = temp("quit.raw");
+    std::fs::remove_file(&out).ok();
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = FileSink::new(&out);
+    sink.paced = true;
+    sink.fader_log = Some(log.clone());
+    let player = Player::new(Box::new(sink));
+    let events = player.events();
+    player.send(Command::Load { paths: vec![wav.clone()], index: 0 });
+    wait_state(&events, PlayState::Playing);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let started = std::time::Instant::now();
+    player.quit(Duration::from_secs(2));
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(500), "quit returned before fading: {took:?}");
+    assert!(took < Duration::from_millis(1500), "quit took too long: {took:?}");
+
+    let log = log.lock().unwrap().clone();
+    let fade = fades(&log);
+    let down = fade.last().unwrap();
+    assert_eq!(down[down.len() - 2], 0.0, "{down:?}");
+    assert_eq!(down[down.len() - 1], 1.0, "the level is put back after the device is let go: {down:?}");
+    drop(player);
+    let bytes = std::fs::read(&out).unwrap();
+    std::fs::remove_file(&out).ok();
+    std::fs::remove_file(&wav).ok();
+    // What did play is exact; the rest of the track never played.
+    let played = unpack(&bytes, Container::I16, 16);
+    assert!(played.len() < samples.len() && samples.starts_with(&played));
 }
 
 #[test]

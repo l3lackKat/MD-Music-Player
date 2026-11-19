@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use serde::Serialize;
 use wasapi::{DeviceEnumerator, Direction};
-use windows::core::implement;
+use windows::core::{implement, GUID};
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
@@ -120,6 +120,10 @@ impl IAudioEndpointVolumeCallback_Impl for Notify_Impl {
     fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
         // SAFETY: Windows passes a valid pointer for the duration of the call.
         if let Some(data) = unsafe { data.as_ref() } {
+            // A fade's steps are not the user's level: the slider stays put.
+            if data.guidEventContext == FADE_CONTEXT {
+                return Ok(());
+            }
             (self.listener)(DeviceVolume {
                 level: data.fMasterVolume,
                 muted: data.bMuted.as_bool(),
@@ -187,5 +191,107 @@ pub fn watch_volume(
             Err(e)
         }
         Err(_) => Err(EngineError::Device("watching the device volume crashed".into())),
+    }
+}
+
+// ---- Fading ----------------------------------------------------------------
+
+/// Marks the level changes a fade makes, so [`watch_volume`] can leave them out.
+const FADE_CONTEXT: GUID = GUID::from_u128(0x5a1e_7c3d_9b2f_4e81_a6d0_3f8c_21b4_e957);
+
+enum FadeMsg {
+    Capture,
+    Set(f32),
+    Sync(mpsc::Sender<()>),
+}
+
+/// Fades by moving the device's Windows volume, so the samples stay exact
+/// (and DSD fades too). The COM calls run on a thread of its own; the player
+/// thread only sends it levels.
+///
+/// Dropping it puts the level back where it was captured, if a fade left it
+/// lower.
+pub struct EndpointFader {
+    tx: Option<mpsc::Sender<FadeMsg>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EndpointFader {
+    /// `None` is the Windows default device at the time of each capture.
+    pub fn new(device_id: Option<String>) -> Self {
+        let (tx, rx) = mpsc::channel::<FadeMsg>();
+        let thread = std::thread::Builder::new()
+            .name("mdm-fader".into())
+            .spawn(move || {
+                let _ = wasapi::initialize_mta();
+                let mut endpoint: Option<IAudioEndpointVolume> = None;
+                let mut full = 1.0f32;
+                let mut fraction = 1.0f32;
+                for msg in rx {
+                    match msg {
+                        FadeMsg::Capture => {
+                            // Opened again each time: the device may have been replugged.
+                            endpoint = open_endpoint(device_id.as_deref()).ok();
+                            full = endpoint
+                                .as_ref()
+                                .and_then(|e| unsafe { e.GetMasterVolumeLevelScalar() }.ok())
+                                .unwrap_or(1.0);
+                            fraction = 1.0;
+                        }
+                        FadeMsg::Set(f) => {
+                            fraction = f.clamp(0.0, 1.0);
+                            if let Some(e) = &endpoint {
+                                unsafe {
+                                    let _ = e.SetMasterVolumeLevelScalar(full * fraction, &FADE_CONTEXT);
+                                }
+                            }
+                        }
+                        FadeMsg::Sync(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+                // The player went away mid-fade: do not leave the device turned down.
+                if fraction < 1.0 {
+                    if let Some(e) = &endpoint {
+                        unsafe {
+                            let _ = e.SetMasterVolumeLevelScalar(full, &FADE_CONTEXT);
+                        }
+                    }
+                }
+            })
+            .ok();
+        EndpointFader { tx: thread.is_some().then_some(tx), thread }
+    }
+
+    fn send(&self, msg: FadeMsg) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+impl super::Fader for EndpointFader {
+    fn capture(&mut self) {
+        self.send(FadeMsg::Capture);
+    }
+
+    fn set(&mut self, fraction: f32) {
+        self.send(FadeMsg::Set(fraction));
+    }
+
+    fn sync(&mut self) {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.send(FadeMsg::Sync(done_tx));
+        let _ = done_rx.recv_timeout(std::time::Duration::from_millis(200));
+    }
+}
+
+impl Drop for EndpointFader {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }

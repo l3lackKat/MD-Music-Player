@@ -86,8 +86,13 @@ fn main() {
                 eprintln!("\nerror: {message}");
                 failed = true;
             }
+            Ok(Event::DeviceLost { message }) => {
+                eprintln!("\nerror: {message}");
+                failed = true;
+                break;
+            }
             Ok(Event::QueueEnded) => break,
-            Ok(Event::State { .. }) => {}
+            Ok(Event::State { .. } | Event::Current { .. }) => {}
             Err(_) => {
                 // No event for five seconds: the player is stopped.
                 break;

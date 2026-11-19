@@ -5,6 +5,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type PlayState = "stopped" | "playing" | "paused";
 export type OutputMode = "exclusive" | "shared";
+/** After the last track: stop, start over, or (`one`) play the current track again. */
+export type Repeat = "off" | "all" | "one";
 
 export interface DeviceInfo {
   id: string;
@@ -22,6 +24,14 @@ export interface OutputSettings {
   exclusive_available: boolean;
   /** The device was at 100% when chosen (or at launch) and was turned down to 10% first. */
   volume_lowered: boolean;
+  /** At launch: the saved device is not connected, so the system default is used for now. */
+  missing_device: string | null;
+}
+
+/** The device that went away is back and playing again. */
+export interface Reconnected {
+  output: OutputSettings;
+  device: string;
 }
 
 /** The Windows volume of the selected output device. */
@@ -164,7 +174,12 @@ export const api = {
     invoke<Playlist>("playlist_remove_file", { id, file }),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   appendFiles: (paths: string[]) => invoke<void>("append_files", { paths }),
+  /** Take a track out of the engine's queue; remove it from the UI's `queue` too. */
+  queueRemove: (index: number) => invoke<void>("queue_remove", { index }),
+  /** Move a track so it ends up at `to`, in the engine's queue; move it in the UI's `queue` too. */
+  queueMove: (from: number, to: number) => invoke<void>("queue_move", { from, to }),
   setShuffle: (on: boolean) => invoke<void>("set_shuffle", { on }),
+  setRepeat: (repeat: Repeat) => invoke<void>("set_repeat", { repeat }),
   playlistRemoveFolder: (id: number, folder: string) =>
     invoke<Playlist>("playlist_remove_folder", { id, folder }),
   playlistScan: (id: number) => invoke<TrackMeta[]>("playlist_scan", { id }),
@@ -190,8 +205,12 @@ export const api = {
 export interface PlayerHandlers {
   state: (state: PlayState) => void;
   track: (track: TrackEvent) => void;
+  /** The queue was edited: the track being heard is now at `index`. */
+  current: (index: number) => void;
   position: (position: PositionEvent) => void;
   error: (message: string) => void;
+  /** The device stopped while playing. Playback stopped where it was. */
+  deviceLost: (message: string) => void;
   queueEnded: () => void;
 }
 
@@ -200,9 +219,26 @@ export async function listenPlayer(handlers: PlayerHandlers): Promise<UnlistenFn
   const unlisten = await Promise.all([
     listen<{ state: PlayState }>("player://state", (e) => handlers.state(e.payload.state)),
     listen<TrackEvent>("player://track", (e) => handlers.track(e.payload)),
+    listen<{ index: number }>("player://current", (e) => handlers.current(e.payload.index)),
     listen<PositionEvent>("player://position", (e) => handlers.position(e.payload)),
     listen<{ message: string }>("player://error", (e) => handlers.error(e.payload.message)),
+    listen<{ message: string }>("player://device-lost", (e) => handlers.deviceLost(e.payload.message)),
     listen("player://queue-ended", () => handlers.queueEnded()),
+  ]);
+  return () => unlisten.forEach((u) => u());
+}
+
+export interface OutputHandlers {
+  /** The device that stopped is unplugged; playback resumes when it is back. */
+  waiting: (device: string) => void;
+  reconnected: (event: Reconnected) => void;
+}
+
+/** Follow a device that went away and came back. Returns a function that unsubscribes. */
+export async function listenOutput(handlers: OutputHandlers): Promise<UnlistenFn> {
+  const unlisten = await Promise.all([
+    listen<string>("output://waiting", (e) => handlers.waiting(e.payload)),
+    listen<Reconnected>("output://reconnected", (e) => handlers.reconnected(e.payload)),
   ]);
   return () => unlisten.forEach((u) => u());
 }
