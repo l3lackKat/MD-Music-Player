@@ -2,14 +2,17 @@
 //! tags, cover art, lyrics, folder scanning and playlists.
 
 mod details;
+mod index;
 mod lyrics;
 mod meta;
 mod playlist;
 mod scan;
+mod tagged;
 
 pub use details::{
     read_details, AudioDetails, LyricsDetails, PictureDetails, TagDetails, TagField, TrackDetails,
 };
+pub use index::{fold, make_thumbnail, Library};
 pub use lyrics::{parse_lyrics, read_lyrics, LyricLine, Lyrics};
 pub use meta::{read_cover, read_meta, Cover, TrackMeta};
 pub use playlist::{Playlist, PlaylistStore};
@@ -21,6 +24,8 @@ pub enum LibraryError {
     Io(#[from] std::io::Error),
     #[error("the playlist file is damaged: {0}")]
     Store(#[from] serde_json::Error),
+    #[error("library index: {0}")]
+    Index(#[from] rusqlite::Error),
     #[error("playlist not found")]
     NoSuchPlaylist,
     #[error("{0}")]

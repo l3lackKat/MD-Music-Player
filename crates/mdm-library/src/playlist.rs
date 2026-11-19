@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::meta::{read_meta, TrackMeta};
-use crate::scan::{is_audio_file, scan_folder};
+use crate::scan::{is_audio_file, scan_folder_with};
 use crate::{LibraryError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -106,6 +106,16 @@ impl PlaylistStore {
         Ok(playlist)
     }
 
+    /// Put the playlists in the order of `ids`. Playlists not named keep
+    /// their order after the named ones; unknown ids are ignored.
+    pub fn reorder(&mut self, ids: &[u64]) -> Result<Vec<Playlist>> {
+        let rank = |id: u64| ids.iter().position(|i| *i == id).unwrap_or(usize::MAX);
+        // A stable sort keeps the unnamed ones in their old order.
+        self.data.playlists.sort_by_key(|p| rank(p.id));
+        self.save()?;
+        Ok(self.data.playlists.clone())
+    }
+
     /// Remove a playlist. The music files are not touched.
     pub fn delete(&mut self, id: u64) -> Result<()> {
         self.get(id)?;
@@ -188,10 +198,15 @@ impl Playlist {
     /// single file inside a folder) is listed once. Missing folders and
     /// files are skipped.
     pub fn scan(&self) -> Vec<TrackMeta> {
+        self.scan_with(&mut read_meta)
+    }
+
+    /// `scan`, getting each file's tags from `read`.
+    pub(crate) fn scan_with(&self, read: &mut dyn FnMut(&Path) -> TrackMeta) -> Vec<TrackMeta> {
         let mut seen = HashSet::new();
         let mut tracks = Vec::new();
         for folder in &self.folders {
-            for track in scan_folder(Path::new(folder)) {
+            for track in scan_folder_with(Path::new(folder), read) {
                 if seen.insert(track.path.to_lowercase()) {
                     tracks.push(track);
                 }
@@ -200,7 +215,7 @@ impl Playlist {
         for file in &self.files {
             let path = Path::new(file);
             if path.is_file() && seen.insert(file.to_lowercase()) {
-                tracks.push(read_meta(path));
+                tracks.push(read(path));
             }
         }
         tracks

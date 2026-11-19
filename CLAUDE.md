@@ -22,7 +22,7 @@ Run all four checks (test, clippy, `npm run check`, `cargo build -p mdmusic`) be
 |---|---|
 | `crates/mdm-decode` | Files to samples. PCM via symphonia, raw DSD from DSF/DFF. |
 | `crates/mdm-engine` | Player thread, format negotiation, DoP, outputs (`output/wasapi.rs`, `output/file_sink.rs`). |
-| `crates/mdm-library` | Tags, cover art, lyrics (`.lrc` and embedded), folder scan, playlists. |
+| `crates/mdm-library` | Tags (`tagged.rs` opens every file, DSD too), cover art, lyrics (`.lrc` and embedded), folder scan, playlists, the SQLite library index (`index.rs`). |
 | `src-tauri` | Tauri commands and events over the two crates above. `capabilities/default.json` lists what the UI may call. |
 | `ui` | Svelte UI. `src/lib/api.ts` is the only place that calls `invoke`. |
 
@@ -100,14 +100,37 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   `before()`); never step through the queue with `index + 1`. Skipping loops
   are bounded by the queue length, since with repeat on the order never ends.
 - **The UI's queue and the engine's queue must match.** Replace with
-  `play_files`, extend with `append_files`, edit with `queue_remove` /
-  `queue_move` (the UI changes its own `queue` and `currentIndex` the same way;
-  the engine confirms with `player://current`). Changing `queue` in the UI
+  `play_files`, extend with `append_files`, edit with `queue_remove` (a set of
+  indexes) / `queue_reorder` (`order[new] = old`, built with `moveRows` in
+  `ui/src/lib/reorder.svelte.ts`). The UI changes its own `queue` and
+  `currentIndex` the same way; the engine confirms with `player://current`. Changing `queue` in the UI
   alone leaves the player playing the old list. After any edit the engine runs
   `fix_line_up()`: audio already in the ring for a track that should no longer
   come next is dropped by restarting the current track where it is.
-- **Tag reading never fails.** `read_meta` falls back to the file name. The tag
-  reader (lofty) does not know DSF/DFF, so DSD files show file names only.
+- **Tag reading never fails.** `read_meta` falls back to the file name. Open
+  tags with `tagged::read_tagged`, never `lofty::read_from_path`: lofty does
+  not know DSF/DFF, so their ID3v2 block (DSF: pointed to by the header; DFF:
+  the `ID3 ` chunk, else `DIIN` title/artist) is handed to lofty inside a
+  minimal in-memory WAV. DSD durations come from the decoder.
+- **The library index (`library.db`) is a cache, never the source.** It holds
+  exactly the tracks of the playlists: `Library::refresh` (run by the
+  `mdm-library` thread at launch and after every playlist change, see
+  `refresh_library()`) scans them all and drops other rows. A row is current
+  while the file's size and modification time match. `expand_paths` (the
+  queue) reads through the cache but never writes. Bump `SCHEMA_VERSION` when
+  the tables change; an old or damaged database is simply rebuilt.
+- **Search is folded text, not FTS**: `fold()` lowercases and strips accents
+  (and maps đ to d), and every query word must appear (`LIKE`, wildcards
+  escaped) in title, artist, album, album artist, file or folder name.
+- **Small covers** are `cover://<path>?thumb`: 96 px JPEGs made by
+  `Library::thumbnail`, kept in the `thumbs` table, at most `THUMB_WORKERS`
+  made at once. Rows load them lazily (`Thumb.svelte`).
+- **Selection is by track object** (`Selection` in
+  `ui/src/lib/selection.svelte.ts`), so it survives moves and sorting. Track
+  lists report rows (`onmenu(rows)`, `ondelete(rows)`, `onmove(rows, slot)`),
+  always in list order. Dragging uses `RowDrag` (pointer events); a row's
+  click handler must first check `drag.endedDrag()`, or the release of a drag
+  counts as a click.
 
 ## Testing
 
@@ -130,7 +153,11 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   (file and folder pickers) cannot be driven; call the command behind them.
   Clean up any playlists a test creates: they live in
   `%APPDATA%\com.mdmusic.app\playlists.json`, the user's real data. Picking a
-  device writes `output.json` there too.
+  device writes `output.json` there too, and `library.db` is rebuilt from the
+  playlists, so a test playlist's tracks leave it on the next refresh.
+- A real click with Ctrl or Shift needs `modifiers` on every
+  `Input.dispatchMouseEvent` (2 = Ctrl, 8 = Shift). A synthetic click event
+  followed by a real release gives a second, plain click.
 - Synthetic events need `bubbles: true`: Svelte 5 delegates `onchange`,
   `onclick` and the like to the root. Queue rows are dragged with real input
   (`Input.dispatchMouseEvent`), since they use pointer events. A file drop can
@@ -174,8 +201,8 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 
 ## Not built yet
 
-SQLite library index and search, reordering playlists, multi-select in track
-lists, cover thumbnails in lists, tags for DSF/DFF, a tray icon, a timeline
-(seek bar) in the Windows media overlay, software (sample-scaling) volume,
-ASIO output for native DSD, a setting to turn the fades off or change their
-length.
+Reordering tracks inside a playlist (only its folders' and files' own order,
+which sorting covers for now), browsing the library by artist or album,
+editing tags, a tray icon, a timeline (seek bar) in the Windows media overlay,
+software (sample-scaling) volume, ASIO output for native DSD, a setting to turn
+the fades off or change their length.

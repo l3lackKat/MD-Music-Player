@@ -40,11 +40,12 @@ pub enum Command {
     Load { paths: Vec<PathBuf>, index: usize },
     /// Add tracks to the end of the queue without interrupting playback.
     Append(Vec<PathBuf>),
-    /// Take a track out of the queue. Removing the track being heard moves
-    /// on to the one after it.
-    Remove(usize),
-    /// Move a track so that it ends up at `to`. What is playing carries on.
-    Move { from: usize, to: usize },
+    /// Take tracks out of the queue. Removing the track being heard moves
+    /// on to the next one that stays.
+    Remove(Vec<usize>),
+    /// Put the queue in a new order: `order[new] = old`, each old index
+    /// exactly once. What is playing carries on. Anything else is ignored.
+    Reorder(Vec<usize>),
     /// Play the queue in random order. The current track keeps playing and
     /// the order of the rest is drawn again each time this is turned on.
     SetShuffle(bool),
@@ -466,8 +467,8 @@ impl Engine {
                 // The decoder may already have run out of queue: carry on into the new tracks.
                 self.fix_line_up(false);
             }
-            Command::Remove(index) => self.remove(index),
-            Command::Move { from, to } => self.move_track(from, to),
+            Command::Remove(indexes) => self.remove(&indexes),
+            Command::Reorder(order) => self.reorder(&order),
             Command::SetShuffle(on) => {
                 self.shuffle = on;
                 // What the ring already holds keeps its place, in the order it plays.
@@ -727,23 +728,42 @@ impl Engine {
 
     // ---- Editing the queue ---------------------------------------------------
 
-    fn remove(&mut self, index: usize) {
+    fn remove(&mut self, indexes: &[usize]) {
         let len = self.queue.len();
-        if index >= len {
+        let mut gone = vec![false; len];
+        for i in indexes.iter().filter(|i| **i < len) {
+            gone[*i] = true;
+        }
+        if !gone.contains(&true) {
             return;
         }
-        let map: Vec<Option<usize>> = (0..len)
-            .map(|i| match i.cmp(&index) {
-                std::cmp::Ordering::Less => Some(i),
-                std::cmp::Ordering::Equal => None,
-                std::cmp::Ordering::Greater => Some(i - 1),
-            })
-            .collect();
-        let was_heard = self.heard.as_ref().is_some_and(|h| h.index == index);
-        // Worked out before the order loses the track.
-        let next = self.following(index, false).filter(|n| *n != index);
-        self.queue.remove(index);
-        if was_heard {
+        let mut map = vec![None; len];
+        let mut kept = 0;
+        for (i, slot) in map.iter_mut().enumerate() {
+            if !gone[i] {
+                *slot = Some(kept);
+                kept += 1;
+            }
+        }
+        let heard = self.heard.as_ref().map(|h| h.index).filter(|h| gone[*h]);
+        // Worked out before the order loses the tracks: the first one after
+        // the heard track that stays.
+        let next = heard.and_then(|h| {
+            let mut candidate = self.following(h, false);
+            for _ in 0..len {
+                match candidate {
+                    Some(c) if gone[c] => candidate = self.following(c, false),
+                    _ => break,
+                }
+            }
+            candidate.filter(|c| !gone[*c])
+        });
+        let mut i = 0;
+        self.queue.retain(|_| {
+            i += 1;
+            !gone[i - 1]
+        });
+        if let Some(h) = heard {
             self.heard = None;
             self.upcoming.clear();
             self.decoding = None;
@@ -752,8 +772,9 @@ impl Engine {
             match next.and_then(|n| map[n]) {
                 Some(n) => self.play_from(n, 0),
                 None => {
-                    let resume = index.min(self.queue.len().saturating_sub(1));
-                    self.stop(resume, 0);
+                    // Where the heard track was, among the tracks left.
+                    let at = (0..h).filter(|i| !gone[*i]).count();
+                    self.stop(at.min(self.queue.len().saturating_sub(1)), 0);
                 }
             }
         } else {
@@ -763,21 +784,20 @@ impl Engine {
         self.announce_current();
     }
 
-    fn move_track(&mut self, from: usize, to: usize) {
+    fn reorder(&mut self, order: &[usize]) {
         let len = self.queue.len();
-        if from >= len || to >= len || from == to {
+        let mut map = vec![None; len];
+        for (new, old) in order.iter().enumerate() {
+            match map.get_mut(*old) {
+                Some(slot @ None) => *slot = Some(new),
+                // Out of range or named twice: not a new order of this queue.
+                _ => return,
+            }
+        }
+        if order.len() != len || order.iter().enumerate().all(|(new, old)| new == *old) {
             return;
         }
-        // `ids[new] = old`, turned round into `map[old] = new`.
-        let mut ids: Vec<usize> = (0..len).collect();
-        let moved = ids.remove(from);
-        ids.insert(to, moved);
-        let mut map = vec![None; len];
-        for (new, old) in ids.iter().enumerate() {
-            map[*old] = Some(new);
-        }
-        let path = self.queue.remove(from);
-        self.queue.insert(to, path);
+        self.queue = order.iter().map(|old| self.queue[*old].clone()).collect();
         let lost = self.reindex(&map);
         self.fix_line_up(lost);
         self.announce_current();

@@ -86,30 +86,41 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
 - **Repeat** (the button right of Next) goes off, all, one. Repeat all starts
   the queue over after the last track; repeat one plays the current track again,
   gapless. Next and Previous still move between tracks.
-- **Edit the queue**: drag a track to move it, or right-click it and choose
-  Remove from queue. Playback carries on.
+- **Edit the queue**: drag tracks to move them, or right-click and choose
+  Remove from queue (or press Delete). Playback carries on.
+- **Select several tracks** in any list: Ctrl+click adds one, Shift+click a
+  range, Ctrl+A all. The right-click menu and Delete then act on all of them.
+- **Search** (the box above Queue, or Ctrl+F) looks through every playlist by
+  title, artist, album, file or folder name. Case and accents do not matter:
+  "hiep si" finds "Hiệp sĩ".
+- **Drag playlists** in the sidebar to put them in the order you like.
 - **Cover art** comes from the picture embedded in the file. Without one, an
   image named `cover`, `folder`, `front` or `album` (jpg, png or webp) in the
-  same folder is used. Click the cover to turn it into a round record that
-  spins while the music plays; click again for the square cover.
+  same folder is used. Track lists show a small copy on every row. Click the
+  cover to turn it into a round record that spins while the music plays; click
+  again for the square cover.
+- **DSF and DFF files** show their tags, cover and lyrics like any other file
+  (from their ID3 tag, or a DFF's own title and artist).
 - **Lyrics** come from a `.lrc` file with the same name as the track, or else
   from the lyrics tag. Timed lyrics follow the music, and clicking a line
   jumps to it.
 
 Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`, the
 equalizer in `eq.json` and the output device in `output.json` next to it.
+`library.db` there is an index of every playlist's tracks (tags and small
+covers), so rescans are quick; it is rebuilt from your files if deleted.
 
 ## Status
 
 Working: playback of a queue of files and folders, pause and resume with
 fades, seek, next and previous, shuffle, repeat (all or one), gapless, moving
-and removing tracks in the queue, device and mode selection (remembered),
-resuming after the DAC is replugged, media keys and the Windows media overlay,
-the device's volume (bit-perfect), an opt-in equalizer, DSD over DoP, a
-signal-path badge, playlists of folders and tracks, sorting a playlist by
-column, a track menu, tags, cover art (square or as a spinning record) and
-lyrics.
+and removing tracks in the queue, selecting several tracks, search across all
+playlists, device and mode selection (remembered), resuming after the DAC is
+replugged, media keys and the Windows media overlay, the device's volume
+(bit-perfect), an opt-in equalizer, DSD over DoP with tags, a signal-path
+badge, playlists of folders and tracks (in your own order), sorting a playlist
+by column, a track menu, tags, cover art (square, as a spinning record, and
+small in every list) and lyrics.
 
-Not built yet: search and a full library index, reordering playlists, tags for
-DSF/DFF files (they show file names), a tray icon, and an ASIO output for
-native DSD.
+Not built yet: browsing by artist or album, editing tags, a tray icon, and an
+ASIO output for native DSD.

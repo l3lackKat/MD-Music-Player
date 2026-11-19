@@ -12,6 +12,9 @@ walkdir = "2.5"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+unicode-normalization = "0.1.26"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
 lofty = "0.25"

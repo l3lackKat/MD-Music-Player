@@ -1,15 +1,20 @@
 <script lang="ts">
-  // A list of tracks. Double-click a row to play from there; right-click
-  // (or the menu key) for the track menu. With `onsort`, the column headers
-  // are buttons that sort the list. With `onmove`, rows can be dragged to a
-  // new place.
+  // A list of tracks, each with its small cover.
   //
-  // Dragging uses pointer events, not HTML drag and drop: Tauri's file drop
-  // handler takes over the webview's drag events.
+  // - Click selects a row, Ctrl+click adds one, Shift+click a range, Ctrl+A
+  //   all, Escape none. Double-click (or Enter) plays.
+  // - Right-click (or the menu key) opens the menu for the selected rows.
+  // - Delete asks to remove the selected rows (`ondelete`).
+  // - With `onsort`, the column headers sort the list.
+  // - With `onmove`, rows can be dragged to a new place; dragging a selected
+  //   row takes the whole selection.
   import { onDestroy } from "svelte";
   import { formatTime, type TrackMeta } from "./api";
+  import { RowDrag } from "./reorder.svelte";
+  import { Selection } from "./selection.svelte";
   import type { SortKey, TrackSort } from "./sort";
   import SourceMark from "./SourceMark.svelte";
+  import Thumb from "./Thumb.svelte";
 
   let {
     tracks,
@@ -17,105 +22,77 @@
     playing,
     onplay,
     onmenu,
-    menuIndex = null,
     source,
     sort = null,
     onsort,
     onmove,
+    ondelete,
   }: {
     tracks: TrackMeta[];
     /** Path of the track being heard, to highlight its row. */
     currentPath: string | null;
     playing: boolean;
     onplay: (index: number) => void;
-    onmenu: (index: number, x: number, y: number) => void;
-    /** Row whose menu is open, kept highlighted while it is. */
-    menuIndex?: number | null;
+    /** The menu for these rows (the selection, in list order) at a screen position. */
+    onmenu: (rows: number[], x: number, y: number) => void;
     /** In a playlist: how each track got there. Draws a mark before the title. */
     source?: (track: TrackMeta) => "folder" | "file";
     /** The column `tracks` is sorted by, to mark its header. `null` is the list's own order. */
     sort?: TrackSort | null;
     /** A header was clicked: a column to sort by, or `null` (the # column) for the list's own order. */
     onsort?: (key: SortKey | null) => void;
-    /** A row was dragged so that the track at `from` ends up at `to`. */
-    onmove?: (from: number, to: number) => void;
+    /** `rows` were dragged into the gap before `slot` (0 to tracks.length). */
+    onmove?: (rows: number[], slot: number) => void;
+    /** Delete was pressed with these rows selected. */
+    ondelete?: (rows: number[]) => void;
   } = $props();
 
-  /** Pixels the pointer must travel before a press becomes a drag. */
-  const DRAG_THRESHOLD = 5;
-  /** Near this many pixels from the list's top or bottom edge, a drag scrolls it. */
-  const SCROLL_EDGE = 48;
-  const SCROLL_SPEED = 14;
+  const selection = new Selection<TrackMeta>();
+  let rowElements = $state<HTMLElement[]>([]);
 
-  /** A row being dragged: where it was, and the gap it would drop into (0 to tracks.length). */
-  let drag = $state<{ from: number; slot: number; startY: number; active: boolean; pointer: number } | null>(
-    null,
-  );
-  let rows = $state<HTMLElement[]>([]);
-  let lastY = 0;
-  let scrollFrame = 0;
+  const drag = new RowDrag({
+    rows: () => rowElements.slice(0, tracks.length),
+    scroller: () => rowElements[0]?.closest("main"),
+    drop: (rows, slot) => {
+      const moved = rows.map((i) => tracks[i]);
+      onmove?.(rows, slot);
+      // The moved rows stay selected in their new place.
+      selection.set(moved);
+    },
+  });
+  onDestroy(() => drag.destroy());
 
-  /** The gap between rows that a pointer at `y` points to. */
-  function slotAt(y: number): number {
-    for (let i = 0; i < tracks.length; i++) {
-      const rect = rows[i]?.getBoundingClientRect();
-      if (rect && y < rect.top + rect.height / 2) return i;
+  /** The rows a press on `index` would drag: the selection if it is part of it. */
+  function rowsFor(index: number): number[] {
+    return selection.has(tracks[index]) ? selection.rows(tracks) : [index];
+  }
+
+  function openMenu(e: MouseEvent, index: number) {
+    e.preventDefault();
+    if (!selection.has(tracks[index])) selection.only(tracks[index]);
+    // The keyboard menu key reports (0, 0): open by the row instead.
+    const fromKeyboard = e.clientX === 0 && e.clientY === 0;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    onmenu(selection.rows(tracks), fromKeyboard ? rect.left + 48 : e.clientX, fromKeyboard ? rect.bottom : e.clientY);
+  }
+
+  function onKey(e: KeyboardEvent) {
+    const rows = selection.rows(tracks);
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      selection.all(tracks);
+    } else if (e.key === "Escape" && rows.length > 0) {
+      selection.clear();
+    } else if (e.key === "Delete" && rows.length > 0 && ondelete) {
+      e.preventDefault();
+      ondelete(rows);
+    } else if (e.key === "Enter" && rows.length > 0) {
+      e.preventDefault();
+      onplay(rows[0]);
     }
-    return tracks.length;
   }
 
-  /** Scroll the list while the pointer is held near its edge. */
-  function scrollStep() {
-    if (!drag?.active) return;
-    const scroller = rows[0]?.closest("main");
-    if (scroller) {
-      const box = scroller.getBoundingClientRect();
-      const by = lastY < box.top + SCROLL_EDGE ? -SCROLL_SPEED : lastY > box.bottom - SCROLL_EDGE ? SCROLL_SPEED : 0;
-      if (by !== 0) {
-        scroller.scrollBy(0, by);
-        drag.slot = slotAt(lastY);
-      }
-    }
-    scrollFrame = requestAnimationFrame(scrollStep);
-  }
-
-  function onPointerDown(e: PointerEvent, index: number) {
-    if (!onmove || e.button !== 0) return;
-    drag = { from: index, slot: index, startY: e.clientY, active: false, pointer: e.pointerId };
-  }
-
-  function onPointerMove(e: PointerEvent) {
-    if (!drag || e.pointerId !== drag.pointer) return;
-    lastY = e.clientY;
-    if (!drag.active) {
-      if (Math.abs(e.clientY - drag.startY) < DRAG_THRESHOLD) return;
-      drag.active = true;
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      scrollFrame = requestAnimationFrame(scrollStep);
-    }
-    drag.slot = slotAt(e.clientY);
-  }
-
-  function endDrag(e: PointerEvent, commit: boolean) {
-    if (!drag || e.pointerId !== drag.pointer) return;
-    const { from, slot, active } = drag;
-    drag = null;
-    cancelAnimationFrame(scrollFrame);
-    if (!commit || !active) return;
-    // Dropping below its own place, the row's old spot closes up first.
-    const to = slot > from ? slot - 1 : slot;
-    if (to !== from) onmove?.(from, to);
-  }
-
-  onDestroy(() => cancelAnimationFrame(scrollFrame));
-
-  /** Draw the drop line above row `index` (or below the last row). */
-  function dropLine(index: number): string {
-    if (!drag?.active || drag.slot === drag.from || drag.slot === drag.from + 1) return "";
-    if (drag.slot === index) return "shadow-[inset_0_2px_0_var(--color-accent)]";
-    if (index === tracks.length - 1 && drag.slot === tracks.length) return "shadow-[inset_0_-2px_0_var(--color-accent)]";
-    return "";
-  }
+  const ROW_GRID = "grid-cols-[2rem_minmax(0,5fr)_minmax(0,3fr)_minmax(0,3fr)_3.5rem]";
 </script>
 
 {#snippet heading(label: string, key: SortKey, right = false)}
@@ -140,10 +117,9 @@
   {/if}
 {/snippet}
 
-<div class="px-3 pb-4 {drag?.active ? 'cursor-grabbing' : ''}">
-  <div
-    class="grid grid-cols-[2rem_minmax(0,5fr)_minmax(0,3fr)_minmax(0,3fr)_3.5rem] gap-4 border-b border-line px-3 pb-2 text-xs uppercase tracking-wider text-muted"
-  >
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="px-3 pb-4 {drag.active ? 'cursor-grabbing' : ''}" onkeydown={onKey}>
+  <div class="grid {ROW_GRID} gap-4 border-b border-line px-3 pb-2 text-xs uppercase tracking-wider text-muted">
     {#if onsort}
       <button
         class="text-right hover:text-ink disabled:hover:text-muted"
@@ -164,25 +140,32 @@
   </div>
   {#each tracks as track, index (index)}
     {@const active = track.path === currentPath}
+    {@const selected = selection.has(track)}
+    {@const line = drag.line(index)}
     <button
-      bind:this={rows[index]}
-      class="grid w-full grid-cols-[2rem_minmax(0,5fr)_minmax(0,3fr)_minmax(0,3fr)_3.5rem] items-center gap-4 rounded-lg px-3 py-2 text-left text-sm {drag?.active
-        ? ''
-        : 'hover:bg-raised'} {active || menuIndex === index ? 'bg-raised' : ''} {menuIndex === index
-        ? 'ring-1 ring-accent/50'
-        : ''} {drag?.active && drag.from === index ? 'opacity-40' : ''} {dropLine(index)}"
-      onpointerdown={(e) => onPointerDown(e, index)}
-      onpointermove={onPointerMove}
-      onpointerup={(e) => endDrag(e, true)}
-      onpointercancel={(e) => endDrag(e, false)}
-      ondblclick={() => onplay(index)}
-      oncontextmenu={(e) => {
-        e.preventDefault();
-        // The keyboard menu key reports (0, 0): open by the row instead.
-        const fromKeyboard = e.clientX === 0 && e.clientY === 0;
-        const rect = e.currentTarget.getBoundingClientRect();
-        onmenu(index, fromKeyboard ? rect.left + 48 : e.clientX, fromKeyboard ? rect.bottom : e.clientY);
+      bind:this={rowElements[index]}
+      data-row
+      aria-pressed={selected}
+      class="grid w-full {ROW_GRID} items-center gap-4 rounded-lg px-3 py-1.5 text-left text-sm {selected
+        ? 'bg-accent/15'
+        : active
+          ? 'bg-raised'
+          : drag.active
+            ? ''
+            : 'hover:bg-raised'} {drag.active && drag.dragging.includes(index) ? 'opacity-40' : ''} {line === 'above'
+        ? 'shadow-[inset_0_2px_0_var(--color-accent)]'
+        : line === 'below'
+          ? 'shadow-[inset_0_-2px_0_var(--color-accent)]'
+          : ''}"
+      onclick={(e) => {
+        if (!drag.endedDrag()) selection.click(tracks, index, e);
       }}
+      ondblclick={() => onplay(index)}
+      oncontextmenu={(e) => openMenu(e, index)}
+      onpointerdown={onmove ? (e) => drag.down(e, rowsFor(index)) : undefined}
+      onpointermove={onmove ? (e) => drag.move(e) : undefined}
+      onpointerup={onmove ? (e) => drag.up(e) : undefined}
+      onpointercancel={onmove ? (e) => drag.cancel(e) : undefined}
       title={onmove
         ? "Double-click to play, drag to move, right-click for more"
         : "Double-click to play, right-click for more"}
@@ -190,7 +173,8 @@
       <span class="text-right tabular-nums {active ? 'text-accent' : 'text-muted'}">
         {active && playing ? "▶" : index + 1}
       </span>
-      <span class="flex min-w-0 items-center gap-2">
+      <span class="flex min-w-0 items-center gap-2.5">
+        <Thumb path={track.path} class="h-8 w-8" />
         {#if source}
           <SourceMark kind={source(track)} />
         {/if}

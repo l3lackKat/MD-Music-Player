@@ -51,8 +51,12 @@ pub fn read_meta(path: &Path) -> TrackMeta {
         duration_ms: None,
     };
 
-    // The tag reader does not know DSF or DFF, and some files are just broken.
-    let Ok(file) = lofty::read_from_path(path) else {
+    // DSD tags hold no audio properties: the decoder knows the length from the header.
+    if crate::tagged::is_dsd(path) {
+        meta.duration_ms = mdm_decode::open(path).ok().and_then(|s| s.info().duration_ms);
+    }
+    // Some files are just broken, or have no tags.
+    let Some(file) = crate::tagged::read_tagged(path) else {
         return meta;
     };
     let duration = file.properties().duration();
@@ -104,7 +108,7 @@ fn folder_cover(track: &Path) -> Option<PathBuf> {
 /// A track's cover: the embedded front cover, else any embedded picture,
 /// else an image such as `cover.jpg` in the same folder.
 pub fn read_cover(path: &Path) -> Option<Cover> {
-    if let Ok(file) = lofty::read_from_path(path) {
+    if let Some(file) = crate::tagged::read_tagged(path) {
         let pictures = file.tags().iter().flat_map(|t| t.pictures());
         let picture = pictures
             .clone()

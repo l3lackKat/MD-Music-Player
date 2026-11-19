@@ -224,7 +224,7 @@ fn a_removed_track_is_skipped_and_the_rest_stays_exact() {
     let (heard, samples) = run_with(
         "remove",
         true,
-        vec![Command::Load { paths: paths.clone(), index: 0 }, Command::Remove(1)],
+        vec![Command::Load { paths: paths.clone(), index: 0 }, Command::Remove(vec![1])],
         |_, _| {},
     );
     assert_eq!(heard, [0, 1], "the old third track is now second");
@@ -243,7 +243,7 @@ fn removing_the_track_being_heard_moves_on() {
         |player, event| {
             if let (Event::Track { index: 0, .. }, false) = (event, removed) {
                 removed = true;
-                player.send(Command::Remove(0));
+                player.send(Command::Remove(vec![0]));
             }
         },
     );
@@ -254,12 +254,54 @@ fn removing_the_track_being_heard_moves_on() {
 }
 
 #[test]
+fn removing_several_tracks_with_the_heard_one_moves_past_them_all() {
+    let (paths, tracks) = make_long_tracks("remove-many", 4, 1.0);
+    let mut removed = false;
+    let (heard, samples) = run_with(
+        "remove-many",
+        true,
+        vec![Command::Load { paths: paths.clone(), index: 0 }],
+        |player, event| {
+            if let (Event::Track { index: 0, .. }, false) = (event, removed) {
+                removed = true;
+                // The heard track and the one after it; out of order and with a repeat.
+                player.send(Command::Remove(vec![1, 0, 1, 99]));
+            }
+        },
+    );
+    // Old 2 and 3 are left, now at 0 and 1.
+    assert_eq!(heard, [0, 0, 1], "{heard:?}");
+    assert!(samples.ends_with(&[tracks[2].clone(), tracks[3].clone()].concat()));
+    assert!(!samples.ends_with(&[tracks[1].clone(), tracks[2].clone(), tracks[3].clone()].concat()));
+    cleanup(&paths);
+}
+
+#[test]
+fn a_reorder_that_is_not_a_permutation_is_ignored() {
+    let (paths, tracks) = make_long_tracks("reorder-bad", 2, 0.5);
+    let (heard, samples) = run_with(
+        "reorder-bad",
+        true,
+        vec![
+            Command::Load { paths: paths.clone(), index: 0 },
+            Command::Reorder(vec![1, 1]),
+            Command::Reorder(vec![0]),
+            Command::Reorder(vec![2, 0]),
+        ],
+        |_, _| {},
+    );
+    assert_eq!(heard, [0, 1]);
+    assert!(samples == tracks.concat());
+    cleanup(&paths);
+}
+
+#[test]
 fn a_moved_track_plays_in_its_new_place() {
     let (paths, tracks) = make_long_tracks("move", 3, 1.0);
     let (heard, samples) = run_with(
         "move",
         true,
-        vec![Command::Load { paths: paths.clone(), index: 0 }, Command::Move { from: 2, to: 1 }],
+        vec![Command::Load { paths: paths.clone(), index: 0 }, Command::Reorder(vec![0, 2, 1])],
         |_, _| {},
     );
     assert_eq!(heard, [0, 1, 2]);
@@ -283,7 +325,7 @@ fn moving_a_track_that_is_already_lined_up_restarts_cleanly() {
         |player, event| {
             if let (Event::Track { index: 1, .. }, false) = (event, moved) {
                 moved = true;
-                player.send(Command::Move { from: 2, to: 0 });
+                player.send(Command::Reorder(vec![2, 0, 1]));
             }
         },
     );

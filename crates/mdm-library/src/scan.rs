@@ -17,6 +17,15 @@ pub fn is_audio_file(path: &Path) -> bool {
 /// folder, and inside a folder by disc, track number, then file name.
 /// Unreadable folders are skipped.
 pub fn scan_folder(folder: &Path) -> Vec<TrackMeta> {
+    scan_folder_with(folder, &mut read_meta)
+}
+
+/// `scan_folder`, getting each file's tags from `read` (the library index
+/// passes its cache here).
+pub(crate) fn scan_folder_with(
+    folder: &Path,
+    read: &mut dyn FnMut(&Path) -> TrackMeta,
+) -> Vec<TrackMeta> {
     // Rebuild the path from its parts so every track path uses the same
     // separators, however the folder was written.
     let folder: PathBuf = folder.components().collect();
@@ -26,7 +35,7 @@ pub fn scan_folder(folder: &Path) -> Vec<TrackMeta> {
         .flatten()
         .filter(|e| e.file_type().is_file() && is_audio_file(e.path()))
         .map(|e| {
-            let meta = read_meta(e.path());
+            let meta = read(e.path());
             (e.into_path(), meta)
         })
         .collect();
@@ -45,12 +54,19 @@ pub fn scan_folder(folder: &Path) -> Vec<TrackMeta> {
 /// Turn a mix of files and folders (a drag-and-drop, say) into tracks, in
 /// the order given. Folders are scanned; files that are not audio are dropped.
 pub fn expand_paths(paths: &[PathBuf]) -> Vec<TrackMeta> {
+    expand_paths_with(paths, &mut read_meta)
+}
+
+pub(crate) fn expand_paths_with(
+    paths: &[PathBuf],
+    read: &mut dyn FnMut(&Path) -> TrackMeta,
+) -> Vec<TrackMeta> {
     let mut tracks = Vec::new();
     for path in paths {
         if path.is_dir() {
-            tracks.extend(scan_folder(path));
+            tracks.extend(scan_folder_with(path, read));
         } else if is_audio_file(path) {
-            tracks.push(read_meta(path));
+            tracks.push(read(path));
         }
     }
     tracks

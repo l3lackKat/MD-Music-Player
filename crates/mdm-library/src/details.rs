@@ -134,7 +134,7 @@ fn audio_details(path: &Path, file: Option<&lofty::file::TaggedFile>) -> AudioDe
 /// Read a file's details. Never fails: what cannot be read is left out.
 pub fn read_details(path: &Path) -> TrackDetails {
     let meta = std::fs::metadata(path).ok();
-    let file = lofty::read_from_path(path).ok();
+    let file = crate::tagged::read_tagged(path);
 
     let mut tags = Vec::new();
     let mut pictures = Vec::new();

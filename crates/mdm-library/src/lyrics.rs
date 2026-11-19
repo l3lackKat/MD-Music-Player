@@ -108,7 +108,7 @@ pub fn read_lyrics(path: &Path) -> Option<Lyrics> {
             text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)
         }
         None => {
-            let file = lofty::read_from_path(path).ok()?;
+            let file = crate::tagged::read_tagged(path)?;
             file.tags()
                 .iter()
                 .find_map(|t| t.get_string(ItemKey::Lyrics).or_else(|| t.get_string(ItemKey::UnsyncLyrics)))?

@@ -9,14 +9,14 @@
 mod media_controls;
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use mdm_engine::{
     Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, Repeat,
     VolumeChange, VolumeWatch, WasapiBackend,
 };
-use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
+use mdm_library::{Library, Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
 use serde::{Deserialize, Serialize};
 use tauri::http::{header, Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -165,8 +165,19 @@ struct AppState {
     /// `reconnect_when_back`).
     reconnect: Mutex<u64>,
     playlists: Mutex<PlaylistStore>,
+    /// Tags of every playlist's tracks, for fast rescans, search and small covers.
+    library: Arc<Library>,
+    /// Asks the refresh thread to bring the index in line with the playlists.
+    refresh: Mutex<mpsc::Sender<()>>,
     eq: Mutex<EqSettings>,
     eq_path: PathBuf,
+}
+
+impl AppState {
+    /// Refresh the index in the background, after the playlists changed.
+    fn refresh_library(&self) {
+        let _ = self.refresh.lock().unwrap().send(());
+    }
 }
 
 type CommandResult<T> = Result<T, String>;
@@ -390,16 +401,16 @@ fn append_files(state: State<AppState>, paths: Vec<String>) {
     state.player.send(Command::Append(paths.into_iter().map(PathBuf::from).collect()));
 }
 
-/// Take one track out of the queue. The UI removes it from its own list too.
+/// Take tracks out of the queue. The UI removes them from its own list too.
 #[tauri::command]
-fn queue_remove(state: State<AppState>, index: usize) {
-    state.player.send(Command::Remove(index));
+fn queue_remove(state: State<AppState>, indexes: Vec<usize>) {
+    state.player.send(Command::Remove(indexes));
 }
 
-/// Move a queue track so it ends up at `to`. The UI moves it in its own list too.
+/// Put the queue in a new order, `order[new] = old`. The UI reorders its own list the same way.
 #[tauri::command]
-fn queue_move(state: State<AppState>, from: usize, to: usize) {
-    state.player.send(Command::Move { from, to });
+fn queue_reorder(state: State<AppState>, order: Vec<usize>) {
+    state.player.send(Command::Reorder(order));
 }
 
 #[tauri::command]
@@ -449,9 +460,29 @@ fn previous(state: State<AppState>) {
 
 /// Turn dropped or picked files and folders into tracks with their tags.
 #[tauri::command(async)]
-fn expand_paths(paths: Vec<String>) -> Vec<TrackMeta> {
+fn expand_paths(state: State<'_, AppState>, paths: Vec<String>) -> Vec<TrackMeta> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    mdm_library::expand_paths(&paths)
+    state.library.expand_paths(&paths)
+}
+
+/// Most tracks a search returns.
+const SEARCH_LIMIT: usize = 500;
+
+/// Tracks of any playlist matching every word of `query`, accents and case ignored.
+#[tauri::command(async)]
+fn search(state: State<'_, AppState>, query: String) -> CommandResult<Vec<TrackMeta>> {
+    state.library.search(&query, SEARCH_LIMIT).map_err(text)
+}
+
+#[derive(Clone, Serialize)]
+struct LibraryStatus {
+    /// Tracks in the index: everything the playlists hold, once scanned.
+    tracks: usize,
+}
+
+#[tauri::command(async)]
+fn library_status(state: State<'_, AppState>) -> LibraryStatus {
+    LibraryStatus { tracks: state.library.track_count() }
 }
 
 /// Everything known about one file, for the track info panel.
@@ -486,7 +517,15 @@ fn playlist_rename(state: State<AppState>, id: u64, name: String) -> CommandResu
 
 #[tauri::command]
 fn playlist_delete(state: State<AppState>, id: u64) -> CommandResult<()> {
-    state.playlists.lock().unwrap().delete(id).map_err(text)
+    state.playlists.lock().unwrap().delete(id).map_err(text)?;
+    state.refresh_library();
+    Ok(())
+}
+
+/// Put the playlists in the order of `ids` and return them all.
+#[tauri::command]
+fn playlist_reorder(state: State<AppState>, ids: Vec<u64>) -> CommandResult<Vec<Playlist>> {
+    state.playlists.lock().unwrap().reorder(&ids).map_err(text)
 }
 
 #[derive(Serialize)]
@@ -501,12 +540,21 @@ struct PlaylistAdded {
 fn playlist_add(state: State<AppState>, id: u64, paths: Vec<String>) -> CommandResult<PlaylistAdded> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     let (playlist, skipped) = state.playlists.lock().unwrap().add_paths(id, &paths).map_err(text)?;
+    state.refresh_library();
     Ok(PlaylistAdded { playlist, skipped })
 }
 
+/// Remove single files from a playlist. Tracks that come from a folder stay.
 #[tauri::command]
-fn playlist_remove_file(state: State<AppState>, id: u64, file: String) -> CommandResult<Playlist> {
-    state.playlists.lock().unwrap().remove_file(id, &file).map_err(text)
+fn playlist_remove_files(state: State<AppState>, id: u64, files: Vec<String>) -> CommandResult<Playlist> {
+    let mut store = state.playlists.lock().unwrap();
+    let mut playlist = store.get(id).map_err(text)?.clone();
+    for file in &files {
+        playlist = store.remove_file(id, file).map_err(text)?;
+    }
+    drop(store);
+    state.refresh_library();
+    Ok(playlist)
 }
 
 /// Open File Explorer with the track selected.
@@ -527,21 +575,92 @@ fn show_in_folder(path: String) -> CommandResult<()> {
 
 #[tauri::command]
 fn playlist_remove_folder(state: State<AppState>, id: u64, folder: String) -> CommandResult<Playlist> {
-    state.playlists.lock().unwrap().remove_folder(id, &folder).map_err(text)
+    let playlist = state.playlists.lock().unwrap().remove_folder(id, &folder).map_err(text)?;
+    state.refresh_library();
+    Ok(playlist)
 }
 
-/// Read the playlist's folders from disk and return its tracks.
+/// Read the playlist's folders from disk and return its tracks. Files that
+/// have not changed come from the index, without being opened.
 #[tauri::command(async)]
 fn playlist_scan(state: State<AppState>, id: u64) -> CommandResult<Vec<TrackMeta>> {
     // Copy the playlist out so the lock is not held during the scan.
     let playlist = state.playlists.lock().unwrap().get(id).map_err(text)?.clone();
-    Ok(playlist.scan())
+    state.library.scan_playlist(&playlist).map_err(text)
+}
+
+// ---- Library index ---------------------------------------------------------
+
+/// Open the index. If it cannot be opened, set it aside and start a new
+/// one; failing that, keep it in memory for this run.
+fn open_library(path: &Path) -> Library {
+    Library::open(path)
+        .or_else(|e| {
+            tracing::error!("the library index could not be opened ({e}); starting a new one");
+            let _ = std::fs::rename(path, path.with_extension("db.damaged"));
+            Library::open(path)
+        })
+        .or_else(|_| Library::open_in_memory())
+        .expect("an in-memory index always opens")
+}
+
+/// Keep the index in line with the playlists: one full refresh at launch,
+/// then one after each change (several changes in a row make one refresh).
+/// Each refresh ends with `library://updated`.
+fn start_refresher(app: AppHandle, requests: mpsc::Receiver<()>) {
+    let spawned = std::thread::Builder::new().name("mdm-library".into()).spawn(move || {
+        while requests.recv().is_ok() {
+            while requests.try_recv().is_ok() {}
+            let state = app.state::<AppState>();
+            let playlists = state.playlists.lock().unwrap().list().to_vec();
+            match state.library.refresh(&playlists) {
+                Ok(tracks) => {
+                    let _ = app.emit("library://updated", LibraryStatus { tracks });
+                }
+                Err(e) => tracing::warn!("library refresh failed: {e}"),
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("the library index will not refresh: {e}");
+    }
 }
 
 // ---- Cover art -------------------------------------------------------------
 
-/// Answer `cover://<track path>` with the track's cover image.
-fn cover_response(uri_path: &str) -> Response<Vec<u8>> {
+/// Small covers are made this many pixels on their longest side: sharp at
+/// 32 CSS pixels up to 300% display scaling.
+const THUMB_PX: u32 = 96;
+/// Small covers made at once. A screenful of rows asks for many together,
+/// and each decodes a full-size picture.
+const THUMB_WORKERS: usize = 3;
+
+/// A counting lock: at most `THUMB_WORKERS` small covers in the making.
+struct Slots {
+    busy: Mutex<usize>,
+    freed: Condvar,
+}
+
+static THUMB_SLOTS: Slots = Slots { busy: Mutex::new(0), freed: Condvar::new() };
+
+impl Slots {
+    fn run<T>(&self, work: impl FnOnce() -> T) -> T {
+        let mut busy = self.busy.lock().unwrap();
+        while *busy >= THUMB_WORKERS {
+            busy = self.freed.wait(busy).unwrap();
+        }
+        *busy += 1;
+        drop(busy);
+        let out = work();
+        *self.busy.lock().unwrap() -= 1;
+        self.freed.notify_one();
+        out
+    }
+}
+
+/// Answer `cover://<track path>` with the track's cover image, or with a
+/// small JPEG of it when the query holds `thumb`.
+fn cover_response(app: &AppHandle, uri_path: &str, query: Option<&str>) -> Response<Vec<u8>> {
     let not_found = || {
         Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).expect("static response")
     };
@@ -553,11 +672,20 @@ fn cover_response(uri_path: &str) -> Response<Vec<u8>> {
     if !mdm_library::is_audio_file(track) {
         return not_found();
     }
-    match mdm_library::read_cover(track) {
-        Some(cover) => Response::builder()
-            .header(header::CONTENT_TYPE, cover.mime)
+    let thumb = query.is_some_and(|q| q.split('&').any(|p| p == "thumb"));
+    let cover = if thumb {
+        let library = app.state::<AppState>().library.clone();
+        THUMB_SLOTS
+            .run(|| library.thumbnail(track, THUMB_PX))
+            .map(|data| ("image/jpeg".to_string(), data))
+    } else {
+        mdm_library::read_cover(track).map(|c| (c.mime, c.data))
+    };
+    match cover {
+        Some((mime, data)) => Response::builder()
+            .header(header::CONTENT_TYPE, mime)
             .header(header::CACHE_CONTROL, "max-age=600")
-            .body(cover.data)
+            .body(data)
             .unwrap_or_else(|_| not_found()),
         None => not_found(),
     }
@@ -615,9 +743,13 @@ fn open_playlists(path: &Path) -> PlaylistStore {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .register_asynchronous_uri_scheme_protocol("cover", |_ctx, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("cover", |ctx, request, responder| {
             let uri_path = request.uri().path().to_string();
-            std::thread::spawn(move || responder.respond(cover_response(&uri_path)));
+            let query = request.uri().query().map(str::to_string);
+            let app = ctx.app_handle().clone();
+            std::thread::spawn(move || {
+                responder.respond(cover_response(&app, &uri_path, query.as_deref()))
+            });
         })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
@@ -626,6 +758,8 @@ pub fn run() {
             let player = Player::new(Box::new(output.backend()));
             let events = player.events();
             let playlists = open_playlists(&data_dir.join("playlists.json"));
+            let library = Arc::new(open_library(&data_dir.join("library.db")));
+            let (refresh_tx, refresh_rx) = mpsc::channel();
             let eq_path = data_dir.join("eq.json");
             let eq = load_eq(&eq_path);
             player.send(Command::SetEq(eq.clone()));
@@ -637,10 +771,15 @@ pub fn run() {
                 volume_watch: Mutex::new(None),
                 reconnect: Mutex::new(0),
                 playlists: Mutex::new(playlists),
+                library,
+                refresh: Mutex::new(refresh_tx),
                 eq: Mutex::new(eq),
                 eq_path,
             });
             watch_volume(app.handle(), &app.state::<AppState>(), device_id.as_deref());
+            start_refresher(app.handle().clone(), refresh_rx);
+            // The first refresh picks up whatever changed on disk while the app was closed.
+            app.state::<AppState>().refresh_library();
 
             // Media keys and the Windows media overlay. The app works without them.
             let media = app.get_webview_window("main").and_then(|window| {
@@ -691,7 +830,7 @@ pub fn run() {
             play_files,
             append_files,
             queue_remove,
-            queue_move,
+            queue_reorder,
             set_shuffle,
             set_repeat,
             play,
@@ -708,7 +847,10 @@ pub fn run() {
             playlist_rename,
             playlist_delete,
             playlist_add,
-            playlist_remove_file,
+            playlist_remove_files,
+            playlist_reorder,
+            search,
+            library_status,
             show_in_folder,
             playlist_remove_folder,
             playlist_scan,

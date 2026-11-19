@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     api,
     holdsFile,
+    listenLibrary,
     listenOutput,
     listenPlayer,
     formatRate,
@@ -24,6 +25,7 @@
   import Cover from "./lib/Cover.svelte";
   import EqPanel from "./lib/EqPanel.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
+  import { isIdentity, moveRows, RowDrag } from "./lib/reorder.svelte";
   import { loadSorts, nextSort, saveSorts, sortTracks, type PlaylistSorts, type SortKey } from "./lib/sort";
   import SourceMark from "./lib/SourceMark.svelte";
   import Spinner from "./lib/Spinner.svelte";
@@ -55,8 +57,18 @@
 
   // ---- Playlists ----
   let playlists = $state<Playlist[]>([]);
-  /** What the main area shows: the queue, or the playlist with this id. */
-  let view = $state<"queue" | number>("queue");
+  /** What the main area shows: the queue, search results, or the playlist with this id. */
+  let view = $state<"queue" | "search" | number>("queue");
+  /** Where to go back to when the search box is emptied. */
+  let lastView: "queue" | number = "queue";
+
+  // ---- Search ----
+  let searchQuery = $state("");
+  /** The last search's tracks; `null` before the first answer. */
+  let searchResults = $state<TrackMeta[] | null>(null);
+  let searching = $state(false);
+  /** Tracks in the library index, which is what search looks through. */
+  let libraryTracks = $state<number | null>(null);
   /** Tracks found by the last scan of each playlist, by playlist id. */
   let scanned = $state<Record<number, TrackMeta[]>>({});
   /** Ids of the playlists being scanned right now. */
@@ -75,8 +87,8 @@
   let showEq = $state(false);
 
   // ---- Window ----
-  /** The open track menu: where, what, and which row it belongs to. */
-  let menu = $state<{ x: number; y: number; items: MenuItem[]; row: number } | null>(null);
+  /** The open track menu: where and what. */
+  let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   /** A short confirmation, such as "Added to Favourites". */
   let notice = $state<string | null>(null);
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -125,7 +137,7 @@
   const shownMs = $derived(scrubMs ?? smoothMs);
   const fill = $derived(durationMs ? Math.min(100, (shownMs / durationMs) * 100) : 0);
   const currentTrack = $derived(currentIndex !== null ? (queue[currentIndex] ?? null) : null);
-  const playlist = $derived(view === "queue" ? null : (playlists.find((p) => p.id === view) ?? null));
+  const playlist = $derived(typeof view === "number" ? (playlists.find((p) => p.id === view) ?? null) : null);
   const playlistSort = $derived(playlist ? (sorts[playlist.id] ?? null) : null);
   /** The open playlist's tracks as listed and played: the last scan, in the chosen sort. */
   const playlistTracks = $derived.by(() => {
@@ -231,37 +243,34 @@
     await api.setRepeat(repeat).catch(showError);
   }
 
-  /** Take a track out of the queue, here and in the engine. */
-  async function removeFromQueue(index: number) {
-    if (index < 0 || index >= queue.length) return;
-    queue = queue.filter((_, i) => i !== index);
+  /** Take tracks out of the queue, here and in the engine. */
+  async function removeFromQueue(rows: number[]) {
+    const gone = new Set(rows.filter((i) => i >= 0 && i < queue.length));
+    if (gone.size === 0) return;
+    queue = queue.filter((_, i) => !gone.has(i));
     if (queue.length === 0) {
       // Nothing left: the engine stops on its own.
       currentIndex = null;
       signalPath = null;
       placePosition(0, true);
       durationMs = null;
-    } else if (currentIndex !== null && currentIndex > index) {
-      currentIndex -= 1;
+    } else if (currentIndex !== null) {
+      // The tracks before it that went. If it went itself, the engine moves on
+      // and announces the next one; meanwhile point at the next that stayed.
+      const c = currentIndex;
+      currentIndex = Math.min([...Array(c).keys()].filter((i) => !gone.has(i)).length, queue.length - 1);
     }
-    // Removing the track being heard: the engine moves on and announces the next one.
-    await api.queueRemove(index).catch(showError);
+    await api.queueRemove([...gone]).catch(showError);
   }
 
-  /** Move a queue track so it ends up at `to`, here and in the engine. */
-  async function moveInQueue(from: number, to: number) {
-    const moved = [...queue];
-    const [track] = moved.splice(from, 1);
-    moved.splice(to, 0, track);
-    queue = moved;
-    const c = currentIndex;
-    if (c !== null) {
-      if (c === from) currentIndex = to;
-      else if (from < c && c <= to) currentIndex = c - 1;
-      else if (to <= c && c < from) currentIndex = c + 1;
-    }
+  /** Move queue rows into the gap before `slot`, here and in the engine. */
+  async function moveInQueue(rows: number[], slot: number) {
+    const order = moveRows(queue.length, rows, slot);
+    if (isIdentity(order)) return;
+    queue = order.map((old) => queue[old]);
+    if (currentIndex !== null) currentIndex = order.indexOf(currentIndex);
     menu = null;
-    await api.queueMove(from, to).catch(showError);
+    await api.queueReorder(order).catch(showError);
   }
 
   async function pickFiles() {
@@ -495,70 +504,167 @@
     menu = null;
   }
 
-  async function removeFromPlaylist(id: number, path: string) {
+  /** Remove single files from a playlist. Paths that came from a folder are left alone. */
+  async function removeFromPlaylist(id: number, paths: string[]) {
+    if (paths.length === 0) return;
     try {
-      replacePlaylist(await api.playlistRemoveFile(id, path));
+      replacePlaylist(await api.playlistRemoveFiles(id, paths));
       await scan(id);
     } catch (e) {
       showError(e);
     }
   }
 
+  /** A playlist was dragged in the sidebar: save the new order. */
+  async function movePlaylists(rows: number[], slot: number) {
+    const order = moveRows(playlists.length, rows, slot);
+    if (isIdentity(order)) return;
+    const ids = order.map((old) => playlists[old].id);
+    playlists = order.map((old) => playlists[old]);
+    try {
+      playlists = await api.playlistReorder(ids);
+    } catch (e) {
+      showError(e);
+      playlists = await api.playlists().catch(() => playlists);
+    }
+  }
+
+  let navRows = $state<HTMLElement[]>([]);
+  const playlistDrag = new RowDrag({
+    rows: () => navRows.slice(0, playlists.length),
+    scroller: () => navRows[0]?.closest("nav"),
+    drop: (rows, slot) => void movePlaylists(rows, slot),
+  });
+  onDestroy(() => playlistDrag.destroy());
+
+  // ---- Search ----
+
+  /** Wait this long after the last key before searching. */
+  const SEARCH_DELAY_MS = 150;
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Searches started; a reply to an older one is dropped. */
+  let searchRun = 0;
+
+  /** The search box changed: search after a short pause, or leave search when it is empty. */
+  function onSearchInput() {
+    clearTimeout(searchTimer);
+    if (searchQuery.trim() === "") {
+      searchResults = null;
+      if (view === "search") view = lastView;
+      return;
+    }
+    if (view !== "search") {
+      lastView = view;
+      view = "search";
+    }
+    searchTimer = setTimeout(() => void runSearch(), SEARCH_DELAY_MS);
+  }
+
+  async function runSearch() {
+    const query = searchQuery.trim();
+    if (query === "") return;
+    const run = ++searchRun;
+    searching = true;
+    try {
+      const found = await api.search(query);
+      if (run === searchRun) searchResults = found;
+    } catch (e) {
+      if (run === searchRun) showError(e);
+    } finally {
+      if (run === searchRun) searching = false;
+    }
+  }
+
+  function clearSearch() {
+    searchQuery = "";
+    onSearchInput();
+  }
+
+  /** Open a view from the sidebar, leaving search. */
+  function show(target: "queue" | number) {
+    searchQuery = "";
+    searchResults = null;
+    if (target === "queue") view = "queue";
+    else openPlaylist(target);
+  }
+
   // ---- Track menu ----
 
-  /** The right-click menu for `tracks[index]` in the list on screen. */
-  function trackMenu(tracks: TrackMeta[], index: number): MenuItem[] {
-    const track = tracks[index];
+  /** "1 track", "3 tracks". */
+  function count(n: number): string {
+    return `${n} ${n === 1 ? "track" : "tracks"}`;
+  }
+
+  /**
+   * The right-click menu for `rows` of `tracks`, the list on screen: one
+   * track's menu, or one for the whole selection.
+   */
+  function trackMenu(tracks: TrackMeta[], rows: number[]): MenuItem[] {
+    const picked = rows.map((i) => tracks[i]);
+    const paths = picked.map((t) => t.path);
+    const one = picked.length === 1 ? picked[0] : null;
     const inQueue = view === "queue";
     const here = playlist;
+    const n = picked.length;
 
     const playlistItems: MenuItem[] = playlists.map((p) => {
-      const already = holdsFile(p, track.path);
+      const already = paths.every((path) => holdsFile(p, path));
       return {
         label: p.name,
         disabled: already,
         hint: already ? "Already in" : undefined,
         action: async () => {
-          if (await addToPlaylist(p.id, [track.path])) showNotice(`Added to ${p.name}`);
+          if (await addToPlaylist(p.id, paths)) showNotice(`Added ${one ? "" : `${count(n)} `}to ${p.name}`);
         },
       };
     });
     if (playlistItems.length > 0) playlistItems.push("separator");
-    playlistItems.push({ label: "New playlist…", action: () => newPlaylistWith([track.path]) });
+    playlistItems.push({ label: "New playlist…", action: () => newPlaylistWith(paths) });
 
-    const items: MenuItem[] = [
-      { label: "Play", action: () => (inQueue ? playQueue(index) : playTracks(tracks, index)) },
-    ];
+    const items: MenuItem[] = [];
     if (inQueue) {
-      items.push({ label: "Remove from queue", danger: true, action: () => removeFromQueue(index) });
+      items.push({ label: one ? "Play" : "Play from here", action: () => playQueue(rows[0]) });
+      items.push({
+        label: one ? "Remove from queue" : `Remove ${count(n)} from queue`,
+        danger: true,
+        action: () => removeFromQueue(rows),
+      });
     } else {
       items.push({
-        label: "Add to queue",
+        label: one ? "Play" : `Play ${count(n)}`,
+        action: () => (one ? playTracks(tracks, rows[0]) : playTracks(picked, 0)),
+      });
+      items.push({
+        label: one ? "Add to queue" : `Add ${count(n)} to queue`,
         action: async () => {
-          if (await addToQueue([track.path])) showNotice("Added to the queue");
+          if (await addToQueue(paths)) showNotice(`Added ${one ? "" : `${count(n)} `}to the queue`);
         },
       });
     }
     items.push({ label: "Add to playlist", children: playlistItems });
     if (here) {
-      const own = holdsFile(here, track.path);
+      const own = paths.filter((path) => holdsFile(here, path));
+      const fromFolders = n - own.length;
       items.push({
-        label: "Remove from playlist",
-        danger: own,
-        disabled: !own,
-        hint: own ? undefined : "From a folder",
-        action: () => removeFromPlaylist(here.id, track.path),
+        label: one || own.length <= 1 ? "Remove from playlist" : `Remove ${count(own.length)} from playlist`,
+        danger: own.length > 0,
+        disabled: own.length === 0,
+        hint: fromFolders === 0 ? undefined : one || own.length === 0 ? "From a folder" : `${fromFolders} from folders stay`,
+        action: () => removeFromPlaylist(here.id, own),
       });
     }
-    items.push("separator", { label: "Track info", action: () => (infoTrack = track) }, {
-      label: "Show in File Explorer",
-      action: () => api.showInFolder(track.path).catch(showError),
-    });
+    if (one) {
+      items.push("separator", { label: "Track info", action: () => (infoTrack = one) }, {
+        label: "Show in File Explorer",
+        action: () => api.showInFolder(one.path).catch(showError),
+      });
+    }
     return items;
   }
 
-  function openTrackMenu(tracks: TrackMeta[], index: number, x: number, y: number) {
-    menu = { x, y, items: trackMenu(tracks, index), row: index };
+  function openTrackMenu(tracks: TrackMeta[], rows: number[], x: number, y: number) {
+    if (rows.length === 0) return;
+    menu = { x, y, items: trackMenu(tracks, rows) };
   }
 
   /** Keep the browser's own menu where it is useful: text fields and selected text. */
@@ -641,21 +747,48 @@
           else if (event.payload.type === "leave") dragging = false;
           else if (event.payload.type === "drop") {
             dragging = false;
-            // On a playlist, a drop adds folders and files to it; on the queue, it adds tracks.
-            if (view === "queue") void addToQueue(event.payload.paths);
-            else void addToPlaylist(view, event.payload.paths);
+            // On a playlist, a drop adds folders and files to it; elsewhere, it adds tracks to the queue.
+            if (typeof view === "number") void addToPlaylist(view, event.payload.paths);
+            else void addToQueue(event.payload.paths);
           }
         }),
       );
+      cleanups.push(
+        await listenLibrary((status) => {
+          libraryTracks = status.tracks;
+          // Playlists changed, or the launch refresh finished: the answer may be different now.
+          if (view === "search") void runSearch();
+        }),
+      );
+      libraryTracks = (await api.libraryStatus()).tracks;
     })().catch(showError);
     return () => cleanups.forEach((c) => c());
   });
 
   function onKey(event: KeyboardEvent) {
-    const tag = (event.target as HTMLElement).tagName;
-    if (event.code === "Space" && !["SELECT", "BUTTON", "INPUT"].includes(tag)) {
+    const target = event.target as HTMLElement;
+    // Track rows are buttons too, but Space there should play or pause, not "click" them.
+    const typing = ["SELECT", "BUTTON", "INPUT", "TEXTAREA"].includes(target.tagName) && !target.hasAttribute("data-row");
+    if (event.code === "Space" && !typing) {
       event.preventDefault();
       void togglePlay();
+    } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      searchInput?.focus();
+      searchInput?.select();
+    }
+  }
+
+  let searchInput = $state<HTMLInputElement>();
+
+  /** Delete was pressed on rows of the list on screen. */
+  function deleteRows(tracks: TrackMeta[], rows: number[]) {
+    if (view === "queue") void removeFromQueue(rows);
+    else if (playlist) {
+      const here = playlist;
+      const own = rows.map((i) => tracks[i].path).filter((path) => holdsFile(here, path));
+      if (own.length === 0) showNotice("Tracks from a folder can only be removed with the folder");
+      else void removeFromPlaylist(here.id, own);
     }
   }
 
@@ -725,24 +858,68 @@
   <div class="flex min-h-0 flex-1">
     <!-- Sidebar: queue and playlists -->
     <nav class="flex w-52 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-line bg-panel p-3 text-sm">
+      <div class="relative mb-2">
+        <svg viewBox="0 0 24 24" class="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
+        </svg>
+        <input
+          bind:this={searchInput}
+          bind:value={searchQuery}
+          oninput={onSearchInput}
+          onkeydown={(e) => {
+            if (e.key === "Escape") clearSearch();
+          }}
+          type="search"
+          class="w-full rounded-lg border border-line bg-raised py-1.5 pl-8 pr-7 outline-none placeholder:text-muted focus:border-accent [&::-webkit-search-cancel-button]:hidden"
+          placeholder={libraryTracks ? `Search ${libraryTracks.toLocaleString()} tracks` : "Search"}
+          aria-label="Search all playlists"
+          title="Search every playlist by title, artist, album, file or folder name (Ctrl+F)"
+        />
+        {#if searchQuery}
+          <button
+            class="absolute right-1.5 top-1/2 grid h-5 w-5 -translate-y-1/2 place-items-center rounded text-muted hover:text-ink"
+            onclick={clearSearch}
+            aria-label="Clear search"
+          >
+            ✕
+          </button>
+        {/if}
+      </div>
+
       <button
         class="flex items-center justify-between rounded-lg px-3 py-2 text-left {view === 'queue'
           ? 'bg-raised font-medium text-ink'
           : 'text-muted hover:bg-raised hover:text-ink'}"
-        onclick={() => (view = "queue")}
+        onclick={() => show("queue")}
       >
         <span>Queue</span>
         {#if queue.length > 0}<span class="text-xs tabular-nums text-muted">{queue.length}</span>{/if}
       </button>
 
       <p class="px-3 pb-1 pt-4 text-xs font-medium uppercase tracking-wider text-muted">Playlists</p>
-      {#each playlists as item (item.id)}
+      {#each playlists as item, index (item.id)}
+        {@const line = playlistDrag.line(index)}
         <button
+          bind:this={navRows[index]}
           class="flex items-center gap-2 rounded-lg px-3 py-2 text-left {view === item.id
             ? 'bg-raised font-medium text-ink'
-            : 'text-muted hover:bg-raised hover:text-ink'}"
-          onclick={() => openPlaylist(item.id)}
-          title={item.name}
+            : playlistDrag.active
+              ? 'text-muted'
+              : 'text-muted hover:bg-raised hover:text-ink'} {playlistDrag.active && playlistDrag.dragging.includes(index)
+            ? 'opacity-40'
+            : ''} {line === 'above'
+            ? 'shadow-[inset_0_2px_0_var(--color-accent)]'
+            : line === 'below'
+              ? 'shadow-[inset_0_-2px_0_var(--color-accent)]'
+              : ''}"
+          onclick={() => {
+            if (!playlistDrag.endedDrag()) show(item.id);
+          }}
+          onpointerdown={(e) => playlistDrag.down(e, [index])}
+          onpointermove={(e) => playlistDrag.move(e)}
+          onpointerup={(e) => playlistDrag.up(e)}
+          onpointercancel={(e) => playlistDrag.cancel(e)}
+          title="{item.name} (drag to reorder)"
         >
           <span class="min-w-0 flex-1 truncate">{item.name}</span>
           {#if scanning.has(item.id)}
@@ -774,7 +951,45 @@
     </nav>
 
     <main class="relative min-w-0 flex-1 overflow-y-auto">
-      {#if playlist}
+      {#if view === "search"}
+        <!-- Search: tracks of every playlist matching what was typed -->
+        <div class="px-6 pb-3 pt-5">
+          <div class="flex items-center gap-3">
+            <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">Search</h1>
+            <button
+              class="rounded-lg bg-accent px-3.5 py-1.5 text-sm font-medium text-base hover:brightness-110 disabled:opacity-40"
+              disabled={!searchResults || searchResults.length === 0}
+              onclick={() => searchResults && playTracks(searchResults, 0)}
+            >
+              Play all
+            </button>
+          </div>
+          <p class="mt-1 min-h-4 text-xs text-muted" role="status">
+            {#if searching && !searchResults}
+              <span class="inline-flex items-center gap-1.5 align-middle"><Spinner /> Searching…</span>
+            {:else if searchResults}
+              {searchResults.length >= 500 ? "The first 500 tracks" : count(searchResults.length)} for “{searchQuery.trim()}”
+              {#if libraryTracks !== null}· searched {libraryTracks.toLocaleString()} tracks in your playlists{/if}
+            {/if}
+          </p>
+        </div>
+        {#if searchResults && searchResults.length > 0}
+          <TrackTable
+            tracks={searchResults}
+            currentPath={currentTrack?.path ?? null}
+            playing={playState === "playing"}
+            onplay={(index) => searchResults && playTracks(searchResults, index)}
+            onmenu={(rows, x, y) => searchResults && openTrackMenu(searchResults, rows, x, y)}
+          />
+        {:else if searchResults}
+          <div class="px-6 py-12 text-center text-sm text-muted">
+            <p>Nothing matches. Every word has to appear in the title, artist, album, file or folder name.</p>
+            {#if libraryTracks === 0}
+              <p class="mt-1.5">Search looks through your playlists, and they have no tracks yet.</p>
+            {/if}
+          </div>
+        {/if}
+      {:else if playlist}
         <!-- A playlist: its folders and the tracks found in them -->
         <div class="px-6 pb-3 pt-5">
           <div class="flex items-center gap-3">
@@ -901,8 +1116,8 @@
             currentPath={currentTrack?.path ?? null}
             playing={playState === "playing"}
             onplay={(index) => playTracks(playlistTracks, index)}
-            onmenu={(index, x, y) => openTrackMenu(playlistTracks, index, x, y)}
-            menuIndex={menu?.row ?? null}
+            onmenu={(rows, x, y) => openTrackMenu(playlistTracks, rows, x, y)}
+            ondelete={(rows) => deleteRows(playlistTracks, rows)}
             source={(track) => (playlist && holdsFile(playlist, track.path) ? "file" : "folder")}
             sort={playlistSort}
             onsort={sortPlaylist}
@@ -948,8 +1163,8 @@
           currentPath={currentTrack?.path ?? null}
           playing={playState === "playing"}
           onplay={playQueue}
-          onmenu={(index, x, y) => openTrackMenu(queue, index, x, y)}
-          menuIndex={menu?.row ?? null}
+          onmenu={(rows, x, y) => openTrackMenu(queue, rows, x, y)}
+          ondelete={(rows) => deleteRows(queue, rows)}
           onmove={moveInQueue}
         />
       {/if}

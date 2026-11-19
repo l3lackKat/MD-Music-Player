@@ -7,7 +7,8 @@ use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::tag::{Tag, TagType};
 use mdm_library::{
-    expand_paths, read_cover, read_details, read_lyrics, read_meta, scan_folder, PlaylistStore,
+    expand_paths, fold, make_thumbnail, read_cover, read_details, read_lyrics, read_meta, scan_folder,
+    Library, PlaylistStore,
 };
 
 /// A fresh, empty folder under the system temp directory.
@@ -239,6 +240,275 @@ fn playlists_persist_and_scan_their_folders() {
 
     // The music itself is untouched by deleting a playlist.
     assert!(dir.join("music/rock/a.wav").exists());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// An ID3v2 tag block, as DSF and DFF files carry it.
+fn id3_block(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Vec<u8> {
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.set_title(title.to_string());
+    tag.set_artist(artist.to_string());
+    tag.set_album(album.to_string());
+    tag.insert_text(ItemKey::UnsyncLyrics, "Sung in DSD".to_string());
+    if let Some(cover) = cover {
+        tag.push_picture(
+            Picture::unchecked(cover.to_vec()).pic_type(PictureType::CoverFront).mime_type(MimeType::Png).build(),
+        );
+    }
+    let mut out = Vec::new();
+    tag.dump_to(&mut out, WriteOptions::default()).unwrap();
+    out
+}
+
+/// One second of stereo DSD64 silence as a DSF, with `id3` after the audio.
+fn write_dsf(path: &Path, id3: Option<&[u8]>) {
+    let block = 4096usize;
+    let frames: usize = 2_822_400 / 8; // bytes per channel for one second
+    let blocks = frames.div_ceil(block);
+    let data = vec![0x69u8; blocks * block * 2];
+    let audio_end = 28 + 52 + 12 + data.len();
+    let mut f = Vec::new();
+    f.extend_from_slice(b"DSD ");
+    f.extend_from_slice(&28u64.to_le_bytes());
+    f.extend_from_slice(&((audio_end + id3.map_or(0, |t| t.len())) as u64).to_le_bytes());
+    f.extend_from_slice(&(if id3.is_some() { audio_end as u64 } else { 0 }).to_le_bytes());
+    f.extend_from_slice(b"fmt ");
+    f.extend_from_slice(&52u64.to_le_bytes());
+    for v in [1u32, 0, 2, 2, 2_822_400, 1] {
+        f.extend_from_slice(&v.to_le_bytes());
+    }
+    f.extend_from_slice(&((frames * 8) as u64).to_le_bytes());
+    f.extend_from_slice(&(block as u32).to_le_bytes());
+    f.extend_from_slice(&0u32.to_le_bytes());
+    f.extend_from_slice(b"data");
+    f.extend_from_slice(&((data.len() + 12) as u64).to_le_bytes());
+    f.extend_from_slice(&data);
+    if let Some(id3) = id3 {
+        f.extend_from_slice(id3);
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, f).unwrap();
+}
+
+/// A stereo DFF with `extra` chunks (already framed) after the sound data.
+fn write_dff(path: &Path, extra: &[u8]) {
+    let data = vec![0x69u8; 2 * 1000];
+    let mut prop = Vec::new();
+    prop.extend_from_slice(b"SND ");
+    prop.extend_from_slice(b"FS  ");
+    prop.extend_from_slice(&4u64.to_be_bytes());
+    prop.extend_from_slice(&2_822_400u32.to_be_bytes());
+    prop.extend_from_slice(b"CHNL");
+    prop.extend_from_slice(&10u64.to_be_bytes());
+    prop.extend_from_slice(&2u16.to_be_bytes());
+    prop.extend_from_slice(b"SLFTSRGT");
+    let mut body = Vec::new();
+    body.extend_from_slice(b"DSD ");
+    body.extend_from_slice(b"PROP");
+    body.extend_from_slice(&(prop.len() as u64).to_be_bytes());
+    body.extend_from_slice(&prop);
+    body.extend_from_slice(b"DSD ");
+    body.extend_from_slice(&(data.len() as u64).to_be_bytes());
+    body.extend_from_slice(&data);
+    body.extend_from_slice(extra);
+    let mut file = Vec::new();
+    file.extend_from_slice(b"FRM8");
+    file.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    file.extend_from_slice(&body);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, file).unwrap();
+}
+
+/// A DFF chunk: id, big-endian size, body, padded to even.
+fn dff_chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut c = id.to_vec();
+    c.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    c.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        c.push(0);
+    }
+    c
+}
+
+fn dff_text(id: &[u8; 4], text: &str) -> Vec<u8> {
+    let mut body = (text.len() as u32).to_be_bytes().to_vec();
+    body.extend_from_slice(text.as_bytes());
+    dff_chunk(id, &body)
+}
+
+#[test]
+fn dsd_files_have_tags_covers_and_lyrics() {
+    let dir = temp_dir("dsd-tags");
+    let png = b"\x89PNG dsd cover";
+
+    let dsf = dir.join("Track.dsf");
+    write_dsf(&dsf, Some(&id3_block("Hiệp sĩ", "Orange Knight", "DSD Album", Some(png))));
+    let meta = read_meta(&dsf);
+    assert_eq!(meta.title, "Hiệp sĩ");
+    assert_eq!(meta.artist.as_deref(), Some("Orange Knight"));
+    assert_eq!(meta.album.as_deref(), Some("DSD Album"));
+    assert_eq!(meta.duration_ms, Some(1000), "length comes from the DSD header");
+    assert_eq!(read_cover(&dsf).expect("embedded cover").data, png);
+    assert_eq!(read_lyrics(&dsf).expect("lyrics").lines[0].text, "Sung in DSD");
+    let details = read_details(&dsf);
+    assert!(details.audio.dsd);
+    assert!(details.tags.iter().flat_map(|t| &t.fields).any(|f| f.value == "Orange Knight"));
+    assert_eq!(details.pictures.len(), 1);
+
+    // No tag block: the file name, as before.
+    let plain = dir.join("Plain Name.dsf");
+    write_dsf(&plain, None);
+    assert_eq!(read_meta(&plain).title, "Plain Name");
+    assert_eq!(read_meta(&plain).duration_ms, Some(1000));
+
+    // DFF with an ID3 chunk.
+    let dff = dir.join("a.dff");
+    write_dff(&dff, &dff_chunk(b"ID3 ", &id3_block("From ID3", "Tagger", "DFF Album", None)));
+    let meta = read_meta(&dff);
+    assert_eq!(meta.title, "From ID3");
+    assert_eq!(meta.album.as_deref(), Some("DFF Album"));
+
+    // DFF with only its own title and artist.
+    let diin = [dff_text(b"DITI", "Native Title"), dff_text(b"DIAR", "Native Artist")].concat();
+    let dff = dir.join("b.dff");
+    write_dff(&dff, &dff_chunk(b"DIIN", &diin));
+    let meta = read_meta(&dff);
+    assert_eq!(meta.title, "Native Title");
+    assert_eq!(meta.artist.as_deref(), Some("Native Artist"));
+
+    // A damaged tag pointer still gives the file name.
+    let broken = dir.join("Broken.dsf");
+    write_dsf(&broken, Some(b"not an id3 tag"));
+    assert_eq!(read_meta(&broken).title, "Broken");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+fn tagged(dir: &Path, rel: &str, title: &str, artist: &str, album: &str, track: u32) -> PathBuf {
+    let path = dir.join(rel);
+    write_tagged(&path, Tags { title, artist, album, track, lyrics: None, cover: None });
+    path
+}
+
+#[test]
+fn the_index_caches_tags_and_follows_changes() {
+    let dir = temp_dir("index-cache");
+    let a = tagged(&dir, "album/a.wav", "First", "Artist", "Album", 1);
+    tagged(&dir, "album/b.wav", "Second", "Artist", "Album", 2);
+    let mut store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    let id = store.create("P").unwrap().id;
+    store.add_folder(id, &dir.join("album")).unwrap();
+    let playlist = store.get(id).unwrap().clone();
+
+    let library = Library::open(&dir.join("library.db")).unwrap();
+    let first = library.scan_playlist(&playlist).unwrap();
+    assert_eq!(first, playlist.scan(), "the index gives what a plain scan gives");
+    assert_eq!(library.track_count(), 2);
+
+    // A changed file is read again (its size changes with the new tag).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_tagged(&a, Tags { title: "First, retitled", artist: "Artist", album: "Album", track: 1, lyrics: None, cover: None });
+    let titles: Vec<String> = library.scan_playlist(&playlist).unwrap().into_iter().map(|t| t.title).collect();
+    assert_eq!(titles, ["First, retitled", "Second"]);
+
+    // The index survives reopening.
+    drop(library);
+    let library = Library::open(&dir.join("library.db")).unwrap();
+    assert_eq!(library.track_count(), 2);
+    assert_eq!(library.search("retitled", 10).unwrap().len(), 1);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn search_ignores_case_and_accents_and_needs_every_word() {
+    let dir = temp_dir("index-search");
+    tagged(&dir, "vn/1.wav", "Hiệp sĩ màu cam", "Đông Nhi", "Đà Lạt", 1);
+    tagged(&dir, "vn/2.wav", "Mưa", "Đông Nhi", "Đà Lạt", 2);
+    tagged(&dir, "en/3.wav", "Orange Knight", "The Band", "Colours", 1);
+    write_wav(&dir.join("Loose Folder/untagged song.wav"));
+    let mut store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    let id = store.create("All").unwrap().id;
+    let (playlist, _) = store.add_paths(id, &[dir.join("vn"), dir.join("en"), dir.join("Loose Folder")]).unwrap();
+    let library = Library::open_in_memory().unwrap();
+    assert_eq!(library.refresh(std::slice::from_ref(&playlist)).unwrap(), 4);
+
+    let titles = |q: &str| -> Vec<String> { library.search(q, 50).unwrap().into_iter().map(|t| t.title).collect() };
+    assert_eq!(titles("hiep si"), ["Hiệp sĩ màu cam"]);
+    assert_eq!(titles("HIỆP"), ["Hiệp sĩ màu cam"]);
+    assert_eq!(titles("dong nhi"), ["Hiệp sĩ màu cam", "Mưa"], "album order");
+    assert_eq!(titles("da lat mua"), ["Mưa"], "every word must match");
+    assert_eq!(titles("knight band"), ["Orange Knight"]);
+    assert_eq!(titles("loose"), ["untagged song"], "folder names count");
+    assert!(titles("100%").is_empty(), "LIKE wildcards are taken literally");
+    assert!(titles("   ").is_empty());
+    assert_eq!(fold("Đà Lạt"), "da lat");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn refresh_drops_what_no_playlist_holds() {
+    let dir = temp_dir("index-refresh");
+    tagged(&dir, "keep/a.wav", "Kept", "X", "Y", 1);
+    tagged(&dir, "gone/b.wav", "Dropped", "X", "Y", 1);
+    let mut store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    let id = store.create("P").unwrap().id;
+    store.add_folder(id, &dir.join("keep")).unwrap();
+    let playlist = store.add_folder(id, &dir.join("gone")).unwrap();
+    let library = Library::open_in_memory().unwrap();
+    assert_eq!(library.refresh(std::slice::from_ref(&playlist)).unwrap(), 2);
+
+    // Files only seen through the queue are read but never kept.
+    write_wav(&dir.join("queue-only.wav"));
+    assert_eq!(library.expand_paths(&[dir.join("queue-only.wav")]).len(), 1);
+    assert_eq!(library.track_count(), 2);
+
+    let gone = playlist.folders[1].clone();
+    let playlist = store.remove_folder(id, &gone).unwrap();
+    assert_eq!(library.refresh(std::slice::from_ref(&playlist)).unwrap(), 1);
+    assert!(library.search("dropped", 10).unwrap().is_empty());
+    assert_eq!(library.search("kept", 10).unwrap().len(), 1);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn thumbnails_are_small_jpegs_made_once() {
+    let dir = temp_dir("index-thumbs");
+    // A real 300x200 PNG, made with the image crate.
+    let mut png = Vec::new();
+    image::RgbImage::from_pixel(300, 200, image::Rgb([200, 120, 40]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let with = dir.join("with.wav");
+    write_tagged(&with, Tags { title: "T", artist: "A", album: "B", track: 1, lyrics: None, cover: Some(&png) });
+    let without = dir.join("without.wav");
+    write_wav(&without);
+
+    let library = Library::open_in_memory().unwrap();
+    let thumb = library.thumbnail(&with, 64).expect("a cover");
+    let decoded = image::load_from_memory(&thumb).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (64, 43), "fits in 64 px, keeps its shape");
+    assert_eq!(&thumb[..2], b"\xFF\xD8", "JPEG");
+    // The second time comes from the index, unchanged.
+    assert_eq!(library.thumbnail(&with, 64).unwrap(), thumb);
+    assert!(library.thumbnail(&without, 64).is_none());
+    assert!(make_thumbnail(b"not a picture", 64).is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn playlists_can_be_put_in_a_new_order() {
+    let dir = temp_dir("reorder");
+    let mut store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    let a = store.create("A").unwrap().id;
+    let b = store.create("B").unwrap().id;
+    let c = store.create("C").unwrap().id;
+    let names = |s: &PlaylistStore| s.list().iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    store.reorder(&[c, a, b]).unwrap();
+    assert_eq!(names(&store), ["C", "A", "B"]);
+    // Ids left out keep their order after the named ones; unknown ids do nothing.
+    store.reorder(&[b, 999]).unwrap();
+    assert_eq!(names(&store), ["B", "C", "A"]);
+    let store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    assert_eq!(names(&store), ["B", "C", "A"], "the order is saved");
     std::fs::remove_dir_all(dir).ok();
 }
 

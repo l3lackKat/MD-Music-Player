@@ -156,6 +156,16 @@ export function coverUrl(path: string): string {
   return convertFileSrc(path, "cover");
 }
 
+/** URL of a track's small cover (JPEG, 96 px), made once and kept in the library index. 404 when there is none. */
+export function thumbUrl(path: string): string {
+  return `${coverUrl(path)}?thumb`;
+}
+
+/** How many tracks the library index holds: every playlist's tracks. */
+export interface LibraryStatus {
+  tracks: number;
+}
+
 export const api = {
   expandPaths: (paths: string[]) => invoke<TrackMeta[]>("expand_paths", { paths }),
   getLyrics: (path: string) => invoke<Lyrics | null>("get_lyrics", { path }),
@@ -170,14 +180,20 @@ export const api = {
   /** Add folders and audio files; `skipped` lists paths that were neither. */
   playlistAdd: (id: number, paths: string[]) =>
     invoke<{ playlist: Playlist; skipped: string[] }>("playlist_add", { id, paths }),
-  playlistRemoveFile: (id: number, file: string) =>
-    invoke<Playlist>("playlist_remove_file", { id, file }),
+  /** Remove single files; tracks that come from a folder stay. */
+  playlistRemoveFiles: (id: number, files: string[]) =>
+    invoke<Playlist>("playlist_remove_files", { id, files }),
+  /** Put the playlists in this order; returns them all. */
+  playlistReorder: (ids: number[]) => invoke<Playlist[]>("playlist_reorder", { ids }),
+  /** Tracks of any playlist matching every word, accents and case ignored. */
+  search: (query: string) => invoke<TrackMeta[]>("search", { query }),
+  libraryStatus: () => invoke<LibraryStatus>("library_status"),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   appendFiles: (paths: string[]) => invoke<void>("append_files", { paths }),
-  /** Take a track out of the engine's queue; remove it from the UI's `queue` too. */
-  queueRemove: (index: number) => invoke<void>("queue_remove", { index }),
-  /** Move a track so it ends up at `to`, in the engine's queue; move it in the UI's `queue` too. */
-  queueMove: (from: number, to: number) => invoke<void>("queue_move", { from, to }),
+  /** Take tracks out of the engine's queue; remove them from the UI's `queue` too. */
+  queueRemove: (indexes: number[]) => invoke<void>("queue_remove", { indexes }),
+  /** Put the engine's queue in a new order, `order[new] = old`; reorder the UI's `queue` the same way. */
+  queueReorder: (order: number[]) => invoke<void>("queue_reorder", { order }),
   setShuffle: (on: boolean) => invoke<void>("set_shuffle", { on }),
   setRepeat: (repeat: Repeat) => invoke<void>("set_repeat", { repeat }),
   playlistRemoveFolder: (id: number, folder: string) =>
@@ -241,6 +257,11 @@ export async function listenOutput(handlers: OutputHandlers): Promise<UnlistenFn
     listen<Reconnected>("output://reconnected", (e) => handlers.reconnected(e.payload)),
   ]);
   return () => unlisten.forEach((u) => u());
+}
+
+/** The library index finished a refresh (after launch, or after the playlists changed). */
+export function listenLibrary(handler: (status: LibraryStatus) => void): Promise<UnlistenFn> {
+  return listen<LibraryStatus>("library://updated", (e) => handler(e.payload));
 }
 
 /** Called whenever the selected device's Windows volume changes, wherever it was changed. */
