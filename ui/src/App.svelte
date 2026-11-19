@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, untrack } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -9,6 +9,7 @@
     listenLibrary,
     listenOutput,
     listenPlayer,
+    formatKhz,
     formatRate,
     formatTime,
     type DeviceInfo,
@@ -101,6 +102,24 @@
   let infoTrack = $state<TrackMeta | null>(null);
   let dragging = $state(false);
   let showPanel = $state(true);
+  /** Below this width the track list and the cover panel do not both fit (a 1080p
+   *  screen split in half is 960 px), so the panel steps aside. */
+  const NARROW_WIDTH = 1100;
+  let innerWidth = $state(window.innerWidth);
+  const narrow = $derived(innerWidth < NARROW_WIDTH);
+  /** The panel was hidden by the window narrowing, not by the user: it comes back when the window widens. */
+  let panelAutoHidden = false;
+  $effect(() => {
+    if (narrow) {
+      if (untrack(() => showPanel)) {
+        showPanel = false;
+        panelAutoHidden = true;
+      }
+    } else if (panelAutoHidden) {
+      showPanel = true;
+      panelAutoHidden = false;
+    }
+  });
   /** The cover is shown as a round record that turns while playing. Clicking a cover switches it. */
   let disc = $state(loadDisc());
   // While the thumb is held, the bar follows the pointer, not the player.
@@ -151,17 +170,56 @@
   /** The open playlist is being scanned. */
   const playlistLoading = $derived(playlist !== null && scanning.has(playlist.id));
 
+  /** The decoder's codec name, as a listener knows it: "PCM_S16LE" is plain PCM (WAV, AIFF). */
+  function codecName(codec: string): string {
+    if (codec.startsWith("PCM")) return "PCM";
+    if (codec === "VORBIS") return "Vorbis";
+    if (codec === "OPUS") return "Opus";
+    return codec;
+  }
+
+  // The signal path in the transport bar, in the short form players use ("16/44.1 →
+  // 24/44.1 kHz"), so it fits beside the volume; `signalTitle` spells it out, codec included.
   const sourceLabel = $derived.by(() => {
     if (!signalPath) return "";
     const s = signalPath.source;
-    if (s.kind.type === "dsd") return `${s.codec} · ${(s.sample_rate / 1e6).toFixed(1)} MHz`;
-    const bits = s.kind.type === "pcm" ? `${s.kind.bits}-bit · ` : "";
-    return `${s.codec} · ${bits}${formatRate(s.sample_rate)}`;
+    if (s.kind.type === "dsd") return s.codec;
+    if (s.kind.type === "pcm") return `${s.kind.bits}/${formatKhz(s.sample_rate)}`;
+    return `${codecName(s.codec)} ${formatRate(s.sample_rate)}`;
   });
   const outputLabel = $derived.by(() => {
     if (!signalPath) return "";
     const o = signalPath.output;
-    return o.dop ? `DoP · ${formatRate(o.sample_rate)}` : `${o.valid_bits}-bit · ${formatRate(o.sample_rate)}`;
+    return o.dop ? `DoP ${formatRate(o.sample_rate)}` : `${o.valid_bits}/${formatRate(o.sample_rate)}`;
+  });
+  const signalTitle = $derived.by(() => {
+    if (!signalPath) return "";
+    const { source: s, output: o } = signalPath;
+    const file =
+      s.kind.type === "dsd"
+        ? `${s.codec} (${(s.sample_rate / 1e6).toFixed(1)} MHz)`
+        : s.kind.type === "pcm"
+          ? `${codecName(s.codec)}, ${s.kind.bits}-bit, ${formatRate(s.sample_rate)}`
+          : `${codecName(s.codec)}, ${formatRate(s.sample_rate)}`;
+    const words = o.container.slice(1);
+    const sent = o.dop
+      ? `DSD over PCM (DoP) at ${formatRate(o.sample_rate)}`
+      : `${o.valid_bits}-bit${String(o.valid_bits) === words ? "" : ` in ${words}-bit words`}, ${formatRate(o.sample_rate)}`;
+    return `File: ${file}\nThe DAC receives: ${sent}\nDevice: ${signalPath.device}`;
+  });
+  /** The bit-perfect badge's tooltip: why it says what it says, then the full path. */
+  const badgeTitle = $derived.by(() => {
+    if (!signalPath) return "";
+    const why = signalPath.bit_perfect
+      ? "Every sample reaches the DAC unchanged"
+      : signalPath.eq
+        ? "The equalizer is changing the samples. Turn it off for bit-perfect playback"
+        : signalPath.soft_volume
+          ? "The software volume is scaling the samples, since this device has no volume of its own. Use a device with a hardware volume for bit-perfect playback"
+          : signalPath.exclusive
+            ? "The source is lossy or floating point, so there are no original samples to preserve"
+            : "Shared mode: Windows resamples and mixes the audio";
+    return `${why}.\n\n${signalTitle}`;
   });
 
   function showError(message: unknown) {
@@ -616,6 +674,15 @@
     else openPlaylist(target);
   }
 
+  /** The transport's track title was clicked: open the queue at the track being heard. */
+  async function revealCurrent() {
+    if (currentIndex === null) return;
+    show("queue");
+    await tick();
+    const row = document.querySelectorAll<HTMLElement>("main [data-row]")[currentIndex];
+    row?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
   // ---- Track menu ----
 
   /** "1 track", "3 tracks". */
@@ -828,7 +895,7 @@
 </script>
 
 <!-- Focus re-reads the volume, which may have been changed in Windows meanwhile. -->
-<svelte:window onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => void onWindowFocus()} />
+<svelte:window bind:innerWidth onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => void onWindowFocus()} />
 
 <div class="flex h-full flex-col">
   <!-- Top bar: output device and mode -->
@@ -1001,15 +1068,17 @@
       {#if view === "search"}
         <!-- Search: tracks of every playlist matching what was typed -->
         <div class="px-6 pb-3 pt-5">
-          <div class="flex items-center gap-3">
+          <!-- `min-h-8` holds the row's height while the button is away (nothing found yet). -->
+          <div class="flex min-h-8 items-center gap-3">
             <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">Search</h1>
-            <button
-              class="rounded-lg bg-accent px-3.5 py-1.5 text-sm font-medium text-base hover:brightness-110 disabled:opacity-40"
-              disabled={!searchResults || searchResults.length === 0}
-              onclick={() => searchResults && playTracks(searchResults, 0)}
-            >
-              Play all
-            </button>
+            {#if searchResults && searchResults.length > 0}
+              <button
+                class="rounded-lg bg-accent px-3.5 py-1.5 text-sm font-medium text-base hover:brightness-110"
+                onclick={() => searchResults && playTracks(searchResults, 0)}
+              >
+                Play all
+              </button>
+            {/if}
           </div>
           <p class="mt-1 min-h-4 text-xs text-muted" role="status">
             {#if searching && !searchResults}
@@ -1039,10 +1108,11 @@
       {:else if playlist}
         <!-- A playlist: its folders and the tracks found in them -->
         <div class="px-6 pb-3 pt-5">
-          <div class="flex items-center gap-3">
+          <!-- The actions wrap under the name when the list is narrow, instead of pushing out of view. -->
+          <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
             {#if renaming !== null}
               <input
-                class="min-w-0 flex-1 rounded-lg border border-accent bg-raised px-3 py-1 text-xl font-semibold outline-none"
+                class="min-w-0 flex-1 basis-40 rounded-lg border border-accent bg-raised px-3 py-1 text-xl font-semibold outline-none"
                 bind:value={renaming}
                 use:focusOnMount
                 onblur={renamePlaylist}
@@ -1052,9 +1122,9 @@
                 }}
               />
             {:else}
-              <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">{playlist.name}</h1>
+              <h1 class="min-w-0 flex-1 basis-40 truncate text-xl font-semibold" title={playlist.name}>{playlist.name}</h1>
             {/if}
-            <div class="flex shrink-0 gap-1 text-sm">
+            <div class="flex flex-wrap gap-1 text-sm">
               <button
                 class="rounded-lg bg-accent px-3.5 py-1.5 font-medium text-base hover:brightness-110 disabled:opacity-40"
                 disabled={!playlistTracks || playlistTracks.length === 0}
@@ -1103,12 +1173,10 @@
             {:else if playlistTracks}
               {playlistTracks.length} {playlistTracks.length === 1 ? "track" : "tracks"}
               · {formatTime(playlistTracks.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
-              {#if playlistTracks.length > 0}
+              {#if playlist.files.length > 0}
+                <!-- Rows mark only single files; folder tracks, the usual case, go unmarked. -->
                 <span class="ml-3 inline-flex items-center gap-1.5 align-middle">
-                  <SourceMark kind="folder" /> from a folder
-                </span>
-                <span class="ml-3 inline-flex items-center gap-1.5 align-middle">
-                  <SourceMark kind="file" /> single file
+                  <SourceMark kind="file" /> added as a single file
                 </span>
               {/if}
             {/if}
@@ -1194,7 +1262,8 @@
           </div>
         </div>
       {:else}
-        <div class="flex items-center justify-between px-6 pb-3 pt-5">
+        <!-- Same header shape as a playlist: name and actions, then a count line. -->
+        <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-6 pt-5">
           <h1 class="text-xl font-semibold">Queue</h1>
           <div class="flex gap-1 text-sm">
             <button class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink" onclick={pickFiles}>
@@ -1205,6 +1274,9 @@
             </button>
           </div>
         </div>
+        <p class="mt-1 px-6 pb-3 text-xs text-muted">
+          {count(queue.length)} · {formatTime(queue.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
+        </p>
         <TrackTable
           tracks={queue}
           currentPath={currentTrack?.path ?? null}
@@ -1276,12 +1348,16 @@
           onclick={toggleDisc}
           title={disc ? "Click for the square cover" : "Click to spin the cover like a record"}
         />
-        <div class="min-w-0">
-          <p class="truncate text-sm font-medium">{currentTrack?.title ?? "Not playing"}</p>
-          {#if currentTrack?.artist}
-            <p class="mt-0.5 truncate text-xs text-muted">{currentTrack.artist}</p>
-          {/if}
-        </div>
+        {#if currentTrack}
+          <button class="group min-w-0 text-left" title="Show in the queue" onclick={revealCurrent}>
+            <p class="truncate text-sm font-medium group-hover:underline">{currentTrack.title}</p>
+            {#if currentTrack.artist}
+              <p class="mt-0.5 truncate text-xs text-muted">{currentTrack.artist}</p>
+            {/if}
+          </button>
+        {:else}
+          <p class="min-w-0 truncate text-sm font-medium text-muted">Not playing</p>
+        {/if}
       </div>
 
       <div class="flex items-center gap-2">
@@ -1346,22 +1422,19 @@
       </div>
 
       <!-- Signal path: what the file is, what the device receives -->
-      <div class="flex min-w-0 items-center justify-end gap-2 text-xs">
+      <div class="@container flex min-w-0 items-center justify-end gap-2 text-xs">
         {#if signalPath && playState !== "stopped"}
-          <span class="truncate text-muted" title={signalPath.device}>{sourceLabel} → {outputLabel}</span>
+          <!-- When space runs out, the file side gives way; what the DAC receives stays. Below
+               28rem (the controls beside it take about 27rem) there is no room for either, and
+               the badge's tooltip carries the full path instead. -->
+          <span class="hidden min-w-0 overflow-hidden whitespace-nowrap text-muted @md:flex" title={signalTitle}>
+            <span class="truncate">{sourceLabel}</span><span class="shrink-0">&nbsp;→ {outputLabel}</span>
+          </span>
           <span
             class="shrink-0 rounded-full px-2.5 py-1 font-medium {signalPath.bit_perfect
               ? 'bg-good/15 text-good'
               : 'bg-warn/15 text-warn'}"
-            title={signalPath.bit_perfect
-              ? "Every sample reaches the DAC unchanged"
-              : signalPath.eq
-                ? "The equalizer is changing the samples. Turn it off for bit-perfect playback"
-                : signalPath.soft_volume
-                  ? "The software volume is scaling the samples, since this device has no volume of its own. Use a device with a hardware volume for bit-perfect playback"
-                  : signalPath.exclusive
-                    ? "The source is lossy or floating point, so there are no original samples to preserve"
-                    : "Shared mode: Windows resamples and mixes the audio"}
+            title={badgeTitle}
           >
             {signalPath.bit_perfect
               ? "Bit-perfect"
@@ -1394,7 +1467,10 @@
             : 'text-muted hover:text-ink'}"
           title={showPanel ? "Hide cover and lyrics" : "Show cover and lyrics"}
           aria-pressed={showPanel}
-          onclick={() => (showPanel = !showPanel)}
+          onclick={() => {
+            showPanel = !showPanel;
+            panelAutoHidden = false;
+          }}
         >
           <svg viewBox="0 0 24 24" class="h-4.5 w-4.5" fill="none" stroke="currentColor" stroke-width="2">
             <rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" />

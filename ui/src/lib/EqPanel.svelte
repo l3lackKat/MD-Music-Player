@@ -25,6 +25,22 @@
     onerror,
   }: { settings: EqSettings; onclose: () => void; onerror: (e: unknown) => void } = $props();
 
+  let panel = $state<HTMLElement>();
+
+  /** Escape closes the panel wherever focus is, unless something else has a use for it:
+   *  an open menu or dialog, or a text field (Escape clears the search). Runs in the
+   *  capture phase, so the track list does not also clear its selection. Inside the
+   *  panel, its own handler closes it. */
+  function onWindowKey(e: KeyboardEvent) {
+    if (e.key !== "Escape") return;
+    const target = e.target as HTMLElement;
+    if (panel?.contains(target)) return;
+    if (target.closest("[role=menu], [role=dialog], input:not([type=range]), textarea, select")) return;
+    if (document.querySelector("[role=menu]")) return;
+    e.stopPropagation();
+    onclose();
+  }
+
   const MAX_GAIN = 12;
   const PREAMP_MIN = -24;
   const PREAMP_MAX = 12;
@@ -159,9 +175,13 @@
   }
 </script>
 
+<svelte:window onkeydowncapture={onWindowKey} />
+
+<!-- `max-h` keeps the panel below the header (about 4.5rem) on short windows; it scrolls if it still does not fit. -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-  class="fixed bottom-28 right-5 z-40 w-[580px] max-w-[calc(100vw-2.5rem)] rounded-2xl border border-line bg-panel p-5 shadow-2xl shadow-black/60"
+  bind:this={panel}
+  class="fixed bottom-28 right-5 z-40 max-h-[calc(100vh-11rem)] w-[580px] max-w-[calc(100vw-2.5rem)] overflow-y-auto rounded-2xl border border-line bg-panel p-5 shadow-2xl shadow-black/60"
   role="dialog"
   aria-label="Equalizer"
   tabindex="-1"

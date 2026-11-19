@@ -68,8 +68,10 @@
   );
 </script>
 
-<aside class="flex w-80 shrink-0 flex-col border-l border-line bg-panel">
-  <div class="p-5 pb-4">
+<!-- `overflow-hidden`: whatever happens inside, nothing may spill onto the transport bar below. -->
+<aside class="flex w-80 shrink-0 flex-col overflow-hidden border-l border-line bg-panel">
+  <div class="shrink-0 p-5 pb-4">
+    <!-- The cover keeps its full size; on short windows the lyrics below get less room. -->
     <Cover
       path={track?.path ?? null}
       class="aspect-square w-full rounded-xl shadow-lg shadow-black/40"
@@ -81,6 +83,9 @@
     <p class="mt-4 select-text truncate text-[15px] font-semibold" title={track?.title}>
       {track?.title ?? "Not playing"}
     </p>
+    {#if !track}
+      <p class="mt-0.5 text-sm text-muted">Play a track to see its cover and lyrics here.</p>
+    {/if}
     {#if track?.artist}
       <p class="mt-0.5 select-text truncate text-sm text-muted">{track.artist}</p>
     {/if}
@@ -91,26 +96,35 @@
 
   <div class="flex min-h-0 flex-1 flex-col border-t border-line">
     <h2 class="px-5 pb-1 pt-3 text-xs font-medium uppercase tracking-wider text-muted">Lyrics</h2>
-    <div class="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
+    <!-- The edges fade, so lines scroll in and out softly instead of being cut. -->
+    <div
+      class="min-h-0 flex-1 overflow-y-auto px-5 pb-8 pt-2 [mask-image:linear-gradient(to_bottom,transparent,black_1rem,black_calc(100%-2.5rem),transparent)]"
+    >
       {#if lyrics}
         {#each lyrics.lines as line, index (index)}
           {#if lyrics.synced}
+            <!-- Sung lines fade back, the current one stands out, the ones to come wait in between. -->
             <button
               bind:this={lineElements[index]}
-              class="block w-full py-1 text-left text-sm leading-snug transition-colors {index === activeLine
-                ? 'font-medium text-ink'
-                : 'text-muted hover:text-ink'}"
+              class="block w-full rounded-md py-1.5 text-left text-[15px] leading-snug transition-colors duration-300 hover:text-ink {index ===
+              activeLine
+                ? 'font-semibold text-ink'
+                : index < activeLine
+                  ? 'text-muted'
+                  : 'text-ink/70'}"
               title="Jump to this line"
               onclick={() => onseek(line.time_ms ?? 0)}
             >
               {line.text || "♪"}
             </button>
           {:else}
-            <p class="min-h-3 select-text py-0.5 text-sm leading-snug text-ink/85">{line.text}</p>
+            <p class="min-h-3 select-text py-1 text-[15px] leading-snug text-ink/85">{line.text}</p>
           {/if}
         {/each}
-      {:else if track && !loading}
-        <p class="pt-2 text-sm text-muted">
+      {:else if !track}
+        <p class="pt-1 text-sm text-muted">Timed lyrics follow the song line by line.</p>
+      {:else if !loading}
+        <p class="pt-1 text-sm text-muted">
           No lyrics in this file. Put a <span class="text-ink/80">.lrc</span> file with the same name next to it to
           add them.
         </p>

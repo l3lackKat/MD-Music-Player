@@ -292,8 +292,13 @@ export function formatTime(ms: number): string {
 
 /** "44.1 kHz", "192 kHz". */
 export function formatRate(hz: number): string {
+  return `${formatKhz(hz)} kHz`;
+}
+
+/** "44.1", "192": a rate in kHz without the unit, as in "24/96". */
+export function formatKhz(hz: number): string {
   const khz = hz / 1000;
-  return `${Number.isInteger(khz) ? khz : khz.toFixed(1)} kHz`;
+  return `${Number.isInteger(khz) ? khz : khz.toFixed(1)}`;
 }
 
 export function fileName(path: string): string {

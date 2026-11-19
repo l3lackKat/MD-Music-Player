@@ -3,6 +3,8 @@
   //
   // - Click selects a row, Ctrl+click adds one, Shift+click a range, Ctrl+A
   //   all, Escape none. Double-click (or Enter) plays.
+  // - The list is one Tab stop. Arrow keys, Page Up/Down, Home and End move
+  //   through it and select (with Shift, a range).
   // - Right-click (or the menu key) opens the menu for the selected rows.
   // - Delete asks to remove the selected rows (`ondelete`).
   // - With `onsort`, the column headers sort the list.
@@ -35,7 +37,7 @@
     onplay: (index: number) => void;
     /** The menu for these rows (the selection, in list order) at a screen position. */
     onmenu: (rows: number[], x: number, y: number) => void;
-    /** In a playlist: how each track got there. Draws a mark before the title. */
+    /** In a playlist: how each track got there. Single files get a mark after the title. */
     source?: (track: TrackMeta) => "folder" | "file";
     /** The column `tracks` is sorted by, to mark its header. `null` is the list's own order. */
     sort?: TrackSort | null;
@@ -49,6 +51,11 @@
 
   const selection = new Selection<TrackMeta>();
   let rowElements = $state<HTMLElement[]>([]);
+  /** The row last clicked or moved to by key. It is the list's one Tab stop. */
+  let cursor = $state(0);
+  const tabRow = $derived(Math.max(0, Math.min(cursor, tracks.length - 1)));
+  /** How far Page Up and Page Down move. */
+  const PAGE_ROWS = 10;
 
   const drag = new RowDrag({
     rows: () => rowElements.slice(0, tracks.length),
@@ -76,9 +83,30 @@
     onmenu(selection.rows(tracks), fromKeyboard ? rect.left + 48 : e.clientX, fromKeyboard ? rect.bottom : e.clientY);
   }
 
+  /** Where an arrow, paging or Home/End key goes from row `from`, or null for other keys. */
+  function keyTarget(key: string, from: number): number | null {
+    const last = tracks.length - 1;
+    const to =
+      key === "ArrowDown" ? from + 1
+      : key === "ArrowUp" ? from - 1
+      : key === "PageDown" ? from + PAGE_ROWS
+      : key === "PageUp" ? from - PAGE_ROWS
+      : key === "Home" ? 0
+      : key === "End" ? last
+      : null;
+    return to === null ? null : Math.max(0, Math.min(to, last));
+  }
+
   function onKey(e: KeyboardEvent) {
     const rows = selection.rows(tracks);
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+    const row = (e.target as HTMLElement).closest("[data-row]");
+    const to = row && !e.altKey ? keyTarget(e.key, rowElements.indexOf(row as HTMLElement)) : null;
+    if (to !== null) {
+      e.preventDefault();
+      selection.click(tracks, to, { ctrlKey: false, metaKey: false, shiftKey: e.shiftKey });
+      cursor = to;
+      rowElements[to]?.focus();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
       selection.all(tracks);
     } else if (e.key === "Escape" && rows.length > 0) {
@@ -146,7 +174,7 @@
       bind:this={rowElements[index]}
       data-row
       aria-pressed={selected}
-      class="grid w-full {ROW_GRID} items-center gap-4 rounded-lg px-3 py-1.5 text-left text-sm {selected
+      class="group grid w-full {ROW_GRID} items-center gap-4 rounded-lg px-3 py-1.5 text-left text-sm {selected
         ? 'bg-accent/15'
         : active
           ? 'bg-raised'
@@ -157,7 +185,9 @@
         : line === 'below'
           ? 'shadow-[inset_0_-2px_0_var(--color-accent)]'
           : ''}"
+      tabindex={index === tabRow ? 0 : -1}
       onclick={(e) => {
+        cursor = index;
         if (!drag.endedDrag()) selection.click(tracks, index, e);
       }}
       ondblclick={() => onplay(index)}
@@ -170,18 +200,42 @@
         ? "Double-click to play, drag to move, right-click for more"
         : "Double-click to play, right-click for more"}
     >
-      <span class="text-right tabular-nums {active ? 'text-accent' : 'text-muted'}">
-        {active && playing ? "▶" : index + 1}
+      <!-- The # cell: the number, bars while this track plays, and a play button on hover
+           (Enter plays from the keyboard, so the button is for the mouse only). -->
+      <span class="relative flex h-5 items-center justify-end tabular-nums {active ? 'text-accent' : 'text-muted'}">
+        {#if active && playing}
+          <span class="playing-bars" aria-hidden="true"><span></span><span></span><span></span></span>
+          <span class="sr-only">Playing</span>
+        {:else}
+          <span class={active ? "" : "group-hover:invisible"}>{index + 1}</span>
+          {#if !active && !drag.active}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <span
+              class="absolute inset-y-0 right-0 hidden w-5 place-items-center rounded text-ink hover:text-accent group-hover:grid"
+              title="Play"
+              aria-hidden="true"
+              onclick={(e) => {
+                e.stopPropagation();
+                onplay(index);
+              }}
+              ondblclick={(e) => e.stopPropagation()}
+            >
+              <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor"><path d="M7 4.5v15l12.5-7.5z" /></svg>
+            </span>
+          {/if}
+        {/if}
       </span>
       <span class="flex min-w-0 items-center gap-2.5">
         <Thumb path={track.path} class="h-8 w-8" />
-        {#if source}
-          <SourceMark kind={source(track)} />
+        <!-- Each cell's own text as its tooltip, so a cut-off name can still be read. -->
+        <span class="truncate {active ? 'font-medium text-accent' : ''}" title={track.title}>{track.title}</span>
+        <!-- Only the exception is marked: a track added on its own, not found in a folder. -->
+        {#if source?.(track) === "file"}
+          <SourceMark kind="file" />
         {/if}
-        <span class="truncate {active ? 'font-medium text-accent' : ''}">{track.title}</span>
       </span>
-      <span class="truncate text-muted">{track.artist ?? ""}</span>
-      <span class="truncate text-muted">{track.album ?? ""}</span>
+      <span class="truncate text-muted" title={track.artist ?? undefined}>{track.artist ?? ""}</span>
+      <span class="truncate text-muted" title={track.album ?? undefined}>{track.album ?? ""}</span>
       <span class="text-right tabular-nums text-muted">
         {track.duration_ms !== null ? formatTime(track.duration_ms) : ""}
       </span>
