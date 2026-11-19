@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
 };
 
-use super::{Backend, DeviceInfo, Feeder, OutputMode, Stream, StreamShared};
+use super::{Backend, DeviceInfo, Feeder, OutputMode, SoftVolume, Stream, StreamShared};
 use crate::format::{Container, FormatRequest, StreamFormat};
 use crate::{EngineError, Result};
 
@@ -33,6 +33,9 @@ pub struct WasapiBackend {
     /// Endpoint id from [`list_devices`]. `None` follows the Windows default.
     pub device_id: Option<String>,
     pub mode: OutputMode,
+    /// Scale PCM by this software volume (for a device with no volume of its
+    /// own). `None` keeps samples exact.
+    pub soft: Option<Arc<SoftVolume>>,
 }
 
 /// List the active playback devices.
@@ -231,6 +234,7 @@ impl Backend for WasapiBackend {
     fn open(&self, req: &FormatRequest) -> Result<Stream> {
         let device_id = self.device_id.clone();
         let mode = self.mode;
+        let soft = self.soft.clone();
         let req = *req;
         let shared = Arc::new(StreamShared::default());
         let thread_shared = shared.clone();
@@ -247,7 +251,7 @@ impl Backend for WasapiBackend {
             };
             let format = opened.format;
             let (producer, consumer) = Stream::ring(&format);
-            let mut feeder = Feeder::new(consumer, thread_shared, format);
+            let mut feeder = Feeder::new(consumer, thread_shared, format, soft);
             if ready_tx.send(Ok((format, opened.device_name, producer))).is_err() {
                 return;
             }
@@ -286,8 +290,15 @@ impl Backend for WasapiBackend {
 
     /// The device's Windows volume, which in exclusive mode is the DAC's own
     /// control. In shared mode it also dips other apps on the device for the
-    /// length of the fade.
+    /// length of the fade. With a software volume, that volume instead.
     fn fader(&self) -> Option<Box<dyn super::Fader>> {
-        Some(Box::new(super::EndpointFader::new(self.device_id.clone())))
+        match &self.soft {
+            Some(soft) => Some(Box::new(super::SoftFader(soft.clone()))),
+            None => Some(Box::new(super::EndpointFader::new(self.device_id.clone()))),
+        }
+    }
+
+    fn soft_volume(&self) -> bool {
+        self.soft.is_some()
     }
 }

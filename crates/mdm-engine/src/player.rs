@@ -103,6 +103,8 @@ pub struct SignalPath {
     pub bit_perfect: bool,
     /// The equalizer is changing this track's samples.
     pub eq: bool,
+    /// The software volume is scaling this track's samples.
+    pub soft_volume: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +251,8 @@ struct Engine {
     eq: Equalizer,
 
     fader: Option<Box<dyn Fader>>,
+    /// The backend scales PCM by a software volume (see `Backend::soft_volume`).
+    soft: bool,
     /// Where the fader stands, as a share of the captured level. 1.0 is the
     /// user's own level.
     fade_level: f32,
@@ -289,14 +293,25 @@ impl Rng {
     }
 }
 
-/// Open a track and work out the stream it needs. With the equalizer on,
-/// PCM gets at least 24 bits so the filtered samples keep their detail, and
-/// may fall back to a narrower container since they are no longer exact.
-fn open_source(path: &Path, eq: bool) -> Result<(Box<dyn Source>, FormatRequest, bool)> {
+/// Open a track and work out the stream it needs. With the equalizer or the
+/// software volume on, PCM gets at least 24 bits so the changed samples keep
+/// their detail, and may fall back to a narrower container since they are no
+/// longer exact. DSD cannot be scaled, so with the software volume on it is
+/// refused: on a device with no volume of its own it would play at full level.
+fn open_source(path: &Path, eq: bool, soft: bool) -> Result<(Box<dyn Source>, FormatRequest, bool)> {
     let source = mdm_decode::open(path)?;
+    let dsd = source.info().kind == SampleKind::Dsd;
+    if dsd && soft {
+        return Err(EngineError::Format(
+            "DSD cannot be turned down by the software volume, and this device has no volume of its \
+             own, so it would play at full level. Turn the software volume off and use a device with a \
+             hardware volume for DSD"
+                .into(),
+        ));
+    }
     let mut req = FormatRequest::for_source(source.info())?;
-    let eq = eq && source.info().kind != SampleKind::Dsd;
-    if eq {
+    let eq = eq && !dsd;
+    if eq || soft {
         req.bits = req.bits.max(24);
         req.exact = false;
     }
@@ -306,6 +321,7 @@ fn open_source(path: &Path, eq: bool) -> Result<(Box<dyn Source>, FormatRequest,
 impl Engine {
     fn new(backend: Box<dyn Backend>, events: Sender<Event>) -> Self {
         let fader = backend.fader();
+        let soft = backend.soft_volume();
         Engine {
             backend,
             events,
@@ -331,6 +347,7 @@ impl Engine {
             empty_run: 0,
             eq: Equalizer::new(EqSettings::default()),
             fader,
+            soft,
             fade_level: 1.0,
             ramp: None,
             restore_at: None,
@@ -549,8 +566,11 @@ impl Engine {
                 // Put the old device's level back before letting go of it.
                 self.end_fade();
                 self.fader = backend.fader();
+                self.soft = backend.soft_volume();
                 self.backend = backend;
                 if let Some((index, ms)) = playing {
+                    // Reopen even the track being heard: its format depends on the software volume.
+                    self.decoding = None;
                     self.play_from(index, ms);
                 }
             }
@@ -635,7 +655,7 @@ impl Engine {
     fn start_track(&mut self, index: usize, ms: u64) -> Result<()> {
         let same_track = matches!(&self.decoding, Some(d) if d.index == index);
         if !same_track {
-            let (source, req, eq) = open_source(&self.queue[index], self.eq.enabled())?;
+            let (source, req, eq) = open_source(&self.queue[index], self.eq.enabled(), self.soft)?;
             let packer = req.dop.then(|| DopPacker::new(req.channels));
             self.decoding = Some(Decoding { index, source, req, packer, eq, produced: false });
         }
@@ -704,8 +724,9 @@ impl Engine {
             output: s.format,
             device: s.device_name.clone(),
             exclusive: s.exclusive,
-            bit_perfect: s.exclusive && h.info.kind != SampleKind::Float && !h.eq,
+            bit_perfect: s.exclusive && h.info.kind != SampleKind::Float && !h.eq && !self.soft,
             eq: h.eq,
+            soft_volume: self.soft,
         };
         self.emit(Event::Track {
             index: h.index,
@@ -1125,7 +1146,7 @@ impl Engine {
         let mut candidate = self.following(index, true);
         let mut tries = self.queue.len();
         while let Some(next) = candidate {
-            match open_source(&self.queue[next], self.eq.enabled()) {
+            match open_source(&self.queue[next], self.eq.enabled(), self.soft) {
                 Ok((source, req, eq)) if Some(req) == self.stream_req => {
                     // Same format: keep feeding the same stream, with no gap.
                     // The EQ's state carries on too, so there is no click.

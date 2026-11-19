@@ -5,6 +5,7 @@
 //! the ring; the backend thread pulls them through a [`Feeder`].
 
 mod file_sink;
+mod soft_volume;
 #[cfg(windows)]
 mod volume;
 #[cfg(windows)]
@@ -21,6 +22,8 @@ use crate::format::{FormatRequest, StreamFormat};
 use crate::Result;
 
 pub use file_sink::FileSink;
+pub use soft_volume::{taper, SoftFader, SoftVolume};
+use soft_volume::Scaler;
 #[cfg(windows)]
 pub use volume::{
     get_volume, set_volume, watch_volume, DeviceVolume, EndpointFader, VolumeChange, VolumeWatch,
@@ -56,6 +59,13 @@ pub trait Backend: Send {
     /// and exit. `None` pauses and resumes at once.
     fn fader(&self) -> Option<Box<dyn Fader>> {
         None
+    }
+
+    /// Streams from this backend scale PCM by a software volume. The player
+    /// then asks for room to do it cleanly (24 bits or more), marks the path
+    /// not bit-perfect, and refuses DSD, which cannot be scaled.
+    fn soft_volume(&self) -> bool {
+        false
     }
 }
 
@@ -118,7 +128,8 @@ impl Drop for Stream {
     }
 }
 
-/// Pulls frames out of the ring for a backend thread.
+/// Pulls frames out of the ring for a backend thread, applying the software
+/// volume when there is one.
 ///
 /// Nothing here allocates or locks, so it is safe on a real-time thread.
 pub struct Feeder {
@@ -129,6 +140,8 @@ pub struct Feeder {
     /// Audio has flowed since the stream opened or was flushed. Until then an
     /// empty ring is start-up, not an underrun.
     started: bool,
+    /// The software volume, when the backend uses one.
+    scaler: Option<Scaler>,
 }
 
 impl Feeder {
@@ -136,8 +149,16 @@ impl Feeder {
         consumer: rtrb::Consumer<u8>,
         shared: Arc<StreamShared>,
         format: StreamFormat,
+        soft: Option<Arc<SoftVolume>>,
     ) -> Self {
-        Feeder { consumer, shared, format, stamper: MarkerStamper::default(), started: false }
+        Feeder {
+            consumer,
+            shared,
+            format,
+            stamper: MarkerStamper::default(),
+            started: false,
+            scaler: soft.map(Scaler::new),
+        }
     }
 
     /// Copy as many whole frames as are ready into the front of `out` and
@@ -166,6 +187,9 @@ impl Feeder {
                 out[..a.len()].copy_from_slice(a);
                 out[a.len()..n].copy_from_slice(b);
                 chunk.commit_all();
+            }
+            if let Some(scaler) = &mut self.scaler {
+                scaler.apply(&mut out[..n], &self.format);
             }
             if self.format.dop {
                 self.stamper.stamp(&mut out[..n], &self.format);

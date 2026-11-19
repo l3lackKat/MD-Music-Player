@@ -32,6 +32,9 @@ pub struct DeviceVolume {
     /// False when the device has no volume control of its own, or has one
     /// fixed at a single level.
     pub hardware: bool,
+    /// This is MDMusic's software volume, not the Windows one: the samples
+    /// are scaled. Always false here; the app sets it.
+    pub software: bool,
 }
 
 /// What to change. `None` leaves that control as it is.
@@ -65,6 +68,7 @@ pub fn set_volume(device_id: Option<&str>, change: VolumeChange) -> Result<Devic
                 level: endpoint.GetMasterVolumeLevelScalar().map_err(win)?,
                 muted: endpoint.GetMute().map_err(win)?.as_bool(),
                 hardware: has_hardware_volume(&endpoint),
+                software: false,
             })
         }
     })
@@ -128,6 +132,7 @@ impl IAudioEndpointVolumeCallback_Impl for Notify_Impl {
                 level: data.fMasterVolume,
                 muted: data.bMuted.as_bool(),
                 hardware: self.hardware,
+                software: false,
             });
         }
         Ok(())

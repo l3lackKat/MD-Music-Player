@@ -8,13 +8,14 @@
 
 mod media_controls;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use mdm_engine::{
     Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, Repeat,
-    VolumeChange, VolumeWatch, WasapiBackend,
+    SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
 };
 use mdm_library::{Library, Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
 use serde::{Deserialize, Serialize};
@@ -32,10 +33,18 @@ struct OutputSettings {
     /// The mode the user picked. It differs from `mode` while exclusive is
     /// unavailable, and comes back when a device that allows it is chosen.
     wanted: OutputMode,
-    /// The device has a volume control that works in exclusive mode. Without
-    /// one, the volume would be stuck at full in exclusive mode, so shared
-    /// mode is used instead.
+    /// Exclusive mode can be used: the device has a volume control that works
+    /// in it, or the software volume is on. Otherwise the volume would be stuck
+    /// at full in exclusive mode, so shared mode is used instead.
     exclusive_available: bool,
+    /// The device has an adjustable volume of its own (`DeviceVolume::hardware`).
+    hardware_volume: bool,
+    /// The user turned the software volume on (kept in `output.json`).
+    soft_volume_enabled: bool,
+    /// The software volume is in use now: it is on, the device has no
+    /// hardware volume, and the mode is exclusive. The volume bar then
+    /// scales samples, so playback is not bit-perfect.
+    soft_volume: bool,
     /// The device was at full volume when it was chosen (or at launch), so it
     /// was turned down to `SAFE_LEVEL` before anything played.
     volume_lowered: bool,
@@ -48,16 +57,18 @@ struct OutputSettings {
 /// Windows often puts USB DACs back to 100% (on replug, driver reload or
 /// reboot), which is far too loud for headphones on a DAC with real gain.
 const FULL_LEVEL: f32 = 0.995;
-/// What a device found at full volume is turned down to.
+/// What a device found at full volume is turned down to, and where the
+/// software volume starts on a device it has not been used with.
 const SAFE_LEVEL: f32 = 0.10;
 
 impl OutputSettings {
-    /// Settings for `device_id`, falling back to shared mode when the device
-    /// has no adjustable hardware volume (or its volume cannot be read).
+    /// Settings for `device_id`. A device without an adjustable hardware
+    /// volume (or whose volume cannot be read) gets shared mode, unless
+    /// `soft_enabled`: then the software volume makes exclusive mode safe.
     ///
     /// With `guard_full`, a device at full volume is first turned down to
     /// `SAFE_LEVEL`, before the stream opens.
-    fn resolve(device_id: Option<String>, wanted: OutputMode, guard_full: bool) -> Self {
+    fn resolve(device_id: Option<String>, wanted: OutputMode, guard_full: bool, soft_enabled: bool) -> Self {
         let mut volume = mdm_engine::get_volume(device_id.as_deref());
         let mut volume_lowered = false;
         if let Ok(v) = &volume {
@@ -72,20 +83,33 @@ impl OutputSettings {
                 }
             }
         }
-        let exclusive_available = volume.map(|v| v.hardware).unwrap_or(false);
+        let hardware_volume = volume.map(|v| v.hardware).unwrap_or(false);
+        let exclusive_available = hardware_volume || soft_enabled;
         let mode = if exclusive_available { wanted } else { OutputMode::Shared };
         OutputSettings {
             device_id,
             mode,
             wanted,
             exclusive_available,
+            hardware_volume,
+            soft_volume_enabled: soft_enabled,
+            soft_volume: soft_enabled && !hardware_volume && mode == OutputMode::Exclusive,
             volume_lowered,
             missing_device: None,
         }
     }
 
-    fn backend(&self) -> WasapiBackend {
-        WasapiBackend { device_id: self.device_id.clone(), mode: self.mode }
+    fn backend(&self, soft: &Arc<SoftVolume>) -> WasapiBackend {
+        WasapiBackend {
+            device_id: self.device_id.clone(),
+            mode: self.mode,
+            soft: self.soft_volume.then(|| soft.clone()),
+        }
+    }
+
+    /// Where this device's software volume level is kept in `output.json`.
+    fn level_key(&self) -> String {
+        self.device_id.clone().unwrap_or_else(|| "default".into())
     }
 }
 
@@ -100,6 +124,13 @@ struct SavedOutput {
     device_name: Option<String>,
     #[serde(default = "exclusive")]
     mode: OutputMode,
+    /// Use the software volume on devices without a hardware volume.
+    #[serde(default)]
+    soft_volume: bool,
+    /// The software volume's level for each device it was used with
+    /// (`OutputSettings::level_key`).
+    #[serde(default)]
+    soft_levels: BTreeMap<String, f32>,
 }
 
 fn exclusive() -> OutputMode {
@@ -108,7 +139,13 @@ fn exclusive() -> OutputMode {
 
 impl Default for SavedOutput {
     fn default() -> Self {
-        SavedOutput { device_id: None, device_name: None, mode: OutputMode::Exclusive }
+        SavedOutput {
+            device_id: None,
+            device_name: None,
+            mode: OutputMode::Exclusive,
+            soft_volume: false,
+            soft_levels: BTreeMap::new(),
+        }
     }
 }
 
@@ -149,7 +186,7 @@ fn startup_output(saved: &SavedOutput) -> OutputSettings {
         }
         None => None,
     };
-    let mut output = OutputSettings::resolve(device_id, saved.mode, true);
+    let mut output = OutputSettings::resolve(device_id, saved.mode, true, saved.soft_volume);
     output.missing_device = missing;
     output
 }
@@ -158,6 +195,10 @@ struct AppState {
     player: Player,
     output: Mutex<OutputSettings>,
     output_path: PathBuf,
+    /// What `output.json` holds; written back whenever it changes.
+    saved: Mutex<SavedOutput>,
+    /// The software volume streams scale by while `OutputSettings::soft_volume`.
+    soft: Arc<SoftVolume>,
     /// Follows the selected device's Windows volume, so the UI moves when it
     /// is changed in Windows, by volume keys or on the DAC.
     volume_watch: Mutex<Option<VolumeWatch>>,
@@ -177,6 +218,24 @@ impl AppState {
     /// Refresh the index in the background, after the playlists changed.
     fn refresh_library(&self) {
         let _ = self.refresh.lock().unwrap().send(());
+    }
+
+    /// Make `output` the one in use: point the software volume at its level,
+    /// send the player a backend for it, and follow its Windows volume.
+    fn apply_output(&self, app: &AppHandle, output: OutputSettings) {
+        if output.soft_volume {
+            let saved = self.saved.lock().unwrap();
+            // A device the software volume has not been used with starts quiet.
+            self.soft.set_level(saved.soft_levels.get(&output.level_key()).copied().unwrap_or(SAFE_LEVEL));
+            self.soft.set_muted(false);
+        }
+        self.player.send(Command::SetOutput(Box::new(output.backend(&self.soft))));
+        *self.output.lock().unwrap() = output;
+        watch_volume(app, self);
+    }
+
+    fn save_output(&self) {
+        save_output(&self.output_path, &self.saved.lock().unwrap());
     }
 }
 
@@ -211,16 +270,34 @@ fn set_output(
 ) -> OutputSettings {
     cancel_reconnect(&state);
     let device_changed = state.output.lock().unwrap().device_id != device_id;
-    let output = OutputSettings::resolve(device_id, mode, device_changed);
-    state.player.send(Command::SetOutput(Box::new(output.backend())));
-    watch_volume(&app, &state, output.device_id.as_deref());
-    *state.output.lock().unwrap() = output.clone();
+    let soft_enabled = state.saved.lock().unwrap().soft_volume;
+    let output = OutputSettings::resolve(device_id, mode, device_changed, soft_enabled);
+    state.apply_output(&app, output.clone());
 
     let device_name = output.device_id.as_ref().and_then(|id| {
         mdm_engine::list_devices().ok()?.into_iter().find(|d| &d.id == id).map(|d| d.name)
     });
-    let saved = SavedOutput { device_id: output.device_id.clone(), device_name, mode: output.wanted };
-    save_output(&state.output_path, &saved);
+    {
+        let mut saved = state.saved.lock().unwrap();
+        saved.device_id = output.device_id.clone();
+        saved.device_name = device_name;
+        saved.mode = output.wanted;
+    }
+    state.save_output();
+    output
+}
+
+/// Turn the software volume on or off. It only acts on a device without a
+/// hardware volume, which then gets (or gives up) exclusive mode; playback
+/// carries on from the same place either way.
+#[tauri::command(async)]
+fn set_soft_volume(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> OutputSettings {
+    cancel_reconnect(&state);
+    state.saved.lock().unwrap().soft_volume = enabled;
+    state.save_output();
+    let current = state.output.lock().unwrap().clone();
+    let output = OutputSettings::resolve(current.device_id, current.wanted, false, enabled);
+    state.apply_output(&app, output.clone());
     output
 }
 
@@ -302,22 +379,27 @@ fn reconnect_when_back(app: AppHandle, generation: u64, device_name: String) {
         if !current() {
             return;
         }
-        let output = OutputSettings::resolve(output.device_id, output.wanted, true);
-        state.player.send(Command::SetOutput(Box::new(output.backend())));
-        watch_volume(&app, &state, output.device_id.as_deref());
-        *state.output.lock().unwrap() = output.clone();
+        let soft_enabled = state.saved.lock().unwrap().soft_volume;
+        let output = OutputSettings::resolve(output.device_id, output.wanted, true, soft_enabled);
+        state.apply_output(&app, output.clone());
         state.player.send(Command::Play);
         let _ = app.emit("output://reconnected", Reconnected { output, device: device_name });
         return;
     }
 }
 
-/// Emit `volume://changed` whenever `device_id`'s volume changes, replacing
-/// the watch on the previous device.
-fn watch_volume(app: &AppHandle, state: &AppState, device_id: Option<&str>) {
+/// Emit `volume://changed` whenever the output device's Windows volume
+/// changes, replacing the watch on the previous device. While the software
+/// volume is in use, the Windows one has no effect, so it is not followed.
+fn watch_volume(app: &AppHandle, state: &AppState) {
+    let output = state.output.lock().unwrap().clone();
     let mut watch = state.volume_watch.lock().unwrap();
     // Unregister from the old device before listening to the new one.
     *watch = None;
+    if output.soft_volume {
+        return;
+    }
+    let device_id = output.device_id.as_deref();
     let handle = app.clone();
     let emit = move |volume: DeviceVolume| {
         if let Err(e) = handle.emit("volume://changed", volume) {
@@ -331,23 +413,44 @@ fn watch_volume(app: &AppHandle, state: &AppState, device_id: Option<&str>) {
     }
 }
 
-/// The Windows volume of the selected output device.
-#[tauri::command(async)]
-fn get_volume(state: State<'_, AppState>) -> CommandResult<DeviceVolume> {
-    let device_id = state.output.lock().unwrap().device_id.clone();
-    mdm_engine::get_volume(device_id.as_deref()).map_err(text)
+/// The software volume as the UI shows a volume.
+fn soft_reading(soft: &SoftVolume) -> DeviceVolume {
+    DeviceVolume { level: soft.level(), muted: soft.muted(), hardware: false, software: true }
 }
 
-/// Change the Windows volume of the selected output device. This sets the
-/// device's own level; the samples sent to it stay unchanged.
+/// The volume the volume bar controls: the selected device's Windows volume,
+/// or the software volume while it is in use.
+#[tauri::command(async)]
+fn get_volume(state: State<'_, AppState>) -> CommandResult<DeviceVolume> {
+    let output = state.output.lock().unwrap().clone();
+    if output.soft_volume {
+        return Ok(soft_reading(&state.soft));
+    }
+    mdm_engine::get_volume(output.device_id.as_deref()).map_err(text)
+}
+
+/// Change that volume. The Windows volume is the device's own level, which
+/// leaves the samples unchanged; the software volume scales them, and its
+/// level is remembered per device.
 #[tauri::command(async)]
 fn set_volume(
     state: State<'_, AppState>,
     level: Option<f32>,
     muted: Option<bool>,
 ) -> CommandResult<DeviceVolume> {
-    let device_id = state.output.lock().unwrap().device_id.clone();
-    mdm_engine::set_volume(device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
+    let output = state.output.lock().unwrap().clone();
+    if output.soft_volume {
+        if let Some(level) = level {
+            state.soft.set_level(level);
+            state.saved.lock().unwrap().soft_levels.insert(output.level_key(), state.soft.level());
+            state.save_output();
+        }
+        if let Some(muted) = muted {
+            state.soft.set_muted(muted);
+        }
+        return Ok(soft_reading(&state.soft));
+    }
+    mdm_engine::set_volume(output.device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
 }
 
 // ---- Equalizer -------------------------------------------------------------
@@ -754,8 +857,12 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let output_path = data_dir.join("output.json");
-            let output = startup_output(&load_saved_output(&output_path));
-            let player = Player::new(Box::new(output.backend()));
+            let saved = load_saved_output(&output_path);
+            let output = startup_output(&saved);
+            let soft = SoftVolume::new(
+                saved.soft_levels.get(&output.level_key()).copied().unwrap_or(SAFE_LEVEL),
+            );
+            let player = Player::new(Box::new(output.backend(&soft)));
             let events = player.events();
             let playlists = open_playlists(&data_dir.join("playlists.json"));
             let library = Arc::new(open_library(&data_dir.join("library.db")));
@@ -763,11 +870,12 @@ pub fn run() {
             let eq_path = data_dir.join("eq.json");
             let eq = load_eq(&eq_path);
             player.send(Command::SetEq(eq.clone()));
-            let device_id = output.device_id.clone();
             app.manage(AppState {
                 player,
                 output: Mutex::new(output),
                 output_path,
+                saved: Mutex::new(saved),
+                soft,
                 volume_watch: Mutex::new(None),
                 reconnect: Mutex::new(0),
                 playlists: Mutex::new(playlists),
@@ -776,7 +884,7 @@ pub fn run() {
                 eq: Mutex::new(eq),
                 eq_path,
             });
-            watch_volume(app.handle(), &app.state::<AppState>(), device_id.as_deref());
+            watch_volume(app.handle(), &app.state::<AppState>());
             start_refresher(app.handle().clone(), refresh_rx);
             // The first refresh picks up whatever changed on disk while the app was closed.
             app.state::<AppState>().refresh_library();
@@ -822,6 +930,7 @@ pub fn run() {
             list_devices,
             get_output,
             set_output,
+            set_soft_volume,
             get_volume,
             set_volume,
             get_eq,

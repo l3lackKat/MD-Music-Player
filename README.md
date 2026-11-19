@@ -46,6 +46,13 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   bit-perfect and DSD fades too. After a pause the level goes back to where you
   set it, behind the silence. In shared mode a fade also dips other apps on the
   same device for a moment.
+- **A device with no volume of its own** (HDMI, S/PDIF, some DACs) uses shared
+  mode, since exclusive mode would play it at full volume. Turn on **Software
+  volume** (next to the mode buttons) to use exclusive mode anyway: MDMusic
+  then turns it down by scaling the samples, so the badge says Soft volume
+  instead of Bit-perfect, and DSD is skipped (DoP cannot be scaled). It starts
+  at 10% and remembers each device's level. Devices with a hardware volume
+  never use it.
 - **The output device is remembered.** If it is not connected at launch, the
   system default is used for that run.
 - **Unplug the DAC mid-track** and playback stops; plug it back in and it
@@ -117,10 +124,11 @@ fades, seek, next and previous, shuffle, repeat (all or one), gapless, moving
 and removing tracks in the queue, selecting several tracks, search across all
 playlists, device and mode selection (remembered), resuming after the DAC is
 replugged, media keys and the Windows media overlay, the device's volume
-(bit-perfect), an opt-in equalizer, DSD over DoP with tags, a signal-path
+(bit-perfect), an opt-in software volume for devices without one, an opt-in
+equalizer, DSD over DoP with tags, a signal-path
 badge, playlists of folders and tracks (in your own order), sorting a playlist
 by column, a track menu, tags, cover art (square, as a spinning record, and
 small in every list) and lyrics.
 
 Not built yet: browsing by artist or album, editing tags, a tray icon, and an
-ASIO output for native DSD.
+ASIO output for native DSD (DSD plays over DoP, which needs no special driver).

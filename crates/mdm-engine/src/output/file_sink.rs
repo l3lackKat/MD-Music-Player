@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{Backend, Fader, Feeder, Stream, StreamShared};
+use super::{Backend, Fader, Feeder, SoftVolume, Stream, StreamShared};
 use crate::format::{Container, FormatRequest};
 use crate::Result;
 
@@ -27,11 +27,13 @@ pub struct FileSink {
     /// Offer a fader that records every level it is set to (`capture` is
     /// recorded as `-1.0`), instead of none.
     pub fader_log: Option<Arc<Mutex<Vec<f32>>>>,
+    /// Scale PCM by this software volume, as a device without a volume would.
+    pub soft: Option<Arc<SoftVolume>>,
 }
 
 impl FileSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        FileSink { path: path.into(), container: None, paced: false, fader_log: None }
+        FileSink { path: path.into(), container: None, paced: false, fader_log: None, soft: None }
     }
 }
 
@@ -56,7 +58,7 @@ impl Backend for FileSink {
         let file = File::options().create(true).append(true).open(&self.path)?;
         let (producer, consumer) = Stream::ring(&format);
         let shared = Arc::new(StreamShared::default());
-        let mut feeder = Feeder::new(consumer, shared.clone(), format);
+        let mut feeder = Feeder::new(consumer, shared.clone(), format, self.soft.clone());
         let paced = self.paced;
 
         let thread = std::thread::Builder::new().name("mdm-file-sink".into()).spawn(move || {
@@ -106,5 +108,9 @@ impl Backend for FileSink {
 
     fn fader(&self) -> Option<Box<dyn Fader>> {
         self.fader_log.clone().map(|log| Box::new(LogFader(log)) as Box<dyn Fader>)
+    }
+
+    fn soft_volume(&self) -> bool {
+        self.soft.is_some()
     }
 }

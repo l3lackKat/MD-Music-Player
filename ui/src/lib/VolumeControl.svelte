@@ -1,7 +1,9 @@
 <script lang="ts">
   // The Windows volume of the selected output device. It sets the device's
   // own level, the one in the Windows volume mixer, so the samples sent to
-  // the DAC stay untouched and bit-perfect playback is kept.
+  // the DAC stay untouched and bit-perfect playback is kept. On a device with
+  // no volume of its own and the software volume on, it is MDMusic's software
+  // volume instead (`volume.software`), which scales the samples.
   import { onMount } from "svelte";
   import { api, listenVolume, type DeviceVolume } from "./api";
 
@@ -13,8 +15,8 @@
 
   const level = $derived(dragLevel ?? volume?.level ?? 0);
   const percent = $derived(Math.round(level * 100));
-  /** In exclusive mode Windows' own scaling is bypassed, so only a hardware control works. */
-  const noEffect = $derived(exclusive && volume !== null && !volume.hardware);
+  /** In exclusive mode Windows' own scaling is bypassed, so only a hardware (or the software) volume works. */
+  const noEffect = $derived(exclusive && volume !== null && !volume.hardware && !volume.software);
 
   /** Read the device's volume again, e.g. after switching devices. */
   export async function refresh(): Promise<DeviceVolume | null> {
@@ -84,7 +86,9 @@
       ? "This device's volume cannot be read"
       : noEffect
         ? "This device has no hardware volume, so Windows' level has no effect in exclusive mode. Use the DAC's or amplifier's own knob, or switch to shared mode."
-        : `Windows volume of this device: ${percent}%${volume.muted ? " (muted)" : ""}`,
+        : volume.software
+          ? `Software volume: ${percent}%${volume.muted ? " (muted)" : ""}. MDMusic scales the samples, so playback is not bit-perfect.`
+          : `Windows volume of this device: ${percent}%${volume.muted ? " (muted)" : ""}`,
   );
 </script>
 
@@ -122,7 +126,7 @@
     oninput={(e) => onInput(Number(e.currentTarget.value))}
     onchange={(e) => onRelease(Number(e.currentTarget.value))}
   />
-  <span class="w-8 text-right text-xs tabular-nums {noEffect ? 'text-warn' : 'text-muted'}">
+  <span class="w-8 text-right text-xs tabular-nums {noEffect || volume?.software ? 'text-warn' : 'text-muted'}">
     {volume === null ? "–" : percent}
   </span>
 </div>

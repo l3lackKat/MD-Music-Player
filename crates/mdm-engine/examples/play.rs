@@ -52,7 +52,7 @@ fn main() {
         }
     });
 
-    let player = Player::new(Box::new(WasapiBackend { device_id, mode }));
+    let player = Player::new(Box::new(WasapiBackend { device_id, mode, soft: None }));
     let events = player.events();
     player.send(Command::Load { paths, index: 0 });
 

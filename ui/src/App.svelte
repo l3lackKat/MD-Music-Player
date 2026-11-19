@@ -51,6 +51,10 @@
   let wantedMode = $state<OutputMode>("exclusive");
   /** Exclusive needs a hardware volume, else the level is stuck at full. */
   let exclusiveAvailable = $state(true);
+  /** The device has an adjustable volume of its own. */
+  let hardwareVolume = $state(true);
+  /** The software volume is on (it acts only on devices without a hardware volume, in exclusive mode). */
+  let softVolumeEnabled = $state(false);
   let volumeControl = $state<ReturnType<typeof VolumeControl>>();
   /** The device that was unplugged mid-track; playback resumes when it is back. */
   let waitingFor = $state<string | null>(null);
@@ -316,6 +320,28 @@
     mode = output.mode;
     wantedMode = output.wanted;
     exclusiveAvailable = output.exclusive_available;
+    hardwareVolume = output.hardware_volume;
+    softVolumeEnabled = output.soft_volume_enabled;
+  }
+
+  /** Turn the software volume on or off for devices without a hardware volume. */
+  async function toggleSoftVolume() {
+    error = null;
+    waitingFor = null;
+    try {
+      const output = await api.setSoftVolume(!softVolumeEnabled);
+      takeOutput(output);
+      const volume = await volumeControl?.refresh();
+      if (output.soft_volume)
+        showNotice(
+          `Software volume on at ${Math.round((volume?.level ?? 0) * 100)}%: exclusive mode works on this device, but playback is not bit-perfect and DSD is skipped`,
+        );
+      else if (output.soft_volume_enabled)
+        showNotice("Software volume is on, and takes over in exclusive mode on devices without a hardware volume");
+      else showNotice("Software volume off");
+    } catch (e) {
+      showError(e);
+    }
   }
 
   /** Open the output; `null` if that failed. */
@@ -338,7 +364,8 @@
     const parts: string[] = [];
     if (output.volume_lowered) parts.push("was at 100%, turned down to 10% to be safe");
     if (output.wanted === "exclusive" && !output.exclusive_available)
-      parts.push("has no adjustable hardware volume, so shared mode is used");
+      parts.push("has no adjustable hardware volume, so shared mode is used (turn on Software volume for exclusive)");
+    if (output.soft_volume) parts.push("has no hardware volume, so the software volume is used (not bit-perfect)");
     return parts.length ? `${name} ${parts.join("; ")}` : null;
   }
 
@@ -357,7 +384,8 @@
     const volume = await volumeControl?.refresh();
     // While an unplugged device is awaited, re-applying would give up on it.
     if (waitingFor !== null) return;
-    if ((volume?.hardware ?? false) !== exclusiveAvailable) {
+    // The software volume says nothing about the device: only compare a Windows volume.
+    if (!volume?.software && (volume?.hardware ?? false) !== hardwareVolume) {
       await applyOutput();
       await volumeControl?.refresh();
     }
@@ -833,9 +861,11 @@
             : 'text-muted enabled:hover:text-ink'}"
           disabled={option === "exclusive" && !exclusiveAvailable}
           title={option === "exclusive"
-            ? exclusiveAvailable
-              ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
-              : "Unavailable: this device has no adjustable hardware volume, so in exclusive mode it would play at full volume. Choose a device with a hardware volume to use exclusive mode."
+            ? !exclusiveAvailable
+              ? "Unavailable: this device has no adjustable hardware volume, so in exclusive mode it would play at full volume. Turn on Software volume, or choose a device with a hardware volume."
+              : hardwareVolume
+                ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
+                : "MDMusic takes over the device, other apps are silent. The software volume sets the level, so it is not bit-perfect"
             : "Goes through the Windows mixer, other apps keep playing"}
           onclick={() => {
             wantedMode = option;
@@ -846,6 +876,23 @@
         </button>
       {/each}
     </div>
+
+    {#if !hardwareVolume}
+      <!-- Only for a device without a volume of its own: with one, the Windows volume keeps playback bit-perfect. -->
+      <button
+        class="flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm transition-colors {softVolumeEnabled
+          ? 'border-warn/40 bg-warn/10 text-warn'
+          : 'border-line text-muted hover:text-ink'}"
+        aria-pressed={softVolumeEnabled}
+        title={softVolumeEnabled
+          ? "Software volume is on: in exclusive mode, MDMusic turns this device down by scaling the samples. Not bit-perfect, and DSD is skipped. Click to turn it off."
+          : "This device has no volume of its own. Turn this on to use exclusive mode anyway: MDMusic then scales the samples to set the level, so it is not bit-perfect, and DSD is skipped."}
+        onclick={toggleSoftVolume}
+      >
+        <span class="h-2 w-2 rounded-full {softVolumeEnabled ? 'bg-warn' : 'bg-line'}" aria-hidden="true"></span>
+        Software volume
+      </button>
+    {/if}
   </header>
 
   {#if error}
@@ -1310,17 +1357,21 @@
               ? "Every sample reaches the DAC unchanged"
               : signalPath.eq
                 ? "The equalizer is changing the samples. Turn it off for bit-perfect playback"
-                : signalPath.exclusive
-                  ? "The source is lossy or floating point, so there are no original samples to preserve"
-                  : "Shared mode: Windows resamples and mixes the audio"}
+                : signalPath.soft_volume
+                  ? "The software volume is scaling the samples, since this device has no volume of its own. Use a device with a hardware volume for bit-perfect playback"
+                  : signalPath.exclusive
+                    ? "The source is lossy or floating point, so there are no original samples to preserve"
+                    : "Shared mode: Windows resamples and mixes the audio"}
           >
             {signalPath.bit_perfect
               ? "Bit-perfect"
               : signalPath.eq
                 ? "EQ on"
-                : signalPath.exclusive
-                  ? "Exclusive"
-                  : "Shared"}
+                : signalPath.soft_volume
+                  ? "Soft volume"
+                  : signalPath.exclusive
+                    ? "Exclusive"
+                    : "Shared"}
           </span>
         {/if}
         <button

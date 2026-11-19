@@ -20,8 +20,14 @@ export interface OutputSettings {
   mode: OutputMode;
   /** The mode the user picked; differs from `mode` while exclusive is unavailable. */
   wanted: OutputMode;
-  /** The device's volume works in exclusive mode. Without it, shared mode is used. */
+  /** Exclusive mode can be used: the device has a hardware volume, or the software volume is on. */
   exclusive_available: boolean;
+  /** The device has an adjustable volume of its own. */
+  hardware_volume: boolean;
+  /** The user turned the software volume on (it only acts on devices without a hardware volume). */
+  soft_volume_enabled: boolean;
+  /** The software volume is in use now: the volume bar scales samples, so playback is not bit-perfect. */
+  soft_volume: boolean;
   /** The device was at 100% when chosen (or at launch) and was turned down to 10% first. */
   volume_lowered: boolean;
   /** At launch: the saved device is not connected, so the system default is used for now. */
@@ -41,6 +47,8 @@ export interface DeviceVolume {
   muted: boolean;
   /** The device applies the level itself, so it also works in exclusive mode. */
   hardware: boolean;
+  /** This is MDMusic's software volume, which scales the samples, not the Windows one. */
+  software: boolean;
 }
 
 export type SampleKind = { type: "pcm"; bits: number } | { type: "float" } | { type: "dsd" };
@@ -65,6 +73,8 @@ export interface SignalPath {
   bit_perfect: boolean;
   /** The equalizer is changing this track's samples. */
   eq: boolean;
+  /** The software volume is scaling this track's samples. */
+  soft_volume: boolean;
 }
 
 export interface EqBand {
@@ -204,6 +214,8 @@ export const api = {
   getOutput: () => invoke<OutputSettings>("get_output"),
   setOutput: (deviceId: string | null, mode: OutputMode) =>
     invoke<OutputSettings>("set_output", { deviceId, mode }),
+  /** Turn the software volume on or off; returns the output as it now is. */
+  setSoftVolume: (enabled: boolean) => invoke<OutputSettings>("set_soft_volume", { enabled }),
   getVolume: () => invoke<DeviceVolume>("get_volume"),
   /** Change the level (0 to 1), the mute, or both. Returns the new state. */
   setVolume: (change: { level?: number; muted?: boolean }) =>

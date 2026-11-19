@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mdm_engine::{Command, Container, EqSettings, Event, FileSink, PlayState, Player, SignalPath};
+use mdm_engine::{
+    Command, Container, EqSettings, Event, FileSink, PlayState, Player, SignalPath, SoftVolume,
+};
 
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mdm-engine-{}-{name}", std::process::id()))
@@ -353,6 +355,81 @@ fn quitting_fades_out_and_puts_the_level_back() {
     // What did play is exact; the rest of the track never played.
     let played = unpack(&bytes, Container::I16, 16);
     assert!(played.len() < samples.len() && samples.starts_with(&played));
+}
+
+#[test]
+fn the_software_volume_scales_pcm_and_says_so() {
+    // A level whose cube is exactly one half: every sample halves, in a
+    // 24-bit container even though the file is 16-bit.
+    let samples = pattern(16, 30_000, 0x50F7);
+    let wav = temp("soft.wav");
+    write_wav(&wav, 16, 44_100, &samples);
+    let mut sink = FileSink::new(temp("soft.raw"));
+    sink.soft = Some(SoftVolume::new(0.5f32.powf(1.0 / 3.0)));
+    let (bytes, tracks) = play_to_file_with(vec![wav.clone()], sink, Vec::new());
+    let (_, path) = &tracks[0];
+    assert!(path.soft_volume && !path.bit_perfect && !path.eq);
+    assert_eq!(path.output.valid_bits, 24);
+
+    let out = unpack(&bytes, Container::I24, 24);
+    assert_eq!(out.len(), samples.len());
+    // A 16-bit sample is worth 256 steps of 24 bits; half of it is 128, exactly.
+    assert!(out.iter().zip(&samples).all(|(o, s)| *o == s * 128), "not an exact halving");
+
+    // Without it, the same file is bit-perfect again.
+    let (bytes, _) = play_to_file(vec![wav.clone()], FileSink::new(temp("soft-off.raw")));
+    assert!(unpack(&bytes, Container::I16, 16) == samples);
+    std::fs::remove_file(wav).ok();
+}
+
+#[test]
+fn dsd_is_refused_while_the_software_volume_is_on() {
+    // DoP cannot be scaled: on a device with no volume of its own it would
+    // play at full level, so the track is skipped with an error instead.
+    let mut file = Vec::new();
+    let mut body = Vec::new();
+    let mut prop = Vec::new();
+    prop.extend_from_slice(b"SND FS  ");
+    prop.extend_from_slice(&4u64.to_be_bytes());
+    prop.extend_from_slice(&2_822_400u32.to_be_bytes());
+    prop.extend_from_slice(b"CHNL");
+    prop.extend_from_slice(&10u64.to_be_bytes());
+    prop.extend_from_slice(&2u16.to_be_bytes());
+    prop.extend_from_slice(b"SLFTSRGT");
+    body.extend_from_slice(b"DSD PROP");
+    body.extend_from_slice(&(prop.len() as u64).to_be_bytes());
+    body.extend_from_slice(&prop);
+    body.extend_from_slice(b"DSD ");
+    body.extend_from_slice(&4000u64.to_be_bytes());
+    body.extend_from_slice(&[0x69; 4000]);
+    file.extend_from_slice(b"FRM8");
+    file.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    file.extend_from_slice(&body);
+    let dff = temp("soft-dsd.dff");
+    std::fs::write(&dff, &file).unwrap();
+
+    let out = temp("soft-dsd.raw");
+    std::fs::remove_file(&out).ok();
+    let mut sink = FileSink::new(&out);
+    sink.soft = Some(SoftVolume::new(0.3));
+    let player = Player::new(Box::new(sink));
+    let events = player.events();
+    player.send(Command::Load { paths: vec![dff.clone()], index: 0 });
+    let mut errors = Vec::new();
+    loop {
+        match events.recv_timeout(Duration::from_secs(10)).expect("the player hung") {
+            Event::Error { message } => errors.push(message),
+            Event::Track { .. } => panic!("DSD must not play with the software volume on"),
+            Event::QueueEnded => break,
+            _ => {}
+        }
+    }
+    drop(player);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("software volume"), "{}", errors[0]);
+    assert!(std::fs::read(&out).map(|b| b.is_empty()).unwrap_or(true), "nothing reached the device");
+    std::fs::remove_file(dff).ok();
+    std::fs::remove_file(out).ok();
 }
 
 #[test]

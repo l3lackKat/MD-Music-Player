@@ -54,7 +54,8 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   It only works in exclusive mode when the device reports an adjustable
   hardware volume (`DeviceVolume::hardware`; a range fixed at one level counts
   as none). Without one, `set_output` (`OutputSettings::resolve`) uses shared
-  mode instead and the UI disables Exclusive. The user's pick (`wanted`) is
+  mode instead and the UI disables Exclusive, unless the software volume is on
+  (next rule). The user's pick (`wanted`) is
   kept, so exclusive comes back on a device that has a hardware volume.
   Changes made outside the app (Windows mixer, volume keys, the DAC) reach the
   UI through `watch_volume` (`IAudioEndpointVolumeCallback`) as the
@@ -65,6 +66,21 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   The chosen device and mode are saved in `%APPDATA%\com.mdmusic.app\output.json`
   (only by `set_output`). A saved device that is not connected at launch falls
   back to the Windows default for that run (`missing_device`), keeping the file.
+- **The software volume is the second opt-in sample change**, only for a
+  device with no hardware volume (`output/soft_volume.rs`). It is used when
+  the user turned it on (`set_soft_volume`, saved as `soft_volume` in
+  `output.json`), the device has no hardware volume, and the mode is
+  exclusive: then `OutputSettings::soft_volume` is set, the backend carries
+  the shared `SoftVolume`, and the volume bar (`get_volume`/`set_volume`,
+  `DeviceVolume::software`) drives it instead of Windows. The level is kept
+  per device in `soft_levels` and starts at `SAFE_LEVEL`; the slider maps to
+  gain by a cube law (`taper`). It scales in `Feeder` (the device end, so a
+  change is heard at once), sliding across each buffer, rounding to the
+  stream's valid bits. Like the EQ, PCM then asks for at least 24 bits and
+  `exact: false`, and `SignalPath::bit_perfect` is cleared
+  (`SignalPath::soft_volume`). **DSD is refused with an error** while it is in
+  use, since DoP cannot be scaled and would play at full level. Fades go
+  through `SoftFader`, a factor on top of the user's level.
 - **Fades move the device volume, never the samples.** Pause fades out
   (`FADE_OUT`), resume fades in, closing the app fades out (`Player::quit`).
   The engine drives a `Fader` from `Backend::fader()`; for WASAPI that is
@@ -145,8 +161,11 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 - **Never play audible audio on this machine to test.** Use silent files
   (all-zero samples); they exercise the full WASAPI path with no sound.
 - Devices here: "Speakers (DX1 II)" is the USB DAC (accepts only 32-bit words
-  with 24 valid bits; 44.1–96 kHz verified). The default device "BlackMeow"
-  refuses 24/96 in exclusive mode, which is a handy negative case.
+  with 24 valid bits; 44.1–96 kHz verified; it is now the Windows default).
+  "1 - GIGABYTE G24F" (HDMI) and "Digital Audio (S/PDIF)" have no hardware
+  volume, so they test the software volume and the shared fallback. Switching
+  to a device sitting at 100% turns it down to 10% (the full-volume guard):
+  put its Windows volume back after a test.
 - To drive the real UI, start the app with
   `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` and talk
   Chrome DevTools Protocol to the page at `localhost:1420`. Native dialogs
@@ -204,5 +223,8 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 Reordering tracks inside a playlist (only its folders' and files' own order,
 which sorting covers for now), browsing the library by artist or album,
 editing tags, a tray icon, a timeline (seek bar) in the Windows media overlay,
-software (sample-scaling) volume, ASIO output for native DSD, a setting to turn
-the fades off or change their length.
+a setting to turn the fades off or change their length. ASIO output for native
+DSD was set aside: the DX1 II runs on Windows' class driver (no ASIO), the
+only ASIO driver here is Realtek's (no DSD), and Steinberg's SDK is
+proprietary or GPLv3 while MDMusic is MIT. DSD stays on DoP until a
+DSD-capable ASIO driver and an SDK license decision exist.
