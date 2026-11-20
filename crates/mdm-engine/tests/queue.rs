@@ -341,6 +341,51 @@ fn moving_a_track_that_is_already_lined_up_restarts_cleanly() {
 }
 
 #[test]
+fn play_next_puts_tracks_right_after_the_current_one() {
+    let (paths, tracks) = make_long_tracks("insert", 2, 1.0);
+    let (extra, extra_samples) = make_tracks("insert-extra", 2);
+    let (heard, samples) = run_with(
+        "insert",
+        true,
+        vec![
+            Command::Load { paths: paths.clone(), index: 0 },
+            Command::Insert { paths: extra.clone(), at: 1 },
+        ],
+        |_, _| {},
+    );
+    // Queue is now [0, extra 0, extra 1, old 1].
+    assert_eq!(heard, [0, 1, 2, 3], "{heard:?}");
+    let expected =
+        [tracks[0].clone(), extra_samples[0].clone(), extra_samples[1].clone(), tracks[1].clone()].concat();
+    assert!(samples == expected, "the inserted tracks play next, gaplessly and exact");
+    cleanup(&paths);
+    cleanup(&extra);
+}
+
+#[test]
+fn play_next_comes_next_with_shuffle_on_too() {
+    let (paths, _) = make_long_tracks("insert-shuffle", 5, 0.5);
+    let (extra, _) = make_tracks("insert-shuffle-extra", 2);
+    let (heard, _) = run_with(
+        "insert-shuffle",
+        true,
+        vec![
+            Command::SetShuffle(true),
+            Command::Load { paths: paths.clone(), index: 2 },
+            // Inserted after the current track in the queue: at 3 and 4.
+            Command::Insert { paths: extra.clone(), at: 3 },
+        ],
+        |_, _| {},
+    );
+    assert_eq!(heard[..3], [2, 3, 4], "the inserted tracks follow the current one, in order: {heard:?}");
+    let mut sorted = heard.clone();
+    sorted.sort();
+    assert_eq!(sorted, (0..7).collect::<Vec<_>>(), "every track still plays once: {heard:?}");
+    cleanup(&paths);
+    cleanup(&extra);
+}
+
+#[test]
 fn appended_tracks_play_after_the_queue_without_a_gap() {
     let (paths, tracks) = make_tracks("append", 3);
     let (heard, samples) = run("append", vec![

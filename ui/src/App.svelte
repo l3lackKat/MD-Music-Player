@@ -273,6 +273,17 @@
     return tracks.length;
   }
 
+  /** "Play next": put tracks right after the one playing; when idle, start playing them. */
+  async function playNext(paths: string[]) {
+    const tracks = await api.expandPaths(paths).catch((e) => (showError(e), []));
+    if (tracks.length === 0) return;
+    const at = currentIndex === null ? queue.length : currentIndex + 1;
+    queue = [...queue.slice(0, at), ...tracks, ...queue.slice(at)];
+    if (playState === "stopped") await playQueue(at);
+    else await api.queueInsert(tracks.map((t) => t.path), at).catch(showError);
+    return tracks.length;
+  }
+
   async function toggleShuffle() {
     shuffle = !shuffle;
     try {
@@ -728,6 +739,12 @@
       items.push({
         label: one ? "Play" : `Play ${count(n)}`,
         action: () => (one ? playTracks(tracks, rows[0]) : playTracks(picked, 0)),
+      });
+      items.push({
+        label: one ? "Play next" : `Play ${count(n)} next`,
+        action: async () => {
+          if (await playNext(paths)) showNotice(one ? "Plays next" : `${count(n)} play next`);
+        },
       });
       items.push({
         label: one ? "Add to queue" : `Add ${count(n)} to queue`,

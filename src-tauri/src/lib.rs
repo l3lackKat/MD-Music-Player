@@ -504,6 +504,15 @@ fn append_files(state: State<AppState>, paths: Vec<String>) {
     state.player.send(Command::Append(paths.into_iter().map(PathBuf::from).collect()));
 }
 
+/// "Play next": put tracks into the queue at `at`, just after the current
+/// track, to play next (with shuffle on too). The UI inserts them in its own
+/// list at the same place.
+#[tauri::command]
+fn queue_insert(state: State<AppState>, paths: Vec<String>, at: usize) {
+    let paths = paths.into_iter().map(PathBuf::from).collect();
+    state.player.send(Command::Insert { paths, at });
+}
+
 /// Take tracks out of the queue. The UI removes them from its own list too.
 #[tauri::command]
 fn queue_remove(state: State<AppState>, indexes: Vec<usize>) {
@@ -938,6 +947,7 @@ pub fn run() {
             supported_extensions,
             play_files,
             append_files,
+            queue_insert,
             queue_remove,
             queue_reorder,
             set_shuffle,

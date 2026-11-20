@@ -40,6 +40,11 @@ pub enum Command {
     Load { paths: Vec<PathBuf>, index: usize },
     /// Add tracks to the end of the queue without interrupting playback.
     Append(Vec<PathBuf>),
+    /// "Play next": put tracks into the queue at `at` (clamped to its end),
+    /// normally just after the current track, and make them the next ones
+    /// to play, in the order given, with shuffle on too. What is playing
+    /// carries on.
+    Insert { paths: Vec<PathBuf>, at: usize },
     /// Take tracks out of the queue. Removing the track being heard moves
     /// on to the next one that stays.
     Remove(Vec<usize>),
@@ -484,6 +489,7 @@ impl Engine {
                 // The decoder may already have run out of queue: carry on into the new tracks.
                 self.fix_line_up(false);
             }
+            Command::Insert { paths, at } => self.insert(paths, at),
             Command::Remove(indexes) => self.remove(&indexes),
             Command::Reorder(order) => self.reorder(&order),
             Command::SetShuffle(on) => {
@@ -748,6 +754,30 @@ impl Engine {
     }
 
     // ---- Editing the queue ---------------------------------------------------
+
+    fn insert(&mut self, paths: Vec<PathBuf>, at: usize) {
+        if paths.is_empty() {
+            return;
+        }
+        let len = self.queue.len();
+        let at = at.min(len);
+        let count = paths.len();
+        // Tracks from `at` on move up to make room.
+        let map: Vec<Option<usize>> = (0..len).map(|i| Some(if i < at { i } else { i + count })).collect();
+        self.queue.splice(at..at, paths);
+        self.reindex(&map);
+        if self.shuffle {
+            // Without shuffle the order is the queue's, where they already
+            // sit after the current track; shuffled, put them there by hand.
+            let added = at..at + count;
+            self.order.retain(|i| !added.contains(i));
+            let current = self.current();
+            let slot = self.order.iter().position(|i| *i == current).map_or(0, |p| p + 1);
+            self.order.splice(slot..slot, added);
+        }
+        self.fix_line_up(false);
+        self.announce_current();
+    }
 
     fn remove(&mut self, indexes: &[usize]) {
         let len = self.queue.len();

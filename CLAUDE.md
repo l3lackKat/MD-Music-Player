@@ -116,7 +116,9 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   `before()`); never step through the queue with `index + 1`. Skipping loops
   are bounded by the queue length, since with repeat on the order never ends.
 - **The UI's queue and the engine's queue must match.** Replace with
-  `play_files`, extend with `append_files`, edit with `queue_remove` (a set of
+  `play_files`, extend with `append_files`, put tracks next with `queue_insert`
+  (at the current index + 1; with shuffle on the engine also makes them next
+  in `order`), edit with `queue_remove` (a set of
   indexes) / `queue_reorder` (`order[new] = old`, built with `moveRows` in
   `ui/src/lib/reorder.svelte.ts`). The UI changes its own `queue` and
   `currentIndex` the same way; the engine confirms with `player://current`. Changing `queue` in the UI

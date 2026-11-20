@@ -200,6 +200,8 @@ export const api = {
   libraryStatus: () => invoke<LibraryStatus>("library_status"),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   appendFiles: (paths: string[]) => invoke<void>("append_files", { paths }),
+  /** Put tracks at `at` in the queue, to play next (after the current track). */
+  queueInsert: (paths: string[], at: number) => invoke<void>("queue_insert", { paths, at }),
   /** Take tracks out of the engine's queue; remove them from the UI's `queue` too. */
   queueRemove: (indexes: number[]) => invoke<void>("queue_remove", { indexes }),
   /** Put the engine's queue in a new order, `order[new] = old`; reorder the UI's `queue` the same way. */
