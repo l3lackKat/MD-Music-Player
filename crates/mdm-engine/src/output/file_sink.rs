@@ -27,26 +27,37 @@ pub struct FileSink {
     /// Offer a fader that records every level it is set to (`capture` is
     /// recorded as `-1.0`), instead of none.
     pub fader_log: Option<Arc<Mutex<Vec<f32>>>>,
+    /// With `fader_log`: record every ReplayGain offset (dB) the fader gets.
+    pub offset_log: Option<Arc<Mutex<Vec<f32>>>>,
     /// Scale PCM by this software volume, as a device without a volume would.
     pub soft: Option<Arc<SoftVolume>>,
 }
 
 impl FileSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        FileSink { path: path.into(), container: None, paced: false, fader_log: None, soft: None }
+        FileSink { path: path.into(), container: None, paced: false, fader_log: None, offset_log: None, soft: None }
     }
 }
 
-/// See [`FileSink::fader_log`].
-struct LogFader(Arc<Mutex<Vec<f32>>>);
+/// See [`FileSink::fader_log`] and [`FileSink::offset_log`].
+struct LogFader {
+    levels: Arc<Mutex<Vec<f32>>>,
+    offsets: Option<Arc<Mutex<Vec<f32>>>>,
+}
 
 impl Fader for LogFader {
     fn capture(&mut self) {
-        self.0.lock().unwrap().push(-1.0);
+        self.levels.lock().unwrap().push(-1.0);
     }
 
     fn set(&mut self, fraction: f32) {
-        self.0.lock().unwrap().push(fraction);
+        self.levels.lock().unwrap().push(fraction);
+    }
+
+    fn set_offset(&mut self, db: f32) {
+        if let Some(log) = &self.offsets {
+            log.lock().unwrap().push(db);
+        }
     }
 }
 
@@ -107,7 +118,9 @@ impl Backend for FileSink {
     }
 
     fn fader(&self) -> Option<Box<dyn Fader>> {
-        self.fader_log.clone().map(|log| Box::new(LogFader(log)) as Box<dyn Fader>)
+        self.fader_log.clone().map(|levels| {
+            Box::new(LogFader { levels, offsets: self.offset_log.clone() }) as Box<dyn Fader>
+        })
     }
 
     fn soft_volume(&self) -> bool {

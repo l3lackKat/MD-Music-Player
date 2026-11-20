@@ -79,6 +79,10 @@ pub trait Fader: Send {
     fn set(&mut self, fraction: f32);
     /// Wait until the changes sent so far have been applied.
     fn sync(&mut self) {}
+    /// Hold the level `db` away from the user's own level (ReplayGain).
+    /// Fades work on top of it; `0.0` puts the user's level back. Dropping
+    /// the fader must put the user's level back too.
+    fn set_offset(&mut self, _db: f32) {}
 }
 
 /// State shared between the player and a backend thread.

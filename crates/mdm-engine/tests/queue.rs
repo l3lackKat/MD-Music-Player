@@ -2,9 +2,10 @@
 //! player into a `FileSink`.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mdm_engine::{Command, Event, FileSink, Player, Repeat};
+use mdm_engine::{Command, Event, FileSink, GainMode, Player, Repeat, ReplayGain};
 
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mdm-queue-{}-{name}", std::process::id()))
@@ -383,6 +384,81 @@ fn play_next_comes_next_with_shuffle_on_too() {
     assert_eq!(sorted, (0..7).collect::<Vec<_>>(), "every track still plays once: {heard:?}");
     cleanup(&paths);
     cleanup(&extra);
+}
+
+/// Play `paths` with ReplayGain in `mode` through a sink that logs the
+/// fader's offsets; `react` may send commands as events come. Returns the
+/// offsets and the samples.
+fn run_gain(
+    name: &str,
+    paths: &[PathBuf],
+    gains: Vec<ReplayGain>,
+    mode: GainMode,
+    paced: bool,
+    mut react: impl FnMut(&Player, &Event),
+) -> (Vec<f32>, Vec<i32>) {
+    let out = temp(&format!("{name}.raw"));
+    std::fs::remove_file(&out).ok();
+    let offsets = Arc::new(Mutex::new(Vec::new()));
+    let mut sink = FileSink::new(&out);
+    sink.paced = paced;
+    sink.fader_log = Some(Arc::new(Mutex::new(Vec::new())));
+    sink.offset_log = Some(offsets.clone());
+    let player = Player::new(Box::new(sink));
+    let events = player.events();
+    let by_path: Vec<(PathBuf, ReplayGain)> = paths.iter().cloned().zip(gains).collect();
+    player.send(Command::SetGainReader(Box::new(move |path| {
+        by_path.iter().find(|(p, _)| p == path).map(|(_, g)| *g).unwrap_or_default()
+    })));
+    player.send(Command::SetReplayGain(mode));
+    player.send(Command::Load { paths: paths.to_vec(), index: 0 });
+    loop {
+        let event = events.recv_timeout(Duration::from_secs(20)).expect("playback did not finish");
+        react(&player, &event);
+        match event {
+            Event::Error { message } => panic!("player error: {message}"),
+            Event::QueueEnded => break,
+            _ => {}
+        }
+    }
+    drop(player);
+    let bytes = std::fs::read(&out).unwrap();
+    std::fs::remove_file(&out).ok();
+    let samples = bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as i32).collect();
+    let offsets = offsets.lock().unwrap().clone();
+    (offsets, samples)
+}
+
+#[test]
+fn replay_gain_follows_the_track_being_heard_and_leaves_the_samples_alone() {
+    let (paths, tracks) = make_tracks("gain", 3);
+    let gains = vec![
+        ReplayGain { track_db: Some(-6.0), album_db: Some(-8.0) },
+        ReplayGain { track_db: Some(-3.0), album_db: None },
+        ReplayGain::default(),
+    ];
+    let (offsets, samples) = run_gain("gain", &paths, gains.clone(), GainMode::Track, false, |_, _| {});
+    assert_eq!(offsets, [-6.0, -3.0, 0.0], "each track's gain, none for an untagged one");
+    assert!(samples == tracks.concat(), "the offset moves the volume, never a sample");
+
+    let (offsets, _) = run_gain("gain-album", &paths, gains, GainMode::Album, false, |_, _| {});
+    assert_eq!(offsets, [-8.0, -3.0, 0.0], "album gain, else the track gain");
+    cleanup(&paths);
+}
+
+#[test]
+fn replay_gain_turned_on_mid_track_applies_and_stopping_takes_it_off() {
+    let (paths, _) = make_long_tracks("gain-late", 1, 1.0);
+    let gains = vec![ReplayGain { track_db: Some(-5.0), album_db: None }];
+    let mut turned_on = false;
+    let (offsets, _) = run_gain("gain-late", &paths, gains, GainMode::Off, true, |player, event| {
+        if let (Event::Track { .. }, false) = (event, turned_on) {
+            turned_on = true;
+            player.send(Command::SetReplayGain(GainMode::Track));
+        }
+    });
+    assert_eq!(offsets, [-5.0, 0.0], "on at once, and the user's level back when the queue ends");
+    cleanup(&paths);
 }
 
 #[test]

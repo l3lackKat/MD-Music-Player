@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::dop::DopPacker;
 use crate::eq::{EqSettings, Equalizer};
 use crate::format::{pack, FormatRequest, StreamFormat};
+use crate::gain::{GainMode, GainReader, ReplayGain};
 use crate::output::{Backend, Fader, Stream};
 use crate::{EngineError, Result};
 
@@ -69,6 +70,11 @@ pub enum Command {
     /// at the same position, since the stream format may change; other
     /// changes apply to the audio not yet queued for the device.
     SetEq(EqSettings),
+    /// Even out loudness with the tracks' ReplayGain tags, through the
+    /// fader's offset (the device volume), so the samples stay exact.
+    SetReplayGain(GainMode),
+    /// How to read a track's ReplayGain tags. Without one, no track has any.
+    SetGainReader(GainReader),
     /// Fade out what is playing, release the device, answer on the channel
     /// and end the player thread. See [`Player::quit`].
     Quit(Sender<()>),
@@ -110,6 +116,9 @@ pub struct SignalPath {
     pub eq: bool,
     /// The software volume is scaling this track's samples.
     pub soft_volume: bool,
+    /// The ReplayGain offset for this track, in dB, when ReplayGain is on and
+    /// the track has a gain. It moves the volume, not the samples.
+    pub replay_gain_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +195,7 @@ struct Decoding {
     eq: bool,
     /// The track gave at least one frame.
     produced: bool,
+    gain: ReplayGain,
 }
 
 /// Where a track starts in the stream of frames pushed to the device.
@@ -196,6 +206,7 @@ struct Mark {
     base_ms: u64,
     info: SourceInfo,
     eq: bool,
+    gain: ReplayGain,
 }
 
 /// A fade of the fader's level in progress.
@@ -265,6 +276,10 @@ struct Engine {
     /// After a fade-out to pause: when to put the level back.
     restore_at: Option<Instant>,
     last_step: Instant,
+    gain_mode: GainMode,
+    gain_reader: Option<GainReader>,
+    /// The ReplayGain offset the fader holds now, in dB.
+    offset_db: f32,
     /// `Quit` arrived: take no more commands.
     quitting: bool,
     /// `Quit` is done: leave the loop.
@@ -357,6 +372,9 @@ impl Engine {
             ramp: None,
             restore_at: None,
             last_step: Instant::now(),
+            gain_mode: GainMode::Off,
+            gain_reader: None,
+            offset_db: 0.0,
             quitting: false,
             finished: false,
         }
@@ -570,8 +588,10 @@ impl Engine {
                 self.stream = None;
                 self.stream_req = None;
                 // Put the old device's level back before letting go of it.
+                // Dropping its fader takes the ReplayGain offset off too.
                 self.end_fade();
                 self.fader = backend.fader();
+                self.offset_db = 0.0;
                 self.soft = backend.soft_volume();
                 self.backend = backend;
                 if let Some((index, ms)) = playing {
@@ -592,8 +612,53 @@ impl Engine {
                     }
                 }
             }
+            Command::SetReplayGain(mode) => {
+                self.gain_mode = mode;
+                // Tags are only read while it is on: read them now for what is lined up.
+                if let Some(h) = &self.heard {
+                    let gain = self.read_gain(h.index);
+                    self.heard.as_mut().expect("checked above").gain = gain;
+                }
+                let gains: Vec<ReplayGain> = self.upcoming.iter().map(|m| self.read_gain(m.index)).collect();
+                for (mark, gain) in self.upcoming.iter_mut().zip(gains) {
+                    mark.gain = gain;
+                }
+                // A seek takes the heard track's gain from here.
+                if let Some(index) = self.decoding.as_ref().map(|d| d.index) {
+                    let gain = self.read_gain(index);
+                    self.decoding.as_mut().expect("checked above").gain = gain;
+                }
+                self.apply_gain();
+                self.announce_track();
+            }
+            Command::SetGainReader(reader) => self.gain_reader = Some(reader),
             Command::Quit(done) => self.begin_quit(done),
             Command::Shutdown => {}
+        }
+    }
+
+    /// The ReplayGain tags of the queue's track `index`, read only while
+    /// ReplayGain is on.
+    fn read_gain(&self, index: usize) -> ReplayGain {
+        match (&self.gain_reader, self.gain_mode, self.queue.get(index)) {
+            (Some(read), mode, Some(path)) if mode != GainMode::Off => read(path),
+            _ => ReplayGain::default(),
+        }
+    }
+
+    /// The offset the track being heard calls for: none when nothing plays.
+    fn wanted_offset(&self) -> f32 {
+        self.heard.as_ref().and_then(|h| h.gain.pick(self.gain_mode)).unwrap_or(0.0)
+    }
+
+    /// Bring the fader's offset in line with the track being heard.
+    fn apply_gain(&mut self) {
+        let want = self.wanted_offset();
+        if want != self.offset_db {
+            if let Some(f) = &mut self.fader {
+                f.set_offset(want);
+            }
+            self.offset_db = want;
         }
     }
 
@@ -619,6 +684,8 @@ impl Engine {
 
     fn stop(&mut self, resume_index: usize, resume_ms: u64) {
         self.close_stream();
+        // Nothing plays: the user's own level, without a track's gain.
+        self.apply_gain();
         self.resume = (resume_index, resume_ms);
         self.set_state(PlayState::Stopped);
         self.emit(Event::Position { ms: resume_ms, duration_ms: None });
@@ -663,7 +730,8 @@ impl Engine {
         if !same_track {
             let (source, req, eq) = open_source(&self.queue[index], self.eq.enabled(), self.soft)?;
             let packer = req.dop.then(|| DopPacker::new(req.channels));
-            self.decoding = Some(Decoding { index, source, req, packer, eq, produced: false });
+            let gain = self.read_gain(index);
+            self.decoding = Some(Decoding { index, source, req, packer, eq, produced: false, gain });
         }
         let decoding = self.decoding.as_mut().expect("decoding was just set");
         let base_ms = if ms > 0 || same_track { decoding.source.seek(ms)? } else { 0 };
@@ -672,6 +740,7 @@ impl Engine {
         }
         let req = decoding.req;
         let eq = decoding.eq;
+        let gain = decoding.gain;
         let info = decoding.source.info().clone();
         if eq {
             self.eq.configure(req.sample_rate, req.channels);
@@ -705,7 +774,8 @@ impl Engine {
         self.switch_to = None;
         self.drained_at = None;
         self.empty_run = 0;
-        self.heard = Some(Mark { index, start_frame: 0, base_ms, info, eq });
+        self.heard = Some(Mark { index, start_frame: 0, base_ms, info, eq, gain });
+        self.apply_gain();
         self.announce_track();
         Ok(())
     }
@@ -733,6 +803,7 @@ impl Engine {
             bit_perfect: s.exclusive && h.info.kind != SampleKind::Float && !h.eq && !self.soft,
             eq: h.eq,
             soft_volume: self.soft,
+            replay_gain_db: h.gain.pick(self.gain_mode),
         };
         self.emit(Event::Track {
             index: h.index,
@@ -1078,6 +1149,11 @@ impl Engine {
         self.stream = None;
         self.restore_level();
         if let Some(f) = &mut self.fader {
+            // Leave the device at the user's own level, not a track's.
+            if self.offset_db != 0.0 {
+                f.set_offset(0.0);
+                self.offset_db = 0.0;
+            }
             f.sync();
         }
         let _ = done.send(());
@@ -1182,14 +1258,16 @@ impl Engine {
                     // The EQ's state carries on too, so there is no click.
                     let info = source.info().clone();
                     let packer = req.dop.then(|| DopPacker::new(req.channels));
+                    let gain = self.read_gain(next);
                     self.decoding =
-                        Some(Decoding { index: next, source, req, packer, eq, produced: false });
+                        Some(Decoding { index: next, source, req, packer, eq, produced: false, gain });
                     self.upcoming.push_back(Mark {
                         index: next,
                         start_frame: self.pushed_frames,
                         base_ms: 0,
                         info,
                         eq,
+                        gain,
                     });
                     return;
                 }
@@ -1230,6 +1308,8 @@ impl Engine {
             changed = true;
         }
         if changed {
+            // The next track is coming out of the device now: its gain with it.
+            self.apply_gain();
             self.announce_track();
         }
 

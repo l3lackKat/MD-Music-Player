@@ -14,6 +14,7 @@
     formatTime,
     type DeviceInfo,
     type EqSettings,
+    type GainMode,
     type OutputMode,
     type OutputSettings,
     type Playlist,
@@ -94,6 +95,20 @@
   /** The equalizer, as last saved. `null` until loaded. */
   let eq = $state<EqSettings | null>(null);
   let showEq = $state(false);
+  let replayGain = $state<GainMode>("off");
+
+  const GAIN_TITLE: Record<GainMode, string> = {
+    off: "ReplayGain evens out loudness between tracks, using their ReplayGain tags. It moves the device volume, never the samples, so playback stays bit-perfect.",
+    track:
+      "ReplayGain by track: every track plays at the same loudness. It moves the device volume, never the samples, so playback stays bit-perfect. Tracks without ReplayGain tags play at your level.",
+    album:
+      "ReplayGain by album: albums play at the same loudness, their quiet and loud tracks kept as they are. It moves the device volume, never the samples, so playback stays bit-perfect.",
+  };
+
+  async function changeReplayGain(mode: GainMode) {
+    replayGain = mode;
+    await api.setReplayGain(mode).catch(showError);
+  }
 
   // ---- Window ----
   /** The open track menu: where and what. */
@@ -209,7 +224,12 @@
     const sent = o.dop
       ? `DSD over PCM (DoP) at ${formatRate(o.sample_rate)}`
       : `${o.valid_bits}-bit${String(o.valid_bits) === words ? "" : ` in ${words}-bit words`}, ${formatRate(o.sample_rate)}`;
-    return `File: ${file}\nThe DAC receives: ${sent}\nDevice: ${signalPath.device}`;
+    const gain = signalPath.replay_gain_db;
+    const rg =
+      gain === null
+        ? ""
+        : `\nReplayGain: ${gain > 0 ? "+" : gain < 0 ? "−" : ""}${Math.abs(gain).toFixed(1)} dB (${replayGain}), on the volume`;
+    return `File: ${file}\nThe DAC receives: ${sent}${rg}\nDevice: ${signalPath.device}`;
   });
   /** The bit-perfect badge's tooltip: why it says what it says, then the full path. */
   const badgeTitle = $derived.by(() => {
@@ -824,6 +844,7 @@
       repeat = loadRepeat();
       await api.setRepeat(repeat);
       eq = await api.getEq();
+      replayGain = await api.getReplayGain();
       await refreshDevices();
 
       cleanups.push(
@@ -937,7 +958,7 @@
     <label class="text-xs text-muted" for="device">Output</label>
     <select
       id="device"
-      class="max-w-72 truncate rounded-lg border border-line bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent"
+      class="min-w-0 max-w-72 truncate rounded-lg border border-line bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent"
       bind:value={deviceId}
       onchange={changeDevice}
       onfocus={refreshDevices}
@@ -989,6 +1010,22 @@
         Software volume
       </button>
     {/if}
+
+    <!-- An output setting like the ones beside it: it works through the device volume. -->
+    <select
+      class="shrink-0 rounded-lg border border-line bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent {replayGain ===
+      'off'
+        ? 'text-muted'
+        : 'text-accent'}"
+      aria-label="ReplayGain"
+      title={GAIN_TITLE[replayGain]}
+      value={replayGain}
+      onchange={(e) => void changeReplayGain(e.currentTarget.value as GainMode)}
+    >
+      <option value="off">ReplayGain off</option>
+      <option value="track">ReplayGain by track</option>
+      <option value="album">ReplayGain by album</option>
+    </select>
   </header>
 
   {#if error}

@@ -89,6 +89,17 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   stays put. After a fade-out the level goes back up behind the silence
   (`FADE_SETTLE`), so a pause never leaves the device turned down. In shared
   mode a fade briefly dips other apps on the same device too.
+- **ReplayGain moves the volume, never the samples** (`gain.rs`). It is off
+  by default (`replay_gain` in `output.json`). The engine reads each track's
+  gains through the app's `GainReader` (`mdm_library::read_replay_gain`)
+  when the track is opened, and when the track *heard* changes it calls
+  `Fader::set_offset(db)`: `EndpointFader` sets the Windows level to the
+  user's level + offset in dB (clamped to the device range; an offset that
+  arrives mid-fade waits for the fade to end), `SoftFader` multiplies the
+  software gain (capped at 1). The offset goes back to 0 on stop, quit and
+  output switch, so the device is never left at a track's level. The
+  volume bar follows the real device level, so it moves with each track.
+  `bit_perfect` stays true; `SignalPath::replay_gain_db` shows the offset.
 - **A device unplugged mid-track is waited for** (`reconnect_when_back` in
   `src-tauri/src/lib.rs`): the engine stops with `Event::DeviceLost`, and once
   the device has left the device list and come back (as the default again when

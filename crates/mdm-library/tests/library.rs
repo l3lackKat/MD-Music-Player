@@ -7,8 +7,8 @@ use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::tag::{Tag, TagType};
 use mdm_library::{
-    expand_paths, fold, make_thumbnail, read_cover, read_details, read_lyrics, read_meta, scan_folder,
-    Library, PlaylistStore,
+    expand_paths, fold, make_thumbnail, read_cover, read_details, read_lyrics, read_meta, read_replay_gain,
+    scan_folder, Library, PlaylistStore,
 };
 
 /// A fresh, empty folder under the system temp directory.
@@ -441,6 +441,23 @@ fn search_ignores_case_and_accents_and_needs_every_word() {
     assert!(titles("100%").is_empty(), "LIKE wildcards are taken literally");
     assert!(titles("   ").is_empty());
     assert_eq!(fold("Đà Lạt"), "da lat");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn replay_gain_tags_are_read_in_db() {
+    let dir = temp_dir("replay-gain");
+    let tagged_path = dir.join("rg.wav");
+    write_wav(&tagged_path);
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.insert_text(ItemKey::ReplayGainTrackGain, "-6.54 dB".into());
+    tag.insert_text(ItemKey::ReplayGainAlbumGain, "+1.20dB".into());
+    tag.save_to_path(&tagged_path, WriteOptions::default()).unwrap();
+    assert_eq!(read_replay_gain(&tagged_path), (Some(-6.54), Some(1.2)));
+
+    let plain = dir.join("plain.wav");
+    write_wav(&plain);
+    assert_eq!(read_replay_gain(&plain), (None, None), "no tags, no gain");
     std::fs::remove_dir_all(dir).ok();
 }
 

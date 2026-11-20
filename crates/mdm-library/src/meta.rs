@@ -81,6 +81,23 @@ pub fn read_meta(path: &Path) -> TrackMeta {
     meta
 }
 
+/// The ReplayGain values in a track's tags, in dB: `(track, album)`. Any tag
+/// of the file counts, since players write them in different places.
+pub fn read_replay_gain(path: &Path) -> (Option<f32>, Option<f32>) {
+    let Some(file) = crate::tagged::read_tagged(path) else { return (None, None) };
+    let find = |key: ItemKey| {
+        file.tags().iter().find_map(|tag| tag.get_string(key).and_then(parse_gain))
+    };
+    (find(ItemKey::ReplayGainTrackGain), find(ItemKey::ReplayGainAlbumGain))
+}
+
+/// "-6.54 dB", "+1.2dB" or "-6.54" as dB.
+fn parse_gain(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let end = text.find(|c: char| !(c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))).unwrap_or(text.len());
+    text[..end].parse::<f32>().ok().filter(|db| db.is_finite())
+}
+
 /// Image names looked for next to a track that has no embedded cover.
 const FOLDER_COVERS: &[&str] = &["cover", "folder", "front", "album"];
 const IMAGE_TYPES: &[(&str, &str)] =

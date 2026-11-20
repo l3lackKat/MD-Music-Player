@@ -24,6 +24,8 @@ pub struct SoftVolume {
     muted: AtomicBool,
     /// A fade's share of the level, 0 to 1, as `f32` bits.
     fade: AtomicU32,
+    /// The ReplayGain offset as an amplitude factor, as `f32` bits.
+    offset: AtomicU32,
 }
 
 /// Loudness from a 0-to-1 slider position: a cube law, so the slider moves
@@ -39,6 +41,7 @@ impl SoftVolume {
             level: AtomicU32::new(level.clamp(0.0, 1.0).to_bits()),
             muted: AtomicBool::new(false),
             fade: AtomicU32::new(1.0f32.to_bits()),
+            offset: AtomicU32::new(1.0f32.to_bits()),
         })
     }
 
@@ -63,12 +66,20 @@ impl SoftVolume {
         self.fade.store(fraction.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
-    /// The amplitude factor the samples get now.
+    fn set_offset_db(&self, db: f32) {
+        let factor = if db.is_finite() { 10f32.powf(db / 20.0) } else { 1.0 };
+        self.offset.store(factor.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The amplitude factor the samples get now. Never above 1: a positive
+    /// ReplayGain on a loud setting would otherwise clip.
     pub fn gain(&self) -> f64 {
         if self.muted() {
             return 0.0;
         }
-        taper(self.level()) * f32::from_bits(self.fade.load(Ordering::Relaxed)) as f64
+        let fade = f32::from_bits(self.fade.load(Ordering::Relaxed)) as f64;
+        let offset = f32::from_bits(self.offset.load(Ordering::Relaxed)) as f64;
+        (taper(self.level()) * offset).min(1.0) * fade
     }
 }
 
@@ -82,12 +93,17 @@ impl Fader for SoftFader {
     fn set(&mut self, fraction: f32) {
         self.0.set_fade(fraction);
     }
+
+    fn set_offset(&mut self, db: f32) {
+        self.0.set_offset_db(db);
+    }
 }
 
 impl Drop for SoftFader {
     fn drop(&mut self) {
-        // Never leave the next output faded down.
+        // Never leave the next output faded down, or moved by a gain.
         self.0.set_fade(1.0);
+        self.0.set_offset_db(0.0);
     }
 }
 

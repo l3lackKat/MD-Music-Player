@@ -14,11 +14,13 @@
 pub mod dop;
 pub mod eq;
 pub mod format;
+pub mod gain;
 pub mod output;
 mod player;
 
 pub use eq::{EqBand, EqSettings};
 pub use format::{Container, FormatRequest, StreamFormat};
+pub use gain::{GainMode, GainReader, ReplayGain};
 pub use mdm_decode::{SampleKind, SourceInfo};
 pub use output::{taper, Backend, DeviceInfo, Fader, FileSink, OutputMode, SoftFader, SoftVolume};
 #[cfg(windows)]

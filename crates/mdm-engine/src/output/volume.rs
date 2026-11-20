@@ -208,14 +208,70 @@ enum FadeMsg {
     Capture,
     Set(f32),
     Sync(mpsc::Sender<()>),
+    Offset(f32),
+}
+
+/// What the fader thread keeps between messages.
+struct FaderState {
+    device_id: Option<String>,
+    endpoint: Option<IAudioEndpointVolume>,
+    /// The level fades go down from and back to (scalar), taken at `Capture`.
+    full: f32,
+    /// Where the fade stands: 1.0 is at `full`.
+    fraction: f32,
+    /// The ReplayGain offset on the device now, and the one asked for. They
+    /// differ while a fade runs: the new one waits for the level to be back.
+    offset_db: f32,
+    want_db: f32,
+    /// The user's own level in dB, under the offset, and the level last set
+    /// for an offset. A device found at another level was turned by someone
+    /// else (the slider, Windows, the DAC): that is the user's level now.
+    user_db: Option<f32>,
+    last_set_db: Option<f32>,
+}
+
+impl FaderState {
+    fn endpoint(&mut self) -> Option<&IAudioEndpointVolume> {
+        if self.endpoint.is_none() {
+            self.endpoint = open_endpoint(self.device_id.as_deref()).ok();
+        }
+        self.endpoint.as_ref()
+    }
+
+    /// Move the device to the user's level plus `want_db`, kept within the
+    /// device's range. Changes made this way are not hidden from
+    /// `watch_volume`: the volume bar shows where the device really is.
+    fn apply_offset(&mut self) {
+        let (offset, want) = (self.offset_db, self.want_db);
+        let last = self.last_set_db;
+        let user = self.user_db;
+        let Some(e) = self.endpoint() else { return };
+        let applied = unsafe {
+            let Ok(now) = e.GetMasterVolumeLevel() else { return };
+            let (mut min, mut max, mut step) = (0.0f32, 0.0f32, 0.0f32);
+            if e.GetVolumeRange(&mut min, &mut max, &mut step).is_err() || max <= min {
+                return;
+            }
+            let turned_elsewhere = last.is_none_or(|l| (now - l).abs() > step.max(0.05));
+            let user = if turned_elsewhere { now - offset } else { user.unwrap_or(now - offset) };
+            let target = (user + want).clamp(min, max);
+            if e.SetMasterVolumeLevel(target, std::ptr::null()).is_err() {
+                return;
+            }
+            (user, e.GetMasterVolumeLevel().unwrap_or(target))
+        };
+        self.user_db = Some(applied.0);
+        self.last_set_db = Some(applied.1);
+        self.offset_db = want;
+    }
 }
 
 /// Fades by moving the device's Windows volume, so the samples stay exact
-/// (and DSD fades too). The COM calls run on a thread of its own; the player
-/// thread only sends it levels.
+/// (and DSD fades too), and holds the ReplayGain offset the same way. The COM
+/// calls run on a thread of its own; the player thread only sends it levels.
 ///
 /// Dropping it puts the level back where it was captured, if a fade left it
-/// lower.
+/// lower, and takes the offset off.
 pub struct EndpointFader {
     tx: Option<mpsc::Sender<FadeMsg>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -229,40 +285,64 @@ impl EndpointFader {
             .name("mdm-fader".into())
             .spawn(move || {
                 let _ = wasapi::initialize_mta();
-                let mut endpoint: Option<IAudioEndpointVolume> = None;
-                let mut full = 1.0f32;
-                let mut fraction = 1.0f32;
+                let mut s = FaderState {
+                    device_id,
+                    endpoint: None,
+                    full: 1.0,
+                    fraction: 1.0,
+                    offset_db: 0.0,
+                    want_db: 0.0,
+                    user_db: None,
+                    last_set_db: None,
+                };
                 for msg in rx {
                     match msg {
                         FadeMsg::Capture => {
                             // Opened again each time: the device may have been replugged.
-                            endpoint = open_endpoint(device_id.as_deref()).ok();
-                            full = endpoint
+                            s.endpoint = open_endpoint(s.device_id.as_deref()).ok();
+                            s.full = s
+                                .endpoint
                                 .as_ref()
                                 .and_then(|e| unsafe { e.GetMasterVolumeLevelScalar() }.ok())
                                 .unwrap_or(1.0);
-                            fraction = 1.0;
+                            s.fraction = 1.0;
                         }
                         FadeMsg::Set(f) => {
-                            fraction = f.clamp(0.0, 1.0);
-                            if let Some(e) = &endpoint {
+                            s.fraction = f.clamp(0.0, 1.0);
+                            if let Some(e) = &s.endpoint {
                                 unsafe {
-                                    let _ = e.SetMasterVolumeLevelScalar(full * fraction, &FADE_CONTEXT);
+                                    let _ = e.SetMasterVolumeLevelScalar(s.full * s.fraction, &FADE_CONTEXT);
                                 }
+                            }
+                            // Back at the full level: an offset that waited for the fade goes on now.
+                            if s.fraction >= 1.0 && s.want_db != s.offset_db {
+                                s.apply_offset();
                             }
                         }
                         FadeMsg::Sync(done) => {
                             let _ = done.send(());
                         }
+                        FadeMsg::Offset(db) => {
+                            s.want_db = db;
+                            if s.fraction >= 1.0 && s.want_db != s.offset_db {
+                                s.apply_offset();
+                            }
+                        }
                     }
                 }
                 // The player went away mid-fade: do not leave the device turned down.
-                if fraction < 1.0 {
-                    if let Some(e) = &endpoint {
+                if s.fraction < 1.0 {
+                    if let Some(e) = &s.endpoint {
                         unsafe {
-                            let _ = e.SetMasterVolumeLevelScalar(full, &FADE_CONTEXT);
+                            let _ = e.SetMasterVolumeLevelScalar(s.full, &FADE_CONTEXT);
                         }
                     }
+                    s.fraction = 1.0;
+                }
+                // Nor moved by a gain no longer playing.
+                if s.offset_db != 0.0 {
+                    s.want_db = 0.0;
+                    s.apply_offset();
                 }
             })
             .ok();
@@ -289,6 +369,10 @@ impl super::Fader for EndpointFader {
         let (done_tx, done_rx) = mpsc::channel();
         self.send(FadeMsg::Sync(done_tx));
         let _ = done_rx.recv_timeout(std::time::Duration::from_millis(200));
+    }
+
+    fn set_offset(&mut self, db: f32) {
+        self.send(FadeMsg::Offset(db));
     }
 }
 

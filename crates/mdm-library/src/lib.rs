@@ -16,7 +16,7 @@ pub use details::{
 };
 pub use index::{fold, make_thumbnail, Library};
 pub use lyrics::{parse_lyrics, read_lyrics, LyricLine, Lyrics};
-pub use meta::{read_cover, read_meta, Cover, TrackMeta};
+pub use meta::{read_cover, read_meta, read_replay_gain, Cover, TrackMeta};
 pub use playlist::{Playlist, PlaylistStore};
 pub use scan::{expand_paths, is_audio_file, scan_folder};
 

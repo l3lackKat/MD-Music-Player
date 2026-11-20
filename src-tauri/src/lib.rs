@@ -14,8 +14,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use mdm_engine::{
-    Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, Repeat,
-    SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
+    Command, DeviceInfo, DeviceVolume, EqSettings, Event, GainMode, OutputMode, Player, Repeat,
+    ReplayGain, SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
 };
 use mdm_library::{
     AlbumSummary, ArtistDetail, ArtistSummary, Library, Lyrics, Playlist, PlaylistStore, TrackDetails,
@@ -134,6 +134,9 @@ struct SavedOutput {
     /// (`OutputSettings::level_key`).
     #[serde(default)]
     soft_levels: BTreeMap<String, f32>,
+    /// Even out loudness with ReplayGain tags, through the volume (not the samples).
+    #[serde(default)]
+    replay_gain: GainMode,
 }
 
 fn exclusive() -> OutputMode {
@@ -148,6 +151,7 @@ impl Default for SavedOutput {
             mode: OutputMode::Exclusive,
             soft_volume: false,
             soft_levels: BTreeMap::new(),
+            replay_gain: GainMode::Off,
         }
     }
 }
@@ -454,6 +458,29 @@ fn set_volume(
         return Ok(soft_reading(&state.soft));
     }
     mdm_engine::set_volume(output.device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
+}
+
+// ---- ReplayGain ------------------------------------------------------------
+
+#[tauri::command]
+fn get_replay_gain(state: State<AppState>) -> GainMode {
+    state.saved.lock().unwrap().replay_gain
+}
+
+/// Turn ReplayGain off, or on by track or album. It moves the volume, never
+/// the samples; the choice is kept in `output.json`.
+#[tauri::command]
+fn set_replay_gain(state: State<AppState>, mode: GainMode) -> GainMode {
+    state.saved.lock().unwrap().replay_gain = mode;
+    state.save_output();
+    state.player.send(Command::SetReplayGain(mode));
+    mode
+}
+
+/// The engine reads gains through this; tags are the library's business.
+fn read_gain(path: &Path) -> ReplayGain {
+    let (track_db, album_db) = mdm_library::read_replay_gain(path);
+    ReplayGain { track_db, album_db }
 }
 
 // ---- Equalizer -------------------------------------------------------------
@@ -916,6 +943,8 @@ pub fn run() {
             let eq_path = data_dir.join("eq.json");
             let eq = load_eq(&eq_path);
             player.send(Command::SetEq(eq.clone()));
+            player.send(Command::SetGainReader(Box::new(|path: &Path| read_gain(path))));
+            player.send(Command::SetReplayGain(saved.replay_gain));
             app.manage(AppState {
                 player,
                 output: Mutex::new(output),
@@ -981,6 +1010,8 @@ pub fn run() {
             set_volume,
             get_eq,
             set_eq,
+            get_replay_gain,
+            set_replay_gain,
             supported_extensions,
             play_files,
             append_files,

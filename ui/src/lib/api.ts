@@ -75,7 +75,12 @@ export interface SignalPath {
   eq: boolean;
   /** The software volume is scaling this track's samples. */
   soft_volume: boolean;
+  /** The ReplayGain offset for this track (dB), moving the volume, not the samples. */
+  replay_gain_db: number | null;
 }
+
+/** ReplayGain: off, or evening out loudness by track or by album. */
+export type GainMode = "off" | "track" | "album";
 
 export interface EqBand {
   freq_hz: number;
@@ -210,6 +215,8 @@ export const api = {
   getLyrics: (path: string) => invoke<Lyrics | null>("get_lyrics", { path }),
   trackDetails: (path: string) => invoke<TrackDetails>("track_details", { path }),
   getEq: () => invoke<EqSettings>("get_eq"),
+  getReplayGain: () => invoke<GainMode>("get_replay_gain"),
+  setReplayGain: (mode: GainMode) => invoke<GainMode>("set_replay_gain", { mode }),
   /** Apply and save. Returns the settings as applied (values clamped into range). */
   setEq: (settings: EqSettings) => invoke<EqSettings>("set_eq", { settings }),
   playlists: () => invoke<Playlist[]>("playlists"),
