@@ -1,6 +1,7 @@
 //! Everything MDMusic knows about music files besides how to play them:
 //! tags, cover art, lyrics, folder scanning and playlists.
 
+mod browse;
 mod details;
 mod index;
 mod lyrics;
@@ -9,6 +10,7 @@ mod playlist;
 mod scan;
 mod tagged;
 
+pub use browse::{AlbumSummary, ArtistDetail, ArtistSummary};
 pub use details::{
     read_details, AudioDetails, LyricsDetails, PictureDetails, TagDetails, TagField, TrackDetails,
 };

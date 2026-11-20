@@ -226,7 +226,7 @@
         {/if}
       </span>
       <span class="flex min-w-0 items-center gap-2.5">
-        <Thumb path={track.path} class="h-8 w-8" />
+        <Thumb path={track.path} class="h-8 w-8 rounded" />
         <!-- Each cell's own text as its tooltip, so a cut-off name can still be read. -->
         <span class="truncate {active ? 'font-medium text-accent' : ''}" title={track.title}>{track.title}</span>
         <!-- Only the exception is marked: a track added on its own, not found in a folder. -->

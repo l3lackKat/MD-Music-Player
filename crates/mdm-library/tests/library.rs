@@ -445,6 +445,51 @@ fn search_ignores_case_and_accents_and_needs_every_word() {
 }
 
 #[test]
+fn albums_and_artists_group_the_library() {
+    let dir = temp_dir("index-browse");
+    // Track numbers out of file order: the album still plays 1, 2.
+    tagged(&dir, "vn/b.wav", "Hai", "Đông Nhi", "Đà Lạt", 2);
+    tagged(&dir, "vn/a.wav", "Một", "Đông Nhi", "Đà Lạt", 1);
+    tagged(&dir, "vn/loose.wav", "Lẻ", "dong nhi", "", 1);
+    // A compilation without an album artist: one album of two artists.
+    tagged(&dir, "mix/1.wav", "Song A", "A", "Hits", 1);
+    tagged(&dir, "mix/2.wav", "Song B", "B", "Hits", 2);
+    // Same album title in another folder: another album.
+    tagged(&dir, "other/1.wav", "Song C", "C", "Hits", 1);
+    let mut store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    let id = store.create("All").unwrap().id;
+    let (playlist, _) =
+        store.add_paths(id, &[dir.join("vn"), dir.join("mix"), dir.join("other")]).unwrap();
+    let library = Library::open_in_memory().unwrap();
+    library.refresh(std::slice::from_ref(&playlist)).unwrap();
+
+    let albums = library.albums().unwrap();
+    let shown: Vec<(&str, Option<&str>, usize)> =
+        albums.iter().map(|a| (a.title.as_str(), a.artist.as_deref(), a.track_count)).collect();
+    assert_eq!(
+        shown,
+        [("Hits", None, 2), ("Hits", Some("C"), 1), ("Đà Lạt", Some("Đông Nhi"), 2)],
+        "by artist (a mix first), and the untitled track has no album"
+    );
+    let titles = |tracks: Vec<mdm_library::TrackMeta>| -> Vec<String> { tracks.into_iter().map(|t| t.title).collect() };
+    assert_eq!(titles(library.album_tracks(&albums[2].id).unwrap()), ["Một", "Hai"]);
+    assert_eq!(titles(library.album_tracks(&albums[0].id).unwrap()), ["Song A", "Song B"]);
+    assert!(albums[2].cover_path.ends_with("a.wav"), "the cover comes from the first track");
+
+    let artists = library.artists().unwrap();
+    let names: Vec<(&str, usize, usize)> =
+        artists.iter().map(|a| (a.name.as_str(), a.album_count, a.track_count)).collect();
+    assert_eq!(names, [("A", 1, 1), ("B", 1, 1), ("C", 1, 1), ("Đông Nhi", 1, 3)], "case and accents merge");
+
+    let detail = library.artist("DONG NHI").unwrap().expect("found without accents");
+    assert_eq!(detail.name, "Đông Nhi");
+    assert_eq!(detail.albums.len(), 1);
+    assert_eq!(titles(detail.tracks), ["Một", "Hai", "Lẻ"], "album tracks first, then the rest");
+    assert!(library.artist("nobody").unwrap().is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn refresh_drops_what_no_playlist_holds() {
     let dir = temp_dir("index-refresh");
     tagged(&dir, "keep/a.wav", "Kept", "X", "Y", 1);

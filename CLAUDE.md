@@ -140,9 +140,16 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 - **Search is folded text, not FTS**: `fold()` lowercases and strips accents
   (and maps đ to d), and every query word must appear (`LIKE`, wildcards
   escaped) in title, artist, album, album artist, file or folder name.
+- **Albums and artists** (`browse.rs`, `LibraryView.svelte`) are grouped in
+  Rust from the index rows, never stored. An album is album title + album
+  artist, or album title + folder when there is no album artist (so an
+  untagged compilation stays one album); an artist is album artist, else
+  track artist, folded like search. The UI keeps the page in `view` as a
+  `Browse` value whose `back` says where the back link goes.
 - **Small covers** are `cover://<path>?thumb`: 96 px JPEGs made by
   `Library::thumbnail`, kept in the `thumbs` table, at most `THUMB_WORKERS`
-  made at once. Rows load them lazily (`Thumb.svelte`).
+  made at once. Rows load them lazily (`Thumb.svelte`). The album and artist
+  grids use `?thumb=grid` (320 px).
 - **Selection is by track object** (`Selection` in
   `ui/src/lib/selection.svelte.ts`), so it survives moves and sorting. Track
   lists report rows (`onmenu(rows)`, `ondelete(rows)`, `onmove(rows, slot)`),
@@ -223,8 +230,7 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 ## Not built yet
 
 Reordering tracks inside a playlist (only its folders' and files' own order,
-which sorting covers for now), browsing the library by artist or album,
-editing tags, a tray icon, a timeline (seek bar) in the Windows media overlay,
+which sorting covers for now), editing tags, a tray icon, a timeline (seek bar) in the Windows media overlay,
 a setting to turn the fades off or change their length. ASIO output for native
 DSD was set aside: the DX1 II runs on Windows' class driver (no ASIO), the
 only ASIO driver here is Realtek's (no DSD), and Steinberg's SDK is

@@ -25,6 +25,7 @@
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Cover from "./lib/Cover.svelte";
   import EqPanel from "./lib/EqPanel.svelte";
+  import LibraryView, { browseRoot, isBrowse, type Browse } from "./lib/LibraryView.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
   import { isIdentity, moveRows, RowDrag } from "./lib/reorder.svelte";
   import { loadSorts, nextSort, saveSorts, sortTracks, type PlaylistSorts, type SortKey } from "./lib/sort";
@@ -62,10 +63,13 @@
 
   // ---- Playlists ----
   let playlists = $state<Playlist[]>([]);
-  /** What the main area shows: the queue, search results, or the playlist with this id. */
-  let view = $state<"queue" | "search" | number>("queue");
+  /** What the main area shows: the queue, search results, the playlist with this id, or the library's albums and artists. */
+  let view = $state<"queue" | "search" | number | Browse>("queue");
   /** Where to go back to when the search box is emptied. */
-  let lastView: "queue" | number = "queue";
+  let lastView: "queue" | number | Browse = "queue";
+  /** Bumped when the library index changes, so the albums and artists are read again. */
+  let libraryVersion = $state(0);
+  const browsing = $derived(isBrowse(view) ? browseRoot(view) : null);
 
   // ---- Search ----
   let searchQuery = $state("");
@@ -678,11 +682,11 @@
   }
 
   /** Open a view from the sidebar, leaving search. */
-  function show(target: "queue" | number) {
+  function show(target: "queue" | number | Browse) {
     searchQuery = "";
     searchResults = null;
-    if (target === "queue") view = "queue";
-    else openPlaylist(target);
+    if (typeof target === "number") openPlaylist(target);
+    else view = target;
   }
 
   /** The transport's track title was clicked: open the queue at the track being heard. */
@@ -766,7 +770,14 @@
       });
     }
     if (one) {
-      items.push("separator", { label: "Track info", action: () => (infoTrack = one) }, {
+      items.push("separator");
+      const artistName = one.album_artist ?? one.artist;
+      // Not from the page of that artist itself.
+      const onTheirPage = isBrowse(view) && view.kind === "artist" && view.name === artistName;
+      if (artistName && !onTheirPage) {
+        items.push({ label: "Go to artist", action: () => show({ kind: "artist", name: artistName, back: { kind: "artists" } }) });
+      }
+      items.push({ label: "Track info", action: () => (infoTrack = one) }, {
         label: "Show in File Explorer",
         action: () => api.showInFolder(one.path).catch(showError),
       });
@@ -868,6 +879,7 @@
       cleanups.push(
         await listenLibrary((status) => {
           libraryTracks = status.tracks;
+          libraryVersion++;
           // Playlists changed, or the launch refresh finished: the answer may be different now.
           if (view === "search") void runSearch();
         }),
@@ -1027,6 +1039,18 @@
         {#if queue.length > 0}<span class="text-xs tabular-nums text-muted">{queue.length}</span>{/if}
       </button>
 
+      <p class="px-3 pb-1 pt-4 text-xs font-medium uppercase tracking-wider text-muted">Library</p>
+      {#each [{ kind: "albums", label: "Albums" }, { kind: "artists", label: "Artists" }] as const as entry (entry.kind)}
+        <button
+          class="rounded-lg px-3 py-2 text-left {browsing === entry.kind
+            ? 'bg-raised font-medium text-ink'
+            : 'text-muted hover:bg-raised hover:text-ink'}"
+          onclick={() => show({ kind: entry.kind })}
+        >
+          {entry.label}
+        </button>
+      {/each}
+
       <p class="px-3 pb-1 pt-4 text-xs font-medium uppercase tracking-wider text-muted">Playlists</p>
       {#each playlists as item, index (item.id)}
         {@const line = playlistDrag.line(index)}
@@ -1122,6 +1146,22 @@
             {/if}
           </div>
         {/if}
+      {:else if isBrowse(view)}
+        <!-- The library: albums and artists from every playlist's tracks -->
+        <LibraryView
+          {view}
+          version={libraryVersion}
+          currentPath={currentTrack?.path ?? null}
+          playing={playState === "playing"}
+          onnavigate={(next) => (view = next)}
+          onplay={(tracks, index) => playTracks(tracks, index)}
+          onqueue={async (paths) => {
+            const added = await addToQueue(paths);
+            if (added) showNotice(`Added ${count(added)} to the queue`);
+          }}
+          onmenu={(tracks, rows, x, y) => openTrackMenu(tracks, rows, x, y)}
+          onerror={showError}
+        />
       {:else if playlist}
         <!-- A playlist: its folders and the tracks found in them -->
         <div class="px-6 pb-3 pt-5">

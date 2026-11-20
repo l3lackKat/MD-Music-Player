@@ -155,6 +155,35 @@ export function holdsFile(playlist: Playlist, path: string): boolean {
   return playlist.files.some((f) => f.toLowerCase() === wanted);
 }
 
+/** An album: tracks sharing an album title and album artist (or folder). */
+export interface AlbumSummary {
+  /** Pass to `albumTracks`. */
+  id: string;
+  title: string;
+  /** `null` for an album of several artists with no album artist. */
+  artist: string | null;
+  year: number | null;
+  track_count: number;
+  duration_ms: number;
+  /** A track to take the album cover from. */
+  cover_path: string;
+}
+
+export interface ArtistSummary {
+  name: string;
+  album_count: number;
+  track_count: number;
+  cover_path: string;
+}
+
+export interface ArtistDetail {
+  name: string;
+  /** Oldest first. */
+  albums: AlbumSummary[];
+  /** Album by album, then the tracks with no album. */
+  tracks: TrackMeta[];
+}
+
 export interface Lyrics {
   /** Every line has a time, in order. */
   synced: boolean;
@@ -167,8 +196,8 @@ export function coverUrl(path: string): string {
 }
 
 /** URL of a track's small cover (JPEG, 96 px), made once and kept in the library index. 404 when there is none. */
-export function thumbUrl(path: string): string {
-  return `${coverUrl(path)}?thumb`;
+export function thumbUrl(path: string, size: "row" | "grid" = "row"): string {
+  return `${coverUrl(path)}?thumb${size === "grid" ? "=grid" : ""}`;
 }
 
 /** How many tracks the library index holds: every playlist's tracks. */
@@ -197,6 +226,10 @@ export const api = {
   playlistReorder: (ids: number[]) => invoke<Playlist[]>("playlist_reorder", { ids }),
   /** Tracks of any playlist matching every word, accents and case ignored. */
   search: (query: string) => invoke<TrackMeta[]>("search", { query }),
+  albums: () => invoke<AlbumSummary[]>("albums"),
+  albumTracks: (id: string) => invoke<TrackMeta[]>("album_tracks", { id }),
+  artists: () => invoke<ArtistSummary[]>("artists"),
+  artist: (name: string) => invoke<ArtistDetail | null>("artist", { name }),
   libraryStatus: () => invoke<LibraryStatus>("library_status"),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   appendFiles: (paths: string[]) => invoke<void>("append_files", { paths }),

@@ -18,6 +18,9 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::browse::{
+    album_id, artist_detail, group_albums, list_artists, AlbumSummary, ArtistDetail, ArtistSummary,
+};
 use crate::meta::{read_cover, read_meta, TrackMeta};
 use crate::playlist::Playlist;
 use crate::scan::expand_paths_with;
@@ -303,6 +306,46 @@ impl Library {
         drop(stmt);
         drop(conn);
         Ok(found.into_iter().filter(|t| Path::new(&t.path).is_file()).collect())
+    }
+
+    /// Every track in the index, in album order (disc, then track number).
+    fn all_tracks(&self) -> Result<Vec<TrackMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM tracks ORDER BY disc_no, track_no, title COLLATE NOCASE"
+        ))?;
+        let rows = stmt.query_map([], meta_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every album, by artist, year and title. See `browse` for what makes an album.
+    pub fn albums(&self) -> Result<Vec<AlbumSummary>> {
+        Ok(group_albums(&self.all_tracks()?).into_iter().map(|(summary, _)| summary).collect())
+    }
+
+    /// The tracks of the album `id` (from `AlbumSummary::id`), in album
+    /// order. Files that have gone are left out.
+    pub fn album_tracks(&self, id: &str) -> Result<Vec<TrackMeta>> {
+        let tracks = self.all_tracks()?;
+        Ok(tracks
+            .into_iter()
+            .filter(|t| album_id(t).as_deref() == Some(id) && Path::new(&t.path).is_file())
+            .collect())
+    }
+
+    /// Every artist, by name.
+    pub fn artists(&self) -> Result<Vec<ArtistSummary>> {
+        Ok(list_artists(&self.all_tracks()?))
+    }
+
+    /// One artist's albums and tracks (case and accents ignored in `name`).
+    /// Files that have gone are left out of the tracks.
+    pub fn artist(&self, name: &str) -> Result<Option<ArtistDetail>> {
+        let mut detail = artist_detail(&self.all_tracks()?, name);
+        if let Some(d) = &mut detail {
+            d.tracks.retain(|t| Path::new(&t.path).is_file());
+        }
+        Ok(detail)
     }
 
     /// The track's cover, cut down to `px` (JPEG), or `None` when it has no

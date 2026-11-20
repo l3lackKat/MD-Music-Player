@@ -17,7 +17,10 @@ use mdm_engine::{
     Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, Repeat,
     SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
 };
-use mdm_library::{Library, Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
+use mdm_library::{
+    AlbumSummary, ArtistDetail, ArtistSummary, Library, Lyrics, Playlist, PlaylistStore, TrackDetails,
+    TrackMeta,
+};
 use serde::{Deserialize, Serialize};
 use tauri::http::{header, Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -586,6 +589,30 @@ fn search(state: State<'_, AppState>, query: String) -> CommandResult<Vec<TrackM
     state.library.search(&query, SEARCH_LIMIT).map_err(text)
 }
 
+/// Every album in the playlists, by artist, year and title.
+#[tauri::command(async)]
+fn albums(state: State<'_, AppState>) -> CommandResult<Vec<AlbumSummary>> {
+    state.library.albums().map_err(text)
+}
+
+/// The tracks of one album (`AlbumSummary::id`), in album order.
+#[tauri::command(async)]
+fn album_tracks(state: State<'_, AppState>, id: String) -> CommandResult<Vec<TrackMeta>> {
+    state.library.album_tracks(&id).map_err(text)
+}
+
+/// Every artist in the playlists, by name.
+#[tauri::command(async)]
+fn artists(state: State<'_, AppState>) -> CommandResult<Vec<ArtistSummary>> {
+    state.library.artists().map_err(text)
+}
+
+/// One artist's albums and tracks; `None` when the library has none of theirs.
+#[tauri::command(async)]
+fn artist(state: State<'_, AppState>, name: String) -> CommandResult<Option<ArtistDetail>> {
+    state.library.artist(&name).map_err(text)
+}
+
 #[derive(Clone, Serialize)]
 struct LibraryStatus {
     /// Tracks in the index: everything the playlists hold, once scanned.
@@ -743,6 +770,9 @@ fn start_refresher(app: AppHandle, requests: mpsc::Receiver<()>) {
 /// Small covers are made this many pixels on their longest side: sharp at
 /// 32 CSS pixels up to 300% display scaling.
 const THUMB_PX: u32 = 96;
+/// The larger size, `?thumb=grid`, for the album and artist grids: sharp at
+/// 160 CSS pixels up to 200%.
+const GRID_THUMB_PX: u32 = 320;
 /// Small covers made at once. A screenful of rows asks for many together,
 /// and each decodes a full-size picture.
 const THUMB_WORKERS: usize = 3;
@@ -771,7 +801,8 @@ impl Slots {
 }
 
 /// Answer `cover://<track path>` with the track's cover image, or with a
-/// small JPEG of it when the query holds `thumb`.
+/// small JPEG of it when the query holds `thumb` (`thumb=grid` for the
+/// larger size).
 fn cover_response(app: &AppHandle, uri_path: &str, query: Option<&str>) -> Response<Vec<u8>> {
     let not_found = || {
         Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).expect("static response")
@@ -784,11 +815,17 @@ fn cover_response(app: &AppHandle, uri_path: &str, query: Option<&str>) -> Respo
     if !mdm_library::is_audio_file(track) {
         return not_found();
     }
-    let thumb = query.is_some_and(|q| q.split('&').any(|p| p == "thumb"));
-    let cover = if thumb {
+    let thumb = query.and_then(|q| {
+        q.split('&').find_map(|p| match p {
+            "thumb" => Some(THUMB_PX),
+            "thumb=grid" => Some(GRID_THUMB_PX),
+            _ => None,
+        })
+    });
+    let cover = if let Some(px) = thumb {
         let library = app.state::<AppState>().library.clone();
         THUMB_SLOTS
-            .run(|| library.thumbnail(track, THUMB_PX))
+            .run(|| library.thumbnail(track, px))
             .map(|data| ("image/jpeg".to_string(), data))
     } else {
         mdm_library::read_cover(track).map(|c| (c.mime, c.data))
@@ -969,6 +1006,10 @@ pub fn run() {
             playlist_remove_files,
             playlist_reorder,
             search,
+            albums,
+            album_tracks,
+            artists,
+            artist,
             library_status,
             show_in_folder,
             playlist_remove_folder,
