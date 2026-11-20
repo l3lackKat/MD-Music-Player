@@ -1026,6 +1026,18 @@
       <option value="track">ReplayGain by track</option>
       <option value="album">ReplayGain by album</option>
     </select>
+
+    <button
+      class="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted hover:bg-raised hover:text-ink"
+      title="Mini player: a small window that stays on top"
+      aria-label="Mini player"
+      onclick={() => api.openMiniPlayer().catch(showError)}
+    >
+      <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="5" width="18" height="14" rx="2" />
+        <rect x="12" y="11" width="6" height="5" rx="1" fill="currentColor" stroke="none" />
+      </svg>
+    </button>
   </header>
 
   {#if error}

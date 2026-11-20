@@ -14,8 +14,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use mdm_engine::{
-    Command, DeviceInfo, DeviceVolume, EqSettings, Event, GainMode, OutputMode, Player, Repeat,
-    ReplayGain, SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
+    Command, DeviceInfo, DeviceVolume, EqSettings, Event, GainMode, OutputMode, PlayState, Player,
+    Repeat, ReplayGain, SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
 };
 use mdm_library::{
     AlbumSummary, ArtistDetail, ArtistSummary, Library, Lyrics, Playlist, PlaylistStore, TrackDetails,
@@ -219,6 +219,36 @@ struct AppState {
     refresh: Mutex<mpsc::Sender<()>>,
     eq: Mutex<EqSettings>,
     eq_path: PathBuf,
+    /// What the player last reported, for a window that opens mid-track
+    /// (the mini player) to start from.
+    now: Mutex<NowPlaying>,
+}
+
+/// The player as its events last described it.
+#[derive(Debug, Clone, Serialize)]
+struct NowPlaying {
+    state: PlayState,
+    /// The track heard (or last heard).
+    path: Option<String>,
+    position_ms: u64,
+    duration_ms: Option<u64>,
+}
+
+impl NowPlaying {
+    fn follow(&mut self, event: &Event) {
+        match event {
+            Event::State { state } => self.state = *state,
+            Event::Track { path, .. } => self.path = Some(path.clone()),
+            Event::Position { ms, duration_ms } => {
+                self.position_ms = *ms;
+                // A position while stopped carries no duration; keep the track's.
+                if duration_ms.is_some() {
+                    self.duration_ms = *duration_ms;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl AppState {
@@ -597,6 +627,75 @@ fn previous(state: State<AppState>) {
     state.player.send(Command::Previous);
 }
 
+/// What is playing, as the player last reported it.
+#[tauri::command]
+fn now_playing(state: State<AppState>) -> NowPlaying {
+    state.now.lock().unwrap().clone()
+}
+
+// ---- Mini player -----------------------------------------------------------
+
+/// The mini player's window label. It loads the same page, which shows the
+/// mini player when it finds itself in this window.
+const MINI: &str = "mini";
+const MINI_SIZE: (f64, f64) = (360.0, 104.0);
+/// Gap between the mini player and the screen edges, in logical pixels.
+const MINI_MARGIN: f64 = 24.0;
+
+/// Swap the main window for the mini player: a small window that stays on
+/// top, in the bottom-right corner of the main window's screen. Async:
+/// creating a window from a synchronous command can deadlock on Windows.
+#[tauri::command(async)]
+fn open_mini_player(app: AppHandle) -> CommandResult<()> {
+    let main = app.get_webview_window("main");
+    if let Some(mini) = app.get_webview_window(MINI) {
+        mini.show().map_err(text)?;
+        mini.set_focus().map_err(text)?;
+    } else {
+        let corner = main.as_ref().and_then(|w| w.current_monitor().ok().flatten()).map(|m| {
+            let scale = m.scale_factor();
+            let area = m.work_area();
+            let right = (area.position.x as f64 + area.size.width as f64) / scale;
+            let bottom = (area.position.y as f64 + area.size.height as f64) / scale;
+            (right - MINI_SIZE.0 - MINI_MARGIN, bottom - MINI_SIZE.1 - MINI_MARGIN)
+        });
+        let mut builder = tauri::WebviewWindowBuilder::new(&app, MINI, tauri::WebviewUrl::App("index.html".into()))
+            .title("MDMusic")
+            .inner_size(MINI_SIZE.0, MINI_SIZE.1)
+            .resizable(false)
+            .maximizable(false)
+            .decorations(false)
+            .always_on_top(true)
+            .background_color(tauri::window::Color(13, 14, 18, 255));
+        if let Some((x, y)) = corner {
+            builder = builder.position(x, y);
+        }
+        builder.build().map_err(text)?;
+    }
+    if let Some(main) = main {
+        main.hide().map_err(text)?;
+    }
+    Ok(())
+}
+
+/// Back from the mini player to the main window.
+#[tauri::command(async)]
+fn close_mini_player(app: AppHandle) -> CommandResult<()> {
+    show_main(&app);
+    if let Some(mini) = app.get_webview_window(MINI) {
+        mini.close().map_err(text)?;
+    }
+    Ok(())
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.unminimize();
+        let _ = main.set_focus();
+    }
+}
+
 // ---- Library ---------------------------------------------------------------
 // Commands marked `async` read files, so they run off the main thread.
 
@@ -958,6 +1057,12 @@ pub fn run() {
                 refresh: Mutex::new(refresh_tx),
                 eq: Mutex::new(eq),
                 eq_path,
+                now: Mutex::new(NowPlaying {
+                    state: PlayState::Stopped,
+                    path: None,
+                    position_ms: 0,
+                    duration_ms: None,
+                }),
             });
             watch_volume(app.handle(), &app.state::<AppState>());
             start_refresher(app.handle().clone(), refresh_rx);
@@ -979,6 +1084,7 @@ pub fn run() {
                 // The device of the track being heard, to wait for if it goes away.
                 let mut device = String::new();
                 for event in events {
+                    handle.state::<AppState>().now.lock().unwrap().follow(&event);
                     match &event {
                         Event::State { state } => {
                             if let Some(m) = &media {
@@ -1000,6 +1106,13 @@ pub fn run() {
                 }
             })?;
             Ok(())
+        })
+        // The mini player closed some other way (Alt+F4): bring the main window back,
+        // or the app would be left running with no window.
+        .on_window_event(|window, event| {
+            if window.label() == MINI && matches!(event, tauri::WindowEvent::Destroyed) {
+                show_main(window.app_handle());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_devices,
@@ -1026,6 +1139,9 @@ pub fn run() {
             seek,
             next,
             previous,
+            now_playing,
+            open_mini_player,
+            close_mini_player,
             expand_paths,
             get_lyrics,
             track_details,

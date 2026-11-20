@@ -79,6 +79,14 @@ export interface SignalPath {
   replay_gain_db: number | null;
 }
 
+export interface NowPlaying {
+  state: PlayState;
+  /** The track heard, or last heard. */
+  path: string | null;
+  position_ms: number;
+  duration_ms: number | null;
+}
+
 /** ReplayGain: off, or evening out loudness by track or by album. */
 export type GainMode = "off" | "track" | "album";
 
@@ -214,6 +222,11 @@ export const api = {
   expandPaths: (paths: string[]) => invoke<TrackMeta[]>("expand_paths", { paths }),
   getLyrics: (path: string) => invoke<Lyrics | null>("get_lyrics", { path }),
   trackDetails: (path: string) => invoke<TrackDetails>("track_details", { path }),
+  /** What is playing, as the player last reported it: for a window opened mid-track. */
+  nowPlaying: () => invoke<NowPlaying>("now_playing"),
+  /** Swap the main window for the always-on-top mini player, and back. */
+  openMiniPlayer: () => invoke<void>("open_mini_player"),
+  closeMiniPlayer: () => invoke<void>("close_mini_player"),
   getEq: () => invoke<EqSettings>("get_eq"),
   getReplayGain: () => invoke<GainMode>("get_replay_gain"),
   setReplayGain: (mode: GainMode) => invoke<GainMode>("set_replay_gain", { mode }),

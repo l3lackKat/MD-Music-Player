@@ -107,6 +107,15 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   the full-volume guard and plays on. A device that never leaves the list is
   not waited for. Any user choice (play, stop, new queue, new output) calls the
   wait off (`cancel_reconnect`).
+- **The mini player is a second window** (label `mini`, `open_mini_player`
+  in `src-tauri/src/lib.rs`) loading the same page; `main.ts` mounts
+  `MiniPlayer.svelte` there by the window label. The main window is hidden,
+  not closed, so its queue and state live on; `close_mini_player` and the
+  mini window's `Destroyed` event both show it again. A window opened
+  mid-track starts from `now_playing` (the last events, kept in
+  `AppState::now`), then follows the player events like the main window.
+  Both windows are in `capabilities/default.json`. Commands that create
+  windows must be `async` (a sync one can deadlock on Windows).
 - **Media keys** go through the Windows media controls
   (`src-tauri/src/media_controls.rs`, SMTC on the main window). Their buttons
   send engine commands directly; the UI follows from the engine's events.
@@ -191,7 +200,9 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   Chrome DevTools Protocol to the page at `localhost:1420`. Native dialogs
   (file and folder pickers) cannot be driven; call the command behind them.
   Clean up any playlists a test creates: they live in
-  `%APPDATA%\com.mdmusic.app\playlists.json`, the user's real data. Picking a
+  `%APPDATA%\com.mdmusic.app\playlists.json`, the user's real data. With the
+  mini player open there are two pages at `localhost:1420`: pick one by
+  `window.__TAURI_INTERNALS__.metadata.currentWindow.label`. Picking a
   device writes `output.json` there too, and `library.db` is rebuilt from the
   playlists, so a test playlist's tracks leave it on the next refresh.
 - A real click with Ctrl or Shift needs `modifiers` on every
