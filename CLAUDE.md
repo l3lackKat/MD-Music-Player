@@ -233,6 +233,13 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   crate source under `~/.cargo/registry/src` instead of guessing.
 - In lofty, ID3v2 lyrics (USLT) are `ItemKey::UnsyncLyrics`; Vorbis and MP4
   lyrics are `ItemKey::Lyrics`. Read both.
+- **Settings live in one dialog** (`ui/src/lib/Settings.svelte`, Ctrl+, or the
+  gear at the bottom of the sidebar): output device and mode, software volume,
+  ReplayGain, the equalizer (`EqPanel.svelte`, embedded there) and appearance.
+  App keeps the state and applies each change; the dialog only shows it and
+  calls back. A new setting goes there, not into the sidebar or the transport.
+- Icons come from `ui/src/lib/Icon.svelte` (one path per name, 24 px grid,
+  2 px strokes). Add a name there rather than inlining a new `<svg>`.
 - The browser's own right-click menu is turned off app-wide (`onContextMenu`
   in `App.svelte`), except in text fields and over selected text. Track rows
   open `ContextMenu.svelte`; its items are built in `trackMenu()`.

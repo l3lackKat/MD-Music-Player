@@ -3,6 +3,8 @@
   import { SvelteSet } from "svelte/reactivity";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { fade, fly, slide } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
   import {
     api,
     holdsFile,
@@ -25,10 +27,11 @@
   } from "./lib/api";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import Cover from "./lib/Cover.svelte";
-  import EqPanel from "./lib/EqPanel.svelte";
+  import Icon from "./lib/Icon.svelte";
   import LibraryView, { browseRoot, isBrowse, type Browse } from "./lib/LibraryView.svelte";
   import NowPlaying from "./lib/NowPlaying.svelte";
   import { isIdentity, moveRows, RowDrag } from "./lib/reorder.svelte";
+  import Settings, { type SettingsTab } from "./lib/Settings.svelte";
   import { loadSorts, nextSort, saveSorts, sortTracks, type PlaylistSorts, type SortKey } from "./lib/sort";
   import SourceMark from "./lib/SourceMark.svelte";
   import Spinner from "./lib/Spinner.svelte";
@@ -94,16 +97,17 @@
   let repeat = $state<Repeat>("off");
   /** The equalizer, as last saved. `null` until loaded. */
   let eq = $state<EqSettings | null>(null);
-  let showEq = $state(false);
   let replayGain = $state<GainMode>("off");
 
-  const GAIN_TITLE: Record<GainMode, string> = {
-    off: "ReplayGain evens out loudness between tracks, using their ReplayGain tags. It moves the device volume, never the samples, so playback stays bit-perfect.",
-    track:
-      "ReplayGain by track: every track plays at the same loudness. It moves the device volume, never the samples, so playback stays bit-perfect. Tracks without ReplayGain tags play at your level.",
-    album:
-      "ReplayGain by album: albums play at the same loudness, their quiet and loud tracks kept as they are. It moves the device volume, never the samples, so playback stays bit-perfect.",
-  };
+  // ---- Settings ----
+  let showSettings = $state(false);
+  let settingsTab = $state<SettingsTab>("output");
+
+  function openSettings(tab?: SettingsTab) {
+    if (tab) settingsTab = tab;
+    menu = null;
+    showSettings = true;
+  }
 
   async function changeReplayGain(mode: GainMode) {
     replayGain = mode;
@@ -245,6 +249,33 @@
             : "Shared mode: Windows resamples and mixes the audio";
     return `${why}.\n\n${signalTitle}`;
   });
+
+  /** The short word on the signal badge. */
+  const badgeLabel = $derived(
+    !signalPath
+      ? ""
+      : signalPath.bit_perfect
+        ? "Bit-perfect"
+        : signalPath.eq
+          ? "EQ on"
+          : signalPath.soft_volume
+            ? "Soft volume"
+            : signalPath.exclusive
+              ? "Exclusive"
+              : "Shared",
+  );
+
+  /** The output, as the sidebar sums it up: the device, then the mode and what else is on. */
+  const deviceLabel = $derived(devices.find((d) => d.id === deviceId)?.name ?? "System default");
+  const outputSummary = $derived(
+    [
+      mode === "exclusive" ? (softVolumeEnabled && !hardwareVolume ? "Exclusive, software volume" : "Exclusive") : "Shared",
+      eq?.enabled ? "EQ" : null,
+      replayGain !== "off" ? "ReplayGain" : null,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  );
 
   function showError(message: unknown) {
     error = String(message);
@@ -464,13 +495,21 @@
   }
 
   /** Switch device, and say how loud the new one is set: each device keeps its own Windows volume. */
-  async function changeDevice() {
+  async function changeDevice(id: string | null) {
+    deviceId = id;
     const output = await applyOutput();
     const volume = await volumeControl?.refresh();
     const name = devices.find((d) => d.id === deviceId)?.name ?? "System default";
     const notice = output && outputNotice(output, name);
     if (notice) showNotice(notice);
     else if (volume) showNotice(`${name}: volume ${Math.round(volume.level * 100)}%${volume.muted ? ", muted" : ""}`);
+  }
+
+  /** Exclusive or shared, as the user picked; shared is used while exclusive is unavailable. */
+  async function changeMode(option: OutputMode) {
+    wantedMode = option;
+    await applyOutput();
+    await volumeControl?.refresh();
   }
 
   /** On focus: re-read the volume, and re-check exclusive if the device changed meanwhile (e.g. a new Windows default). */
@@ -819,6 +858,36 @@
     if (!editable && !selected) event.preventDefault();
   }
 
+  /** The open playlist's "more" menu, under the button that opened it. */
+  function openPlaylistMenu(event: MouseEvent) {
+    const here = playlist;
+    if (!here) return;
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    menu = { x: rect.left, y: rect.bottom + 4, items: playlistMenuItems(here) };
+  }
+
+  function playlistMenuItems(here: Playlist): MenuItem[] {
+    return [
+      {
+        label: "Rescan folders",
+        hint: here.folders.length === 0 ? "No folders" : undefined,
+        disabled: here.folders.length === 0 || scanning.has(here.id),
+        action: () => scan(here.id),
+      },
+      { label: "Rename", action: () => (renaming = here.name) },
+      "separator",
+      { label: "Delete playlist", danger: true, action: deletePlaylist },
+    ];
+  }
+
+  /** Right-click on a playlist in the sidebar: open it, then its menu. */
+  function onPlaylistContextMenu(event: MouseEvent, id: number) {
+    event.preventDefault();
+    if (view !== id) show(id);
+    const here = playlists.find((p) => p.id === id);
+    if (here) menu = { x: event.clientX, y: event.clientY, items: playlistMenuItems(here) };
+  }
+
   async function removeFolder(folder: string) {
     if (!playlist) return;
     const id = playlist.id;
@@ -932,6 +1001,9 @@
     if (event.code === "Space" && !typing) {
       event.preventDefault();
       void togglePlay();
+    } else if ((event.ctrlKey || event.metaKey) && event.key === ",") {
+      event.preventDefault();
+      openSettings();
     } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
       event.preventDefault();
       searchInput?.focus();
@@ -959,116 +1031,48 @@
   }
 </script>
 
+
 <!-- Focus re-reads the volume, which may have been changed in Windows meanwhile. -->
 <svelte:window bind:innerWidth onkeydown={onKey} oncontextmenu={onContextMenu} onfocus={() => void onWindowFocus()} />
 
+{#snippet navItem(label: string, icon: "queue" | "album" | "artist", active: boolean, onclick: () => void, badge?: number)}
+  <button
+    class="flex items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors duration-150 {active
+      ? 'bg-raised font-medium text-ink'
+      : 'text-muted hover:bg-raised/70 hover:text-ink'}"
+    aria-current={active ? "page" : undefined}
+    {onclick}
+  >
+    <Icon name={icon} class="h-[18px] w-[18px] {active ? 'text-accent' : ''}" />
+    <span class="flex-1">{label}</span>
+    {#if badge}<span class="rounded-full bg-line/70 px-1.5 text-[11px] tabular-nums text-muted">{badge}</span>{/if}
+  </button>
+{/snippet}
+
+{#snippet pageTitle(kicker: string, title: string)}
+  <p class="text-xs font-medium uppercase tracking-wider text-muted">{kicker}</p>
+  <h1 class="mt-1 truncate text-2xl font-semibold tracking-tight" {title}>{title}</h1>
+{/snippet}
+
 <div class="flex h-full flex-col">
-  <!-- Top bar: output device and mode -->
-  <header class="flex items-center gap-3 border-b border-line bg-panel px-5 py-3">
-    <div class="mr-auto flex items-center gap-2.5">
-      <img src={appIcon} alt="" class="h-8 w-8" draggable="false" />
-      <span class="text-[15px] font-semibold tracking-tight">MDMusic</span>
-    </div>
-
-    <label class="text-xs text-muted" for="device">Output</label>
-    <select
-      id="device"
-      class="min-w-0 max-w-72 truncate rounded-lg border border-line bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent"
-      bind:value={deviceId}
-      onchange={changeDevice}
-      onfocus={refreshDevices}
-    >
-      <option value={null}>System default</option>
-      {#each devices as device (device.id)}
-        <option value={device.id}>{device.name}</option>
-      {/each}
-    </select>
-
-    <div class="flex rounded-lg border border-line bg-raised p-0.5 text-sm" role="group" aria-label="Output mode">
-      {#each ["exclusive", "shared"] as const as option}
-        <button
-          class="rounded-md px-3 py-1 capitalize transition-colors disabled:cursor-not-allowed disabled:opacity-40 {mode ===
-          option
-            ? 'bg-accent/20 text-accent'
-            : 'text-muted enabled:hover:text-ink'}"
-          disabled={option === "exclusive" && !exclusiveAvailable}
-          title={option === "exclusive"
-            ? !exclusiveAvailable
-              ? "Unavailable: this device has no adjustable hardware volume, so in exclusive mode it would play at full volume. Turn on Software volume, or choose a device with a hardware volume."
-              : hardwareVolume
-                ? "Bit-perfect: MDMusic takes over the device, other apps are silent"
-                : "MDMusic takes over the device, other apps are silent. The software volume sets the level, so it is not bit-perfect"
-            : "Goes through the Windows mixer, other apps keep playing"}
-          onclick={() => {
-            wantedMode = option;
-            void applyOutput().then(() => volumeControl?.refresh());
-          }}
-        >
-          {option}
-        </button>
-      {/each}
-    </div>
-
-    {#if !hardwareVolume}
-      <!-- Only for a device without a volume of its own: with one, the Windows volume keeps playback bit-perfect. -->
-      <button
-        class="flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm transition-colors {softVolumeEnabled
-          ? 'border-warn/40 bg-warn/10 text-warn'
-          : 'border-line text-muted hover:text-ink'}"
-        aria-pressed={softVolumeEnabled}
-        title={softVolumeEnabled
-          ? "Software volume is on: in exclusive mode, MDMusic turns this device down by scaling the samples. Not bit-perfect, and DSD is skipped. Click to turn it off."
-          : "This device has no volume of its own. Turn this on to use exclusive mode anyway: MDMusic then scales the samples to set the level, so it is not bit-perfect, and DSD is skipped."}
-        onclick={toggleSoftVolume}
-      >
-        <span class="h-2 w-2 rounded-full {softVolumeEnabled ? 'bg-warn' : 'bg-line'}" aria-hidden="true"></span>
-        Software volume
-      </button>
-    {/if}
-
-    <!-- An output setting like the ones beside it: it works through the device volume. -->
-    <select
-      class="shrink-0 rounded-lg border border-line bg-raised px-3 py-1.5 text-sm outline-none focus:border-accent {replayGain ===
-      'off'
-        ? 'text-muted'
-        : 'text-accent'}"
-      aria-label="ReplayGain"
-      title={GAIN_TITLE[replayGain]}
-      value={replayGain}
-      onchange={(e) => void changeReplayGain(e.currentTarget.value as GainMode)}
-    >
-      <option value="off">ReplayGain off</option>
-      <option value="track">ReplayGain by track</option>
-      <option value="album">ReplayGain by album</option>
-    </select>
-
-    <button
-      class="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted hover:bg-raised hover:text-ink"
-      title="Mini player: a small window that stays on top"
-      aria-label="Mini player"
-      onclick={() => api.openMiniPlayer().catch(showError)}
-    >
-      <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
-        <rect x="3" y="5" width="18" height="14" rx="2" />
-        <rect x="12" y="11" width="6" height="5" rx="1" fill="currentColor" stroke="none" />
-      </svg>
-    </button>
-  </header>
-
-  {#if error}
-    <div class="flex items-start gap-3 border-b border-bad/30 bg-bad/10 px-5 py-2.5 text-sm text-bad">
-      <span class="flex-1 select-text">{error}</span>
-      <button class="text-bad/70 hover:text-bad" onclick={() => (error = null)} aria-label="Dismiss">✕</button>
-    </div>
-  {/if}
-
   <div class="flex min-h-0 flex-1">
-    <!-- Sidebar: queue and playlists -->
-    <nav class="flex w-52 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-line bg-panel p-3 text-sm">
-      <div class="relative mb-2">
-        <svg viewBox="0 0 24 24" class="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-          <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
-        </svg>
+    <!-- Sidebar: search, the library, playlists, and the output with the settings -->
+    <nav class="flex w-60 shrink-0 flex-col border-r border-line bg-panel text-sm">
+      <div class="flex items-center gap-2.5 px-5 pb-3 pt-4">
+        <img src={appIcon} alt="" class="h-7 w-7" draggable="false" />
+        <span class="mr-auto text-[15px] font-semibold tracking-tight">MDMusic</span>
+        <button
+          class="grid h-8 w-8 place-items-center rounded-lg text-muted transition-colors hover:bg-raised hover:text-ink"
+          title="Mini player: a small window that stays on top"
+          aria-label="Mini player"
+          onclick={() => api.openMiniPlayer().catch(showError)}
+        >
+          <Icon name="mini" class="h-4 w-4" />
+        </button>
+      </div>
+
+      <div class="relative mx-3 mb-3">
+        <Icon name="search" class="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
         <input
           bind:this={searchInput}
           bind:value={searchQuery}
@@ -1077,7 +1081,7 @@
             if (e.key === "Escape") clearSearch();
           }}
           type="search"
-          class="w-full rounded-lg border border-line bg-raised py-1.5 pl-8 pr-7 outline-none placeholder:text-muted focus:border-accent [&::-webkit-search-cancel-button]:hidden"
+          class="w-full rounded-lg border border-transparent bg-raised py-2 pl-8 pr-7 outline-none transition-colors placeholder:text-muted hover:border-line focus:border-accent [&::-webkit-search-cancel-button]:hidden"
           placeholder={libraryTracks ? `Search ${libraryTracks.toLocaleString()} tracks` : "Search"}
           aria-label="Search all playlists"
           title="Search every playlist by title, artist, album, file or folder name (Ctrl+F)"
@@ -1088,402 +1092,456 @@
             onclick={clearSearch}
             aria-label="Clear search"
           >
-            ✕
+            <Icon name="close" class="h-3.5 w-3.5" />
           </button>
         {/if}
       </div>
 
-      <button
-        class="flex items-center justify-between rounded-lg px-3 py-2 text-left {view === 'queue'
-          ? 'bg-raised font-medium text-ink'
-          : 'text-muted hover:bg-raised hover:text-ink'}"
-        onclick={() => show("queue")}
-      >
-        <span>Queue</span>
-        {#if queue.length > 0}<span class="text-xs tabular-nums text-muted">{queue.length}</span>{/if}
-      </button>
+      <div class="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-3 pb-3">
+        {@render navItem("Queue", "queue", view === "queue", () => show("queue"), queue.length)}
+        {@render navItem("Albums", "album", browsing === "albums", () => show({ kind: "albums" }))}
+        {@render navItem("Artists", "artist", browsing === "artists", () => show({ kind: "artists" }))}
 
-      <p class="px-3 pb-1 pt-4 text-xs font-medium uppercase tracking-wider text-muted">Library</p>
-      {#each [{ kind: "albums", label: "Albums" }, { kind: "artists", label: "Artists" }] as const as entry (entry.kind)}
-        <button
-          class="rounded-lg px-3 py-2 text-left {browsing === entry.kind
-            ? 'bg-raised font-medium text-ink'
-            : 'text-muted hover:bg-raised hover:text-ink'}"
-          onclick={() => show({ kind: entry.kind })}
-        >
-          {entry.label}
-        </button>
-      {/each}
+        <div class="flex items-center justify-between pb-1 pl-3 pr-1 pt-5">
+          <p class="text-xs font-medium uppercase tracking-wider text-muted">Playlists</p>
+          <button
+            class="grid h-6 w-6 place-items-center rounded-md text-muted transition-colors hover:bg-raised hover:text-ink"
+            title="New playlist"
+            aria-label="New playlist"
+            onclick={() => (newName = "")}
+          >
+            <Icon name="plus" class="h-4 w-4" />
+          </button>
+        </div>
+        {#each playlists as item, index (item.id)}
+          {@const line = playlistDrag.line(index)}
+          <button
+            bind:this={navRows[index]}
+            class="flex items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors duration-150 {view === item.id
+              ? 'bg-raised font-medium text-ink'
+              : playlistDrag.active
+                ? 'text-muted'
+                : 'text-muted hover:bg-raised/70 hover:text-ink'} {playlistDrag.active &&
+            playlistDrag.dragging.includes(index)
+              ? 'opacity-40'
+              : ''} {line === 'above'
+              ? 'shadow-[inset_0_2px_0_var(--color-accent)]'
+              : line === 'below'
+                ? 'shadow-[inset_0_-2px_0_var(--color-accent)]'
+                : ''}"
+            onclick={() => {
+              if (!playlistDrag.endedDrag()) show(item.id);
+            }}
+            oncontextmenu={(e) => onPlaylistContextMenu(e, item.id)}
+            onpointerdown={(e) => playlistDrag.down(e, [index])}
+            onpointermove={(e) => playlistDrag.move(e)}
+            onpointerup={(e) => playlistDrag.up(e)}
+            onpointercancel={(e) => playlistDrag.cancel(e)}
+            title="{item.name} (drag to reorder, right-click for more)"
+          >
+            <Icon name="playlist" class="h-[18px] w-[18px] {view === item.id ? 'text-accent' : ''}" />
+            <span class="min-w-0 flex-1 truncate">{item.name}</span>
+            {#if scanning.has(item.id)}
+              <span class="appear-late flex"><Spinner /></span>
+            {/if}
+          </button>
+        {/each}
 
-      <p class="px-3 pb-1 pt-4 text-xs font-medium uppercase tracking-wider text-muted">Playlists</p>
-      {#each playlists as item, index (item.id)}
-        {@const line = playlistDrag.line(index)}
-        <button
-          bind:this={navRows[index]}
-          class="flex items-center gap-2 rounded-lg px-3 py-2 text-left {view === item.id
-            ? 'bg-raised font-medium text-ink'
-            : playlistDrag.active
-              ? 'text-muted'
-              : 'text-muted hover:bg-raised hover:text-ink'} {playlistDrag.active && playlistDrag.dragging.includes(index)
-            ? 'opacity-40'
-            : ''} {line === 'above'
-            ? 'shadow-[inset_0_2px_0_var(--color-accent)]'
-            : line === 'below'
-              ? 'shadow-[inset_0_-2px_0_var(--color-accent)]'
-              : ''}"
-          onclick={() => {
-            if (!playlistDrag.endedDrag()) show(item.id);
-          }}
-          onpointerdown={(e) => playlistDrag.down(e, [index])}
-          onpointermove={(e) => playlistDrag.move(e)}
-          onpointerup={(e) => playlistDrag.up(e)}
-          onpointercancel={(e) => playlistDrag.cancel(e)}
-          title="{item.name} (drag to reorder)"
-        >
-          <span class="min-w-0 flex-1 truncate">{item.name}</span>
-          {#if scanning.has(item.id)}
-            <span class="appear-late flex"><Spinner /></span>
-          {/if}
-        </button>
-      {/each}
+        {#if newName !== null}
+          <input
+            class="mt-0.5 rounded-lg border border-accent bg-raised px-3 py-1.5 outline-none"
+            placeholder="Playlist name"
+            bind:value={newName}
+            use:focusOnMount
+            onblur={createPlaylist}
+            onkeydown={(e) => {
+              if (e.key === "Enter") void createPlaylist();
+              else if (e.key === "Escape") newName = null;
+            }}
+          />
+        {:else if playlists.length === 0}
+          <button
+            class="mx-1 mt-1 rounded-lg border border-dashed border-line px-3 py-3 text-left text-xs leading-relaxed text-muted transition-colors hover:border-accent/50 hover:text-ink"
+            onclick={() => (newName = "")}
+          >
+            <span class="block text-sm font-medium text-ink">Create a playlist</span>
+            Add your music folders to it, and they fill Albums, Artists and search too.
+          </button>
+        {/if}
+      </div>
 
-      {#if newName !== null}
-        <input
-          class="rounded-lg border border-accent bg-raised px-3 py-1.5 outline-none"
-          placeholder="Playlist name"
-          bind:value={newName}
-          use:focusOnMount
-          onblur={createPlaylist}
-          onkeydown={(e) => {
-            if (e.key === "Enter") void createPlaylist();
-            else if (e.key === "Escape") newName = null;
-          }}
-        />
-      {:else}
+      <!-- The output at a glance; clicking it opens its settings. -->
+      <div class="flex items-center gap-1 border-t border-line p-3">
         <button
-          class="rounded-lg px-3 py-2 text-left text-muted hover:bg-raised hover:text-ink"
-          onclick={() => (newName = "")}
+          class="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg p-2 text-left transition-colors hover:bg-raised"
+          title="Output settings: device, mode and volume"
+          onclick={() => openSettings("output")}
         >
-          + New playlist
+          <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-raised text-accent">
+            <Icon name="speaker" class="h-4 w-4" />
+          </span>
+          <span class="min-w-0">
+            <span class="block truncate text-[13px] font-medium" title={deviceLabel}>{deviceLabel}</span>
+            <span class="block truncate text-[11px] text-muted">{outputSummary}</span>
+          </span>
         </button>
-      {/if}
+        <button
+          class="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-raised hover:text-ink"
+          title="Settings (Ctrl+,)"
+          aria-label="Settings"
+          onclick={() => openSettings()}
+        >
+          <Icon name="settings" class="h-[18px] w-[18px]" />
+        </button>
+      </div>
     </nav>
 
-    <main class="relative min-w-0 flex-1 overflow-y-auto">
-      {#if view === "search"}
-        <!-- Search: tracks of every playlist matching what was typed -->
-        <div class="px-6 pb-3 pt-5">
-          <!-- `min-h-8` holds the row's height while the button is away (nothing found yet). -->
-          <div class="flex min-h-8 items-center gap-3">
-            <h1 class="min-w-0 flex-1 truncate text-xl font-semibold">Search</h1>
-            {#if searchResults && searchResults.length > 0}
-              <button
-                class="rounded-lg bg-accent px-3.5 py-1.5 text-sm font-medium text-base hover:brightness-110"
-                onclick={() => searchResults && playTracks(searchResults, 0)}
-              >
-                Play all
-              </button>
-            {/if}
-          </div>
-          <p class="mt-1 min-h-4 text-xs text-muted" role="status">
-            {#if searching && !searchResults}
-              <span class="inline-flex items-center gap-1.5 align-middle"><Spinner /> Searching…</span>
-            {:else if searchResults}
-              {searchResults.length >= 500 ? "The first 500 tracks" : count(searchResults.length)} for “{searchQuery.trim()}”
-              {#if libraryTracks !== null}· searched {libraryTracks.toLocaleString()} tracks in your playlists{/if}
-            {/if}
-          </p>
-        </div>
-        {#if searchResults && searchResults.length > 0}
-          <TrackTable
-            tracks={searchResults}
-            currentPath={currentTrack?.path ?? null}
-            playing={playState === "playing"}
-            onplay={(index) => searchResults && playTracks(searchResults, index)}
-            onmenu={(rows, x, y) => searchResults && openTrackMenu(searchResults, rows, x, y)}
-          />
-        {:else if searchResults}
-          <div class="px-6 py-12 text-center text-sm text-muted">
-            <p>Nothing matches. Every word has to appear in the title, artist, album, file or folder name.</p>
-            {#if libraryTracks === 0}
-              <p class="mt-1.5">Search looks through your playlists, and they have no tracks yet.</p>
-            {/if}
-          </div>
-        {/if}
-      {:else if isBrowse(view)}
-        <!-- The library: albums and artists from every playlist's tracks -->
-        <LibraryView
-          {view}
-          version={libraryVersion}
-          currentPath={currentTrack?.path ?? null}
-          playing={playState === "playing"}
-          onnavigate={(next) => (view = next)}
-          onplay={(tracks, index) => playTracks(tracks, index)}
-          onqueue={async (paths) => {
-            const added = await addToQueue(paths);
-            if (added) showNotice(`Added ${count(added)} to the queue`);
-          }}
-          onmenu={(tracks, rows, x, y) => openTrackMenu(tracks, rows, x, y)}
-          onerror={showError}
-        />
-      {:else if playlist}
-        <!-- A playlist: its folders and the tracks found in them -->
-        <div class="px-6 pb-3 pt-5">
-          <!-- The actions wrap under the name when the list is narrow, instead of pushing out of view. -->
-          <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-            {#if renaming !== null}
-              <input
-                class="min-w-0 flex-1 basis-40 rounded-lg border border-accent bg-raised px-3 py-1 text-xl font-semibold outline-none"
-                bind:value={renaming}
-                use:focusOnMount
-                onblur={renamePlaylist}
-                onkeydown={(e) => {
-                  if (e.key === "Enter") void renamePlaylist();
-                  else if (e.key === "Escape") renaming = null;
-                }}
-              />
-            {:else}
-              <h1 class="min-w-0 flex-1 basis-40 truncate text-xl font-semibold" title={playlist.name}>{playlist.name}</h1>
-            {/if}
-            <div class="flex flex-wrap gap-1 text-sm">
-              <button
-                class="rounded-lg bg-accent px-3.5 py-1.5 font-medium text-base hover:brightness-110 disabled:opacity-40"
-                disabled={!playlistTracks || playlistTracks.length === 0}
-                onclick={() => playlistTracks && playTracks(playlistTracks, 0)}
-              >
-                Play
-              </button>
-              <button class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink" onclick={pickFolders}>
-                Add folder
-              </button>
-              <button
-                class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink"
-                onclick={pickPlaylistFiles}
-              >
-                Add files
-              </button>
-              <button
-                class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink disabled:opacity-40"
-                disabled={playlistLoading}
-                title="Look in the folders again for new or removed files"
-                onclick={() => playlist && scan(playlist.id)}
-              >
-                Rescan
-              </button>
-              <button
-                class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink"
-                onclick={() => (renaming = playlist?.name ?? "")}
-              >
-                Rename
-              </button>
-              <button class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-bad/15 hover:text-bad" onclick={deletePlaylist}>
-                Delete
-              </button>
-            </div>
-          </div>
-
-          <!-- `min-h-4` keeps the line's height while it is blank during the first load. -->
-          <p class="mt-1 min-h-4 text-xs text-muted">
-            {#if playlistLoading}
-              <!-- The first load is shown in the list area below; this is a rescan over the old list. -->
-              {#if playlistTracks && playlistTracks.length > 0}
-                <span class="inline-flex items-center gap-1.5 align-middle" role="status">
-                  <Spinner /> Scanning folders…
-                </span>
-              {/if}
-            {:else if playlistTracks}
-              {playlistTracks.length} {playlistTracks.length === 1 ? "track" : "tracks"}
-              · {formatTime(playlistTracks.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
-              {#if playlist.files.length > 0}
-                <!-- Rows mark only single files; folder tracks, the usual case, go unmarked. -->
-                <span class="ml-3 inline-flex items-center gap-1.5 align-middle">
-                  <SourceMark kind="file" /> added as a single file
-                </span>
-              {/if}
-            {/if}
-          </p>
-
-          {#if playlist.folders.length > 0}
-            <ul class="mt-3 flex flex-wrap gap-2">
-              {#each playlist.folders as folder (folder)}
-                <li class="flex max-w-full items-center gap-1.5 rounded-full border border-line bg-raised py-1 pl-3 pr-1.5 text-xs">
-                  <span class="truncate" title={folder}>{folder}</span>
-                  <button
-                    class="grid h-4 w-4 shrink-0 place-items-center rounded-full text-muted hover:bg-line hover:text-ink"
-                    title="Remove this folder from the playlist"
-                    aria-label="Remove folder {folder}"
-                    onclick={() => removeFolder(folder)}
-                  >
-                    ✕
-                  </button>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        </div>
-
-        {#if playlist.folders.length === 0 && playlist.files.length === 0}
-          <div class="grid place-items-center px-8 py-16 text-center">
-            <div class="max-w-sm">
-              <p class="text-lg font-medium">This playlist is empty</p>
-              <p class="mt-1.5 text-sm text-muted">
-                Add a folder and every audio file inside it, subfolders included, becomes part of the playlist. Add
-                single tracks with Add files, by dropping them here, or by right-clicking any track.
-              </p>
-              <div class="mt-5 flex justify-center gap-2">
-                <button
-                  class="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-base hover:brightness-110"
-                  onclick={pickFolders}
-                >
-                  Add folder
-                </button>
-                <button
-                  class="rounded-lg border border-line px-4 py-2 text-sm font-medium hover:bg-raised"
-                  onclick={pickPlaylistFiles}
-                >
-                  Add files
-                </button>
-              </div>
-            </div>
-          </div>
-        {:else if playlistTracks && playlistTracks.length > 0}
-          <TrackTable
-            tracks={playlistTracks}
-            currentPath={currentTrack?.path ?? null}
-            playing={playState === "playing"}
-            onplay={(index) => playTracks(playlistTracks, index)}
-            onmenu={(rows, x, y) => openTrackMenu(playlistTracks, rows, x, y)}
-            ondelete={(rows) => deleteRows(playlistTracks, rows)}
-            source={(track) => (playlist && holdsFile(playlist, track.path) ? "file" : "folder")}
-            sort={playlistSort}
-            onsort={sortPlaylist}
-          />
-        {:else if playlistLoading}
-          <div class="appear-late flex flex-col items-center gap-3 px-6 py-16 text-sm text-muted" role="status">
-            <Spinner class="h-6 w-6" />
-            <p>Loading tracks…</p>
-          </div>
-        {:else if playlistTracks}
-          <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found for this playlist.</p>
-        {/if}
-      {:else if queue.length === 0}
-        <div class="grid h-full place-items-center p-8">
-          <div class="max-w-sm text-center">
-            <p class="text-lg font-medium">Nothing in the queue</p>
-            <p class="mt-1.5 text-sm text-muted">
-              Drop audio files or folders here, or pick files. FLAC, WAV, AIFF, ALAC, MP3, AAC, Ogg, DSF and DFF are
-              supported.
-            </p>
-            <button
-              class="mt-5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-base hover:brightness-110"
-              onclick={pickFiles}
-            >
-              Add files
-            </button>
-          </div>
-        </div>
-      {:else}
-        <!-- Same header shape as a playlist: name and actions, then a count line. -->
-        <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-6 pt-5">
-          <h1 class="text-xl font-semibold">Queue</h1>
-          <div class="flex gap-1 text-sm">
-            <button class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink" onclick={pickFiles}>
-              Add files
-            </button>
-            <button class="rounded-lg px-2.5 py-1.5 text-muted hover:bg-raised hover:text-ink" onclick={clearQueue}>
-              Clear
-            </button>
-          </div>
-        </div>
-        <p class="mt-1 px-6 pb-3 text-xs text-muted">
-          {count(queue.length)} · {formatTime(queue.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
-        </p>
-        <TrackTable
-          tracks={queue}
-          currentPath={currentTrack?.path ?? null}
-          playing={playState === "playing"}
-          onplay={playQueue}
-          onmenu={(rows, x, y) => openTrackMenu(queue, rows, x, y)}
-          ondelete={(rows) => deleteRows(queue, rows)}
-          onmove={moveInQueue}
-        />
-      {/if}
-
-      {#if dragging}
-        <div class="pointer-events-none absolute inset-3 grid place-items-center rounded-2xl border-2 border-dashed border-accent bg-accent/10">
-          <p class="font-medium text-accent">
-            {playlist ? `Drop folders or files to add them to "${playlist.name}"` : "Drop to add to the queue"}
-          </p>
-        </div>
-      {/if}
-
-      {#if notice}
+    <div class="flex min-w-0 flex-1 flex-col">
+      {#if error}
         <div
-          class="pointer-events-none sticky bottom-4 mx-auto w-fit rounded-full border border-line bg-raised px-4 py-2 text-sm shadow-lg shadow-black/40"
-          role="status"
+          class="flex items-start gap-3 border-b border-bad/25 bg-bad/10 px-5 py-2.5 text-sm text-bad"
+          role="alert"
+          transition:slide={{ duration: 180 }}
         >
-          {notice}
+          <Icon name="alert" class="mt-0.5 h-4 w-4" />
+          <span class="flex-1 select-text">{error}</span>
+          <button
+            class="grid h-6 w-6 place-items-center rounded text-bad/70 hover:bg-bad/15 hover:text-bad"
+            onclick={() => (error = null)}
+            aria-label="Dismiss"
+          >
+            <Icon name="close" class="h-3.5 w-3.5" />
+          </button>
         </div>
       {/if}
-    </main>
+
+      <main class="relative min-h-0 flex-1 overflow-y-auto">
+        <!-- A soft fade between pages. Library pages share one key, so the albums stay loaded. -->
+        {#key view === "search" ? "search" : isBrowse(view) ? "library" : view}
+          <div in:fade={{ duration: 140 }}>
+            {#if view === "search"}
+              <!-- Search: tracks of every playlist matching what was typed -->
+              <div class="px-7 pb-3 pt-6">
+                <div class="flex min-h-9 items-end gap-3">
+                  <div class="min-w-0 flex-1">
+                    {@render pageTitle("Search", `“${searchQuery.trim()}”`)}
+                  </div>
+                  {#if searchResults && searchResults.length > 0}
+                    <button
+                      class="flex items-center gap-2 rounded-full bg-accent px-4 py-2 text-sm font-medium text-base transition hover:brightness-110"
+                      onclick={() => searchResults && playTracks(searchResults, 0)}
+                    >
+                      <Icon name="play" class="h-4 w-4" /> Play all
+                    </button>
+                  {/if}
+                </div>
+                <p class="mt-1.5 min-h-4 text-xs text-muted" role="status">
+                  {#if searching && !searchResults}
+                    <span class="inline-flex items-center gap-1.5 align-middle"><Spinner /> Searching…</span>
+                  {:else if searchResults}
+                    {searchResults.length >= 500 ? "The first 500 tracks" : count(searchResults.length)}
+                    {#if libraryTracks !== null}· searched {libraryTracks.toLocaleString()} tracks in your playlists{/if}
+                  {/if}
+                </p>
+              </div>
+              {#if searchResults && searchResults.length > 0}
+                <TrackTable
+                  tracks={searchResults}
+                  currentPath={currentTrack?.path ?? null}
+                  playing={playState === "playing"}
+                  onplay={(index) => searchResults && playTracks(searchResults, index)}
+                  onmenu={(rows, x, y) => searchResults && openTrackMenu(searchResults, rows, x, y)}
+                />
+              {:else if searchResults}
+                <div class="grid place-items-center px-8 py-16 text-center">
+                  <div class="max-w-sm">
+                    <span class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-raised text-muted">
+                      <Icon name="search" class="h-6 w-6" />
+                    </span>
+                    <p class="mt-4 text-lg font-medium">No matches</p>
+                    <p class="mt-1.5 text-sm text-muted">
+                      Every word has to appear in the title, artist, album, file or folder name.
+                      {#if libraryTracks === 0}Search looks through your playlists, and they have no tracks yet.{/if}
+                    </p>
+                  </div>
+                </div>
+              {/if}
+            {:else if isBrowse(view)}
+              <!-- The library: albums and artists from every playlist's tracks -->
+              <LibraryView
+                {view}
+                version={libraryVersion}
+                currentPath={currentTrack?.path ?? null}
+                playing={playState === "playing"}
+                onnavigate={(next) => (view = next)}
+                onplay={(tracks, index) => playTracks(tracks, index)}
+                onqueue={async (paths) => {
+                  const added = await addToQueue(paths);
+                  if (added) showNotice(`Added ${count(added)} to the queue`);
+                }}
+                onmenu={(tracks, rows, x, y) => openTrackMenu(tracks, rows, x, y)}
+                onerror={showError}
+              />
+            {:else if playlist}
+              <!-- A playlist: its folders and the tracks found in them -->
+              <div class="px-7 pb-3 pt-6">
+                <div class="flex flex-wrap items-end gap-5">
+                  <span
+                    class="grid h-28 w-28 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-accent/60 via-accent/25 to-raised text-ink shadow-lg shadow-black/40"
+                  >
+                    <Icon name="playlist" class="h-10 w-10" />
+                  </span>
+                  <div class="min-w-0 flex-1 basis-60">
+                    <p class="text-xs font-medium uppercase tracking-wider text-muted">Playlist</p>
+                    {#if renaming !== null}
+                      <input
+                        class="mt-1 w-full rounded-lg border border-accent bg-raised px-2.5 py-0.5 text-2xl font-semibold tracking-tight outline-none"
+                        bind:value={renaming}
+                        use:focusOnMount
+                        onblur={renamePlaylist}
+                        onkeydown={(e) => {
+                          if (e.key === "Enter") void renamePlaylist();
+                          else if (e.key === "Escape") renaming = null;
+                        }}
+                      />
+                    {:else}
+                      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                      <h1
+                        class="mt-1 truncate text-2xl font-semibold tracking-tight"
+                        title="{playlist.name} (double-click to rename)"
+                        ondblclick={() => (renaming = playlist?.name ?? "")}
+                      >
+                        {playlist.name}
+                      </h1>
+                    {/if}
+                    <!-- `min-h-4` keeps the line's height while it is blank during the first load. -->
+                    <p class="mt-1.5 min-h-4 text-xs text-muted">
+                      {#if playlistLoading}
+                        <!-- The first load is shown in the list area below; this is a rescan over the old list. -->
+                        {#if playlistTracks && playlistTracks.length > 0}
+                          <span class="inline-flex items-center gap-1.5 align-middle" role="status">
+                            <Spinner /> Scanning folders…
+                          </span>
+                        {/if}
+                      {:else if playlistTracks}
+                        {count(playlistTracks.length)}
+                        · {formatTime(playlistTracks.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
+                        {#if playlist.files.length > 0}
+                          <!-- Rows mark only single files; folder tracks, the usual case, go unmarked. -->
+                          <span class="ml-3 inline-flex items-center gap-1.5 align-middle">
+                            <SourceMark kind="file" /> added as a single file
+                          </span>
+                        {/if}
+                      {/if}
+                    </p>
+                    <div class="mt-3 flex flex-wrap items-center gap-1.5 text-sm">
+                      <button
+                        class="flex items-center gap-2 rounded-full bg-accent px-4 py-2 font-medium text-base transition hover:brightness-110 disabled:opacity-40 disabled:hover:brightness-100"
+                        disabled={!playlistTracks || playlistTracks.length === 0}
+                        onclick={() => playlistTracks && playTracks(playlistTracks, 0)}
+                      >
+                        <Icon name="play" class="h-4 w-4" /> Play
+                      </button>
+                      <button
+                        class="flex items-center gap-2 rounded-full border border-line px-3.5 py-2 transition-colors hover:bg-raised"
+                        onclick={pickFolders}
+                      >
+                        <Icon name="folder" class="h-4 w-4 text-muted" /> Add folder
+                      </button>
+                      <button
+                        class="flex items-center gap-2 rounded-full border border-line px-3.5 py-2 transition-colors hover:bg-raised"
+                        onclick={pickPlaylistFiles}
+                      >
+                        <Icon name="file" class="h-4 w-4 text-muted" /> Add files
+                      </button>
+                      <button
+                        class="grid h-9 w-9 place-items-center rounded-full text-muted transition-colors hover:bg-raised hover:text-ink"
+                        title="More: rescan, rename, delete"
+                        aria-label="More playlist actions"
+                        aria-haspopup="menu"
+                        onclick={openPlaylistMenu}
+                      >
+                        <Icon name="more" class="h-5 w-5" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {#if playlist.folders.length > 0}
+                  <ul class="mt-5 flex flex-wrap gap-2">
+                    {#each playlist.folders as folder (folder)}
+                      <li
+                        class="flex max-w-full items-center gap-1.5 rounded-full border border-line bg-raised/60 py-1 pl-2.5 pr-1 text-xs"
+                        transition:fade={{ duration: 120 }}
+                      >
+                        <Icon name="folder" class="h-3.5 w-3.5 text-muted" />
+                        <span class="truncate" title={folder}>{folder}</span>
+                        <button
+                          class="grid h-5 w-5 shrink-0 place-items-center rounded-full text-muted hover:bg-line hover:text-ink"
+                          title="Remove this folder from the playlist"
+                          aria-label="Remove folder {folder}"
+                          onclick={() => removeFolder(folder)}
+                        >
+                          <Icon name="close" class="h-3 w-3" />
+                        </button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+
+              {#if playlist.folders.length === 0 && playlist.files.length === 0}
+                <div class="grid place-items-center px-8 py-12 text-center">
+                  <div class="max-w-sm">
+                    <span class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-raised text-accent">
+                      <Icon name="folder" class="h-6 w-6" />
+                    </span>
+                    <p class="mt-4 text-lg font-medium">This playlist is empty</p>
+                    <p class="mt-1.5 text-sm text-muted">
+                      Add a folder and every audio file inside it, subfolders included, becomes part of the playlist. Add
+                      single tracks with Add files, by dropping them here, or by right-clicking any track.
+                    </p>
+                  </div>
+                </div>
+              {:else if playlistTracks && playlistTracks.length > 0}
+                <TrackTable
+                  tracks={playlistTracks}
+                  currentPath={currentTrack?.path ?? null}
+                  playing={playState === "playing"}
+                  onplay={(index) => playTracks(playlistTracks, index)}
+                  onmenu={(rows, x, y) => openTrackMenu(playlistTracks, rows, x, y)}
+                  ondelete={(rows) => deleteRows(playlistTracks, rows)}
+                  source={(track) => (playlist && holdsFile(playlist, track.path) ? "file" : "folder")}
+                  sort={playlistSort}
+                  onsort={sortPlaylist}
+                />
+              {:else if playlistLoading}
+                <div class="appear-late flex flex-col items-center gap-3 px-6 py-16 text-sm text-muted" role="status">
+                  <Spinner class="h-6 w-6" />
+                  <p>Loading tracks…</p>
+                </div>
+              {:else if playlistTracks}
+                <p class="px-6 py-10 text-center text-sm text-muted">No audio files were found for this playlist.</p>
+              {/if}
+            {:else if queue.length === 0}
+              <div class="grid min-h-[calc(100vh-14rem)] place-items-center p-8">
+                <div class="max-w-sm text-center">
+                  <span class="mx-auto grid h-16 w-16 place-items-center rounded-full bg-raised text-accent">
+                    <Icon name="queue" class="h-7 w-7" />
+                  </span>
+                  <p class="mt-5 text-lg font-medium">Nothing in the queue</p>
+                  <p class="mt-1.5 text-sm text-muted">
+                    Drop audio files or folders here, pick files, or play an album from your library. FLAC, WAV, AIFF,
+                    ALAC, MP3, AAC, Ogg, DSF and DFF are supported.
+                  </p>
+                  <div class="mt-6 flex justify-center gap-2">
+                    <button
+                      class="flex items-center gap-2 rounded-full bg-accent px-4 py-2 text-sm font-medium text-base transition hover:brightness-110"
+                      onclick={pickFiles}
+                    >
+                      <Icon name="plus" class="h-4 w-4" /> Add files
+                    </button>
+                    <button
+                      class="flex items-center gap-2 rounded-full border border-line px-4 py-2 text-sm transition-colors hover:bg-raised"
+                      onclick={() => show({ kind: "albums" })}
+                    >
+                      <Icon name="album" class="h-4 w-4 text-muted" /> Browse albums
+                    </button>
+                  </div>
+                </div>
+              </div>
+            {:else}
+              <div class="flex flex-wrap items-end justify-between gap-x-3 gap-y-2 px-7 pb-3 pt-6">
+                <div class="min-w-0">
+                  {@render pageTitle("Playing from", "Queue")}
+                  <p class="mt-1.5 text-xs text-muted">
+                    {count(queue.length)} · {formatTime(queue.reduce((sum, t) => sum + (t.duration_ms ?? 0), 0))}
+                  </p>
+                </div>
+                <div class="flex gap-1.5 text-sm">
+                  <button
+                    class="flex items-center gap-2 rounded-full border border-line px-3.5 py-2 transition-colors hover:bg-raised"
+                    onclick={pickFiles}
+                  >
+                    <Icon name="plus" class="h-4 w-4 text-muted" /> Add files
+                  </button>
+                  <button
+                    class="flex items-center gap-2 rounded-full px-3.5 py-2 text-muted transition-colors hover:bg-bad/10 hover:text-bad"
+                    onclick={clearQueue}
+                  >
+                    <Icon name="trash" class="h-4 w-4" /> Clear
+                  </button>
+                </div>
+              </div>
+              <TrackTable
+                tracks={queue}
+                currentPath={currentTrack?.path ?? null}
+                playing={playState === "playing"}
+                onplay={playQueue}
+                onmenu={(rows, x, y) => openTrackMenu(queue, rows, x, y)}
+                ondelete={(rows) => deleteRows(queue, rows)}
+                onmove={moveInQueue}
+              />
+            {/if}
+          </div>
+        {/key}
+
+        {#if dragging}
+          <div
+            class="pointer-events-none absolute inset-3 grid place-items-center rounded-2xl border-2 border-dashed border-accent bg-accent/10"
+            transition:fade={{ duration: 120 }}
+          >
+            <p class="font-medium text-accent">
+              {playlist ? `Drop folders or files to add them to "${playlist.name}"` : "Drop to add to the queue"}
+            </p>
+          </div>
+        {/if}
+      </main>
+    </div>
 
     {#if showPanel}
-      <NowPlaying
-        track={currentTrack}
-        {positionMs}
-        onseek={seekTo}
-        {disc}
-        playing={playState === "playing"}
-        ontoggledisc={toggleDisc}
-      />
+      <div class="flex shrink-0" transition:fly={{ x: 40, duration: 200, easing: cubicOut }}>
+        <NowPlaying
+          track={currentTrack}
+          {positionMs}
+          onseek={seekTo}
+          {disc}
+          playing={playState === "playing"}
+          ontoggledisc={toggleDisc}
+        />
+      </div>
     {/if}
   </div>
 
-  <!-- Transport -->
-  <footer class="border-t border-line bg-panel px-5 pb-4 pt-3">
-    <div class="flex items-center gap-3">
-      <span class="w-12 text-right text-xs tabular-nums text-muted">{formatTime(shownMs)}</span>
-      <input
-        class="seek flex-1"
-        type="range"
-        min="0"
-        max={durationMs ?? 0}
-        step="any"
-        value={shownMs}
-        style="--fill: {fill}%"
-        disabled={!durationMs || playState === "stopped"}
-        aria-label="Seek"
-        oninput={(e) => (scrubMs = Math.round(Number(e.currentTarget.value)))}
-        onchange={commitSeek}
+  <!-- Transport: the track on the left, the controls and the seek bar in the middle, the output on the right -->
+  <footer
+    class="grid grid-cols-[minmax(0,1fr)_minmax(15rem,34rem)_minmax(0,1fr)] items-center gap-6 border-t border-line bg-panel px-4 py-3"
+  >
+    <div class="flex min-w-0 items-center gap-3">
+      <Cover
+        path={currentTrack?.path ?? null}
+        class="h-14 w-14 shrink-0 rounded-lg shadow-md shadow-black/30"
+        {disc}
+        spinning={playState === "playing"}
+        onclick={toggleDisc}
+        title={disc ? "Click for the square cover" : "Click to spin the cover like a record"}
       />
-      <span class="w-12 text-xs tabular-nums text-muted">{durationMs ? formatTime(durationMs) : "–:––"}</span>
+      {#if currentTrack}
+        <button class="group min-w-0 text-left" title="Show in the queue" onclick={revealCurrent}>
+          <p class="truncate text-sm font-medium group-hover:underline">{currentTrack.title}</p>
+          {#if currentTrack.artist}
+            <p class="mt-0.5 truncate text-xs text-muted">{currentTrack.artist}</p>
+          {/if}
+        </button>
+      {:else}
+        <p class="min-w-0 truncate text-sm text-muted">Not playing</p>
+      {/if}
     </div>
 
-    <div class="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-4">
-      <div class="flex min-w-0 items-center gap-3">
-        <Cover
-          path={currentTrack?.path ?? null}
-          class="h-11 w-11 shrink-0 rounded-md"
-          {disc}
-          spinning={playState === "playing"}
-          onclick={toggleDisc}
-          title={disc ? "Click for the square cover" : "Click to spin the cover like a record"}
-        />
-        {#if currentTrack}
-          <button class="group min-w-0 text-left" title="Show in the queue" onclick={revealCurrent}>
-            <p class="truncate text-sm font-medium group-hover:underline">{currentTrack.title}</p>
-            {#if currentTrack.artist}
-              <p class="mt-0.5 truncate text-xs text-muted">{currentTrack.artist}</p>
-            {/if}
-          </button>
-        {:else}
-          <p class="min-w-0 truncate text-sm font-medium text-muted">Not playing</p>
-        {/if}
-      </div>
-
-      <div class="flex items-center gap-2">
+    <div class="flex min-w-0 flex-col items-center gap-1.5">
+      <div class="flex items-center gap-3">
         <button
-          class="relative grid h-9 w-9 place-items-center rounded-full hover:bg-raised {shuffle
+          class="relative grid h-8 w-8 place-items-center rounded-full transition-colors hover:bg-raised {shuffle
             ? 'text-accent'
             : 'text-muted hover:text-ink'}"
           onclick={toggleShuffle}
@@ -1491,119 +1549,150 @@
           aria-label="Shuffle"
           title={shuffle ? "Shuffle is on: next plays a random track" : "Shuffle is off"}
         >
-          <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
-          </svg>
-          {#if shuffle}<span class="absolute bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
+          <Icon name="shuffle" class="h-4 w-4" />
+          {#if shuffle}<span class="absolute -bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
         </button>
         <button
-          class="grid h-9 w-9 place-items-center rounded-full text-muted hover:bg-raised hover:text-ink disabled:opacity-40"
+          class="grid h-9 w-9 place-items-center rounded-full text-muted transition-colors hover:bg-raised hover:text-ink disabled:opacity-40"
           onclick={() => api.previous().catch(showError)}
           disabled={queue.length === 0}
           aria-label="Previous"
+          title="Previous"
         >
-          <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M6 5h2v14H6zM20 5v14L9 12z" /></svg>
+          <Icon name="previous" class="h-5 w-5" />
         </button>
         <button
-          class="grid h-11 w-11 place-items-center rounded-full bg-ink text-base hover:scale-105 disabled:opacity-40"
+          class="grid h-11 w-11 place-items-center rounded-full bg-ink text-base shadow-lg shadow-black/30 transition-transform duration-150 enabled:hover:scale-105 enabled:active:scale-95 disabled:opacity-40"
           onclick={togglePlay}
           disabled={queue.length === 0}
           aria-label={playState === "playing" ? "Pause" : "Play"}
+          title={playState === "playing" ? "Pause (Space)" : "Play (Space)"}
         >
-          {#if playState === "playing"}
-            <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z" /></svg>
-          {:else}
-            <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
-          {/if}
+          <Icon name={playState === "playing" ? "pause" : "play"} class="h-5 w-5" />
         </button>
         <button
-          class="grid h-9 w-9 place-items-center rounded-full text-muted hover:bg-raised hover:text-ink disabled:opacity-40"
+          class="grid h-9 w-9 place-items-center rounded-full text-muted transition-colors hover:bg-raised hover:text-ink disabled:opacity-40"
           onclick={() => api.next().catch(showError)}
           disabled={queue.length === 0}
           aria-label="Next"
+          title="Next"
         >
-          <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z" /></svg>
+          <Icon name="next" class="h-5 w-5" />
         </button>
         <button
-          class="relative grid h-9 w-9 place-items-center rounded-full hover:bg-raised {repeat !== 'off'
+          class="relative grid h-8 w-8 place-items-center rounded-full transition-colors hover:bg-raised {repeat !== 'off'
             ? 'text-accent'
             : 'text-muted hover:text-ink'}"
           onclick={cycleRepeat}
           aria-label="Repeat: {repeat}"
           title={REPEAT_TITLE[repeat]}
         >
-          <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="m17 2 4 4-4 4M3 11V10a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v1a4 4 0 0 1-4 4H3" />
-          </svg>
+          <Icon name="repeat" class="h-4 w-4" />
           {#if repeat === "one"}
-            <span class="absolute right-1 top-1 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent text-[9px] font-bold leading-none text-base">1</span>
+            <span class="absolute right-0 top-0 grid h-3.5 w-3.5 place-items-center rounded-full bg-accent text-[9px] font-bold leading-none text-base">1</span>
           {/if}
-          {#if repeat !== "off"}<span class="absolute bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
+          {#if repeat !== "off"}<span class="absolute -bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
         </button>
       </div>
+      <div class="flex w-full items-center gap-2.5">
+        <span class="w-10 text-right text-[11px] tabular-nums text-muted">{formatTime(shownMs)}</span>
+        <input
+          class="seek flex-1"
+          type="range"
+          min="0"
+          max={durationMs ?? 0}
+          step="any"
+          value={shownMs}
+          style="--fill: {fill}%"
+          disabled={!durationMs || playState === "stopped"}
+          aria-label="Seek"
+          oninput={(e) => (scrubMs = Math.round(Number(e.currentTarget.value)))}
+          onchange={commitSeek}
+        />
+        <span class="w-10 text-[11px] tabular-nums text-muted">{durationMs ? formatTime(durationMs) : "–:––"}</span>
+      </div>
+    </div>
 
-      <!-- Signal path: what the file is, what the device receives -->
-      <div class="@container flex min-w-0 items-center justify-end gap-2 text-xs">
-        {#if signalPath && playState !== "stopped"}
-          <!-- When space runs out, the file side gives way; what the DAC receives stays. Below
-               28rem (the controls beside it take about 27rem) there is no room for either, and
-               the badge's tooltip carries the full path instead. -->
-          <span class="hidden min-w-0 overflow-hidden whitespace-nowrap text-muted @md:flex" title={signalTitle}>
-            <span class="truncate">{sourceLabel}</span><span class="shrink-0">&nbsp;→ {outputLabel}</span>
-          </span>
-          <span
-            class="shrink-0 rounded-full px-2.5 py-1 font-medium {signalPath.bit_perfect
-              ? 'bg-good/15 text-good'
-              : 'bg-warn/15 text-warn'}"
-            title={badgeTitle}
-          >
-            {signalPath.bit_perfect
-              ? "Bit-perfect"
-              : signalPath.eq
-                ? "EQ on"
-                : signalPath.soft_volume
-                  ? "Soft volume"
-                  : signalPath.exclusive
-                    ? "Exclusive"
-                    : "Shared"}
-          </span>
-        {/if}
+    <!-- Signal path: what the file is, what the device receives -->
+    <div class="@container flex min-w-0 items-center justify-end gap-1.5 text-xs">
+      {#if signalPath && playState !== "stopped"}
+        <!-- Only on wide windows; the badge's tooltip and Settings carry the full path otherwise. -->
+        <span class="hidden min-w-0 overflow-hidden whitespace-nowrap text-muted @min-[30rem]:flex" title={signalTitle}>
+          <span class="truncate">{sourceLabel}</span><span class="shrink-0">&nbsp;→ {outputLabel}</span>
+        </span>
         <button
-          class="relative grid h-8 shrink-0 place-items-center rounded-lg px-2 text-xs font-semibold tracking-wide hover:bg-raised disabled:opacity-40 {showEq ||
-          eq?.enabled
-            ? 'text-accent'
-            : 'text-muted hover:text-ink'}"
-          disabled={eq === null}
-          aria-pressed={showEq}
-          title={eq?.enabled ? "Equalizer is on: PCM is not bit-perfect" : "Equalizer (off)"}
-          onclick={() => (showEq = !showEq)}
+          class="flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 font-medium transition hover:brightness-125 {signalPath.bit_perfect
+            ? 'bg-good/15 text-good'
+            : 'bg-warn/15 text-warn'}"
+          title={`${badgeTitle}\n\nClick for the output settings.`}
+          onclick={() => openSettings(signalPath?.eq ? "equalizer" : "output")}
+          transition:fade={{ duration: 150 }}
         >
-          EQ
-          {#if eq?.enabled}<span class="absolute bottom-0.5 h-1 w-1 rounded-full bg-accent"></span>{/if}
+          {#if signalPath.bit_perfect}<Icon name="check" class="h-3 w-3" />{/if}
+          {badgeLabel}
         </button>
-        <VolumeControl bind:this={volumeControl} exclusive={mode === "exclusive"} onerror={showError} />
-        <button
-          class="grid h-8 w-8 shrink-0 place-items-center rounded-lg hover:bg-raised {showPanel
-            ? 'text-accent'
-            : 'text-muted hover:text-ink'}"
-          title={showPanel ? "Hide cover and lyrics" : "Show cover and lyrics"}
-          aria-pressed={showPanel}
-          onclick={() => {
-            showPanel = !showPanel;
-            panelAutoHidden = false;
-          }}
-        >
-          <svg viewBox="0 0 24 24" class="h-4.5 w-4.5" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" />
-          </svg>
-        </button>
-      </div>
+      {/if}
+      <VolumeControl bind:this={volumeControl} exclusive={mode === "exclusive"} onerror={showError} />
+      <button
+        class="grid h-8 w-8 shrink-0 place-items-center rounded-lg transition-colors hover:bg-raised {showPanel
+          ? 'text-accent'
+          : 'text-muted hover:text-ink'}"
+        title={showPanel ? "Hide cover and lyrics" : "Show cover and lyrics"}
+        aria-label="Cover and lyrics"
+        aria-pressed={showPanel}
+        onclick={() => {
+          showPanel = !showPanel;
+          panelAutoHidden = false;
+        }}
+      >
+        <Icon name="lyrics" class="h-[18px] w-[18px]" />
+      </button>
     </div>
   </footer>
 </div>
 
-{#if showEq && eq}
-  <EqPanel bind:settings={eq} onclose={() => (showEq = false)} onerror={showError} />
+{#if notice}
+  <div
+    class="pointer-events-none fixed bottom-28 left-1/2 z-30 w-max max-w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 rounded-full border border-line bg-raised px-4 py-2 text-center text-sm shadow-xl shadow-black/40"
+    role="status"
+    transition:fly={{ y: 12, duration: 200, easing: cubicOut }}
+  >
+    {notice}
+  </div>
+{/if}
+
+{#if showSettings}
+  <Settings
+    bind:tab={settingsTab}
+    bind:eq
+    {devices}
+    {deviceId}
+    {mode}
+    {wantedMode}
+    {exclusiveAvailable}
+    {hardwareVolume}
+    {softVolumeEnabled}
+    {replayGain}
+    {disc}
+    {showPanel}
+    signal={signalPath && playState !== "stopped"
+      ? { bitPerfect: signalPath.bit_perfect, badge: badgeLabel, details: badgeTitle }
+      : null}
+    onrefreshdevices={refreshDevices}
+    ondevice={(id) => void changeDevice(id)}
+    onmode={(option) => void changeMode(option)}
+    onsoftvolume={toggleSoftVolume}
+    onreplaygain={(gain) => void changeReplayGain(gain)}
+    ondisc={(on) => {
+      if (on !== disc) toggleDisc();
+    }}
+    onpanel={(on) => {
+      showPanel = on;
+      panelAutoHidden = false;
+    }}
+    onclose={() => (showSettings = false)}
+    onerror={showError}
+  />
 {/if}
 
 {#if infoTrack}
