@@ -385,7 +385,8 @@
   }
 
   async function clearQueue() {
-    await api.stop().catch(showError);
+    // An empty queue, not just a stop: Play elsewhere (mini player, media keys) must have nothing to start.
+    await api.playFiles([], 0).catch(showError);
     waitingFor = null;
     queue = [];
     currentIndex = null;
@@ -855,6 +856,14 @@
             signalPath = t.signal_path;
           },
           current: (index) => (currentIndex = index),
+          cued: ({ index }) => {
+            // Stopped, the cue moved (Next, Previous, end of queue, an edit): that track is not open yet.
+            if (index !== currentIndex) {
+              durationMs = null;
+              signalPath = null;
+            }
+            currentIndex = index;
+          },
           position: (p) => {
             placePosition(p.ms);
             if (p.duration_ms !== null || playState !== "stopped") durationMs = p.duration_ms;
@@ -882,6 +891,12 @@
                 ? `${device} is back at 100%, turned down to 10% to be safe`
                 : `${device} is back, playing again`,
             );
+          },
+          // Called off from the mini player or a media key: the banner and the wait go.
+          waitEnded: () => {
+            if (waitingFor === null) return;
+            waitingFor = null;
+            error = null;
           },
         }),
       );

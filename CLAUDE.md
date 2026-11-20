@@ -106,7 +106,8 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   following the default) it is reopened through `OutputSettings::resolve` with
   the full-volume guard and plays on. A device that never leaves the list is
   not waited for. Any user choice (play, stop, new queue, new output) calls the
-  wait off (`cancel_reconnect`).
+  wait off (`cancel_reconnect`), which emits `output://wait-ended` so the
+  other window drops its waiting state too.
 - **The mini player is a second window** (label `mini`, `open_mini_player`
   in `src-tauri/src/lib.rs`) loading the same page; `main.ts` mounts
   `MiniPlayer.svelte` there by the window label. The main window is hidden,
@@ -114,6 +115,11 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   mini window's `Destroyed` event both show it again. A window opened
   mid-track starts from `now_playing` (the last events, kept in
   `AppState::now`), then follows the player events like the main window.
+  It subscribes before reading `now_playing` and applies events that came
+  in meanwhile after the snapshot, so the newest wins. While stopped, the
+  engine announces the track Play starts from with `Event::Cued` (none for
+  an empty queue); both windows follow it. Clearing the queue sends an
+  empty `play_files`, so the engine's queue is empty too.
   Both windows are in `capabilities/default.json`. Commands that create
   windows must be `async` (a sync one can deadlock on Windows).
 - **Media keys** go through the Windows media controls

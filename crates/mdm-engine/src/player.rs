@@ -129,6 +129,10 @@ pub enum Event {
     Track { index: usize, path: String, signal_path: SignalPath },
     /// The queue was edited: the track being heard is now at `index`.
     Current { index: usize },
+    /// While stopped: the track `Play` starts from, moved by Stop, the end
+    /// of the queue, Next, Previous or a queue edit. `None` when the queue
+    /// is empty.
+    Cued { index: Option<usize>, path: Option<String> },
     Position { ms: u64, duration_ms: Option<u64> },
     /// A track or the device failed. Playback moves on or stops.
     Error { message: String },
@@ -493,7 +497,8 @@ impl Engine {
                     self.set_state(PlayState::Playing);
                     self.play_from(index, 0);
                 } else {
-                    self.set_state(PlayState::Stopped);
+                    // An empty queue clears the queue: nothing is cued any more.
+                    self.stop(0, 0);
                 }
             }
             Command::Append(paths) => {
@@ -506,6 +511,10 @@ impl Engine {
                 self.order.extend(added);
                 // The decoder may already have run out of queue: carry on into the new tracks.
                 self.fix_line_up(false);
+                if self.state == PlayState::Stopped {
+                    // An empty queue had nothing cued; now it has.
+                    self.announce_cued();
+                }
             }
             Command::Insert { paths, at } => self.insert(paths, at),
             Command::Remove(indexes) => self.remove(&indexes),
@@ -662,9 +671,16 @@ impl Engine {
         }
     }
 
-    /// Tell listeners the position moved while nothing is playing.
+    /// Tell listeners where `Play` starts from, while nothing is playing.
     fn announce_stopped_track(&self) {
         self.emit(Event::Position { ms: self.resume.1, duration_ms: None });
+        self.announce_cued();
+    }
+
+    fn announce_cued(&self) {
+        let index = (self.resume.0 < self.queue.len()).then_some(self.resume.0);
+        let path = index.map(|i| self.queue[i].to_string_lossy().into_owned());
+        self.emit(Event::Cued { index, path });
     }
 
     fn close_stream(&mut self) {
@@ -688,7 +704,7 @@ impl Engine {
         self.apply_gain();
         self.resume = (resume_index, resume_ms);
         self.set_state(PlayState::Stopped);
-        self.emit(Event::Position { ms: resume_ms, duration_ms: None });
+        self.announce_stopped_track();
     }
 
     /// Start playing at `index`, skipping tracks that cannot be played.
@@ -962,7 +978,10 @@ impl Engine {
         self.resume = match to(self.resume.0) {
             Some(n) => (n, self.resume.1),
             // The track Play would start from is gone: the one after it takes its place.
-            None => (self.resume.0.min(self.queue.len().saturating_sub(1)), 0),
+            None => {
+                let kept_before = (0..self.resume.0).filter(|i| to(*i).is_some()).count();
+                (kept_before.min(self.queue.len().saturating_sub(1)), 0)
+            }
         };
         lost
     }
@@ -1013,6 +1032,8 @@ impl Engine {
     fn announce_current(&self) {
         if let Some(h) = &self.heard {
             self.emit(Event::Current { index: h.index });
+        } else if self.state == PlayState::Stopped {
+            self.announce_cued();
         }
     }
 

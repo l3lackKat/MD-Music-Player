@@ -92,7 +92,7 @@ fn main() {
                 break;
             }
             Ok(Event::QueueEnded) => break,
-            Ok(Event::State { .. } | Event::Current { .. }) => {}
+            Ok(Event::State { .. } | Event::Current { .. } | Event::Cued { .. }) => {}
             Err(_) => {
                 // No event for five seconds: the player is stopped.
                 break;

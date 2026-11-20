@@ -255,6 +255,46 @@ fn removing_the_track_being_heard_moves_on() {
 }
 
 #[test]
+fn while_stopped_the_track_play_starts_from_is_announced() {
+    let (paths, _) = make_long_tracks("cued", 4, 2.0);
+    let path = |i: usize| Some(paths[i].to_string_lossy().into_owned());
+    let out = temp("cued.raw");
+    let mut sink = FileSink::new(&out);
+    sink.paced = true;
+    let player = Player::new(Box::new(sink));
+    let events = player.events();
+    let next_cue = || loop {
+        match events.recv_timeout(Duration::from_secs(5)).expect("no cue announced") {
+            Event::Cued { index, path } => break (index, path),
+            Event::Error { message } => panic!("player error: {message}"),
+            _ => {}
+        }
+    };
+
+    player.send(Command::Load { paths: paths.clone(), index: 1 });
+    player.send(Command::Stop);
+    assert_eq!(next_cue(), (Some(1), path(1)), "Stop cues the track it stopped");
+    player.send(Command::Next);
+    assert_eq!(next_cue(), (Some(2), path(2)), "Next while stopped moves the cue");
+    player.send(Command::Previous);
+    assert_eq!(next_cue(), (Some(1), path(1)), "Previous while stopped moves it back");
+    player.send(Command::Remove(vec![0, 1]));
+    assert_eq!(next_cue(), (Some(0), path(2)), "a removed cue passes to the track after it");
+    player.send(Command::Load { paths: Vec::new(), index: 0 });
+    assert_eq!(next_cue(), (None, None), "an empty queue has nothing cued");
+    player.send(Command::Append(vec![paths[3].clone()]));
+    assert_eq!(next_cue(), (Some(0), path(3)), "appending to an empty queue cues its first track");
+
+    // The end of the queue cues its first track.
+    player.send(Command::Load { paths: paths[..2].to_vec(), index: 1 });
+    player.send(Command::Seek(1_900));
+    assert_eq!(next_cue(), (Some(0), path(0)));
+    drop(player);
+    std::fs::remove_file(&out).ok();
+    cleanup(&paths);
+}
+
+#[test]
 fn removing_several_tracks_with_the_heard_one_moves_past_them_all() {
     let (paths, tracks) = make_long_tracks("remove-many", 4, 1.0);
     let mut removed = false;

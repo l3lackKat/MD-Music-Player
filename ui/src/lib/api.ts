@@ -140,6 +140,12 @@ export interface PositionEvent {
   duration_ms: number | null;
 }
 
+/** While stopped: where Play starts. Both are null when the queue is empty. */
+export interface CueEvent {
+  index: number | null;
+  path: string | null;
+}
+
 /** A track with its tags, as read by mdm-library. */
 export interface TrackMeta {
   path: string;
@@ -290,6 +296,8 @@ export interface PlayerHandlers {
   track: (track: TrackEvent) => void;
   /** The queue was edited: the track being heard is now at `index`. */
   current: (index: number) => void;
+  /** While stopped: the track Play starts from, or none when the queue is empty. */
+  cued: (cue: CueEvent) => void;
   position: (position: PositionEvent) => void;
   error: (message: string) => void;
   /** The device stopped while playing. Playback stopped where it was. */
@@ -303,6 +311,7 @@ export async function listenPlayer(handlers: PlayerHandlers): Promise<UnlistenFn
     listen<{ state: PlayState }>("player://state", (e) => handlers.state(e.payload.state)),
     listen<TrackEvent>("player://track", (e) => handlers.track(e.payload)),
     listen<{ index: number }>("player://current", (e) => handlers.current(e.payload.index)),
+    listen<CueEvent>("player://cued", (e) => handlers.cued(e.payload)),
     listen<PositionEvent>("player://position", (e) => handlers.position(e.payload)),
     listen<{ message: string }>("player://error", (e) => handlers.error(e.payload.message)),
     listen<{ message: string }>("player://device-lost", (e) => handlers.deviceLost(e.payload.message)),
@@ -315,6 +324,8 @@ export interface OutputHandlers {
   /** The device that stopped is unplugged; playback resumes when it is back. */
   waiting: (device: string) => void;
   reconnected: (event: Reconnected) => void;
+  /** The wait was called off by a user choice (play, stop, new queue, new output), in either window. */
+  waitEnded: () => void;
 }
 
 /** Follow a device that went away and came back. Returns a function that unsubscribes. */
@@ -322,6 +333,7 @@ export async function listenOutput(handlers: OutputHandlers): Promise<UnlistenFn
   const unlisten = await Promise.all([
     listen<string>("output://waiting", (e) => handlers.waiting(e.payload)),
     listen<Reconnected>("output://reconnected", (e) => handlers.reconnected(e.payload)),
+    listen("output://wait-ended", () => handlers.waitEnded()),
   ]);
   return () => unlisten.forEach((u) => u());
 }

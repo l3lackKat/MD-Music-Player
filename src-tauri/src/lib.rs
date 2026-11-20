@@ -228,7 +228,7 @@ struct AppState {
 #[derive(Debug, Clone, Serialize)]
 struct NowPlaying {
     state: PlayState,
-    /// The track heard (or last heard).
+    /// The track heard, or while stopped the one `Play` starts from.
     path: Option<String>,
     position_ms: u64,
     duration_ms: Option<u64>,
@@ -239,10 +239,18 @@ impl NowPlaying {
         match event {
             Event::State { state } => self.state = *state,
             Event::Track { path, .. } => self.path = Some(path.clone()),
+            Event::Cued { path, .. } => {
+                if *path != self.path {
+                    // Not opened yet, so its length is unknown.
+                    self.duration_ms = None;
+                }
+                self.path = path.clone();
+            }
             Event::Position { ms, duration_ms } => {
                 self.position_ms = *ms;
                 // A position while stopped carries no duration; keep the track's.
-                if duration_ms.is_some() {
+                // While playing, none means the track's length is unknown.
+                if duration_ms.is_some() || self.state != PlayState::Stopped {
                     self.duration_ms = *duration_ms;
                 }
             }
@@ -305,7 +313,7 @@ fn set_output(
     device_id: Option<String>,
     mode: OutputMode,
 ) -> OutputSettings {
-    cancel_reconnect(&state);
+    cancel_reconnect(&app);
     let device_changed = state.output.lock().unwrap().device_id != device_id;
     let soft_enabled = state.saved.lock().unwrap().soft_volume;
     let output = OutputSettings::resolve(device_id, mode, device_changed, soft_enabled);
@@ -329,7 +337,7 @@ fn set_output(
 /// carries on from the same place either way.
 #[tauri::command(async)]
 fn set_soft_volume(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> OutputSettings {
-    cancel_reconnect(&state);
+    cancel_reconnect(&app);
     state.saved.lock().unwrap().soft_volume = enabled;
     state.save_output();
     let current = state.output.lock().unwrap().clone();
@@ -355,9 +363,14 @@ struct Reconnected {
     device: String,
 }
 
-/// Stop waiting for a device that went away: the user took over.
-fn cancel_reconnect(state: &AppState) {
-    *state.reconnect.lock().unwrap() += 1;
+/// Stop waiting for a device that went away: the user took over, maybe in
+/// the other window, so both are told (`output://wait-ended`).
+fn cancel_reconnect(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut generation = state.reconnect.lock().unwrap();
+    *generation += 1;
+    // Emitted under the lock, so it cannot overtake a `waiting` of the wait it ends.
+    let _ = app.emit("output://wait-ended", ());
 }
 
 /// The device playing `device_name` stopped mid-stream. Wait for it to come
@@ -402,6 +415,11 @@ fn reconnect_when_back(app: AppHandle, generation: u64, device_name: String) {
         if !back {
             if !gone {
                 gone = true;
+                // Under the lock: a wait called off meanwhile is not announced.
+                let generation_now = state.reconnect.lock().unwrap();
+                if *generation_now != generation {
+                    return;
+                }
                 let _ = app.emit("output://waiting", &device_name);
             }
             continue;
@@ -552,8 +570,8 @@ fn supported_extensions() -> Vec<&'static str> {
 }
 
 #[tauri::command]
-fn play_files(state: State<AppState>, paths: Vec<String>, index: usize) {
-    cancel_reconnect(&state);
+fn play_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, index: usize) {
+    cancel_reconnect(&app);
     let paths = paths.into_iter().map(PathBuf::from).collect();
     state.player.send(Command::Load { paths, index });
 }
@@ -596,8 +614,8 @@ fn set_repeat(state: State<AppState>, repeat: Repeat) {
 }
 
 #[tauri::command]
-fn play(state: State<AppState>) {
-    cancel_reconnect(&state);
+fn play(app: AppHandle, state: State<AppState>) {
+    cancel_reconnect(&app);
     state.player.send(Command::Play);
 }
 
@@ -607,8 +625,8 @@ fn pause(state: State<AppState>) {
 }
 
 #[tauri::command]
-fn stop(state: State<AppState>) {
-    cancel_reconnect(&state);
+fn stop(app: AppHandle, state: State<AppState>) {
+    cancel_reconnect(&app);
     state.player.send(Command::Stop);
 }
 
@@ -973,6 +991,7 @@ fn event_name(event: &Event) -> &'static str {
         Event::State { .. } => "player://state",
         Event::Track { .. } => "player://track",
         Event::Current { .. } => "player://current",
+        Event::Cued { .. } => "player://cued",
         Event::Position { .. } => "player://position",
         Event::Error { .. } => "player://error",
         Event::DeviceLost { .. } => "player://device-lost",
@@ -985,12 +1004,12 @@ fn on_media_button(app: &AppHandle, button: Button) {
     let state = app.state::<AppState>();
     let command = match button {
         Button::Play => {
-            cancel_reconnect(&state);
+            cancel_reconnect(app);
             Command::Play
         }
         Button::Pause => Command::Pause,
         Button::Stop => {
-            cancel_reconnect(&state);
+            cancel_reconnect(app);
             Command::Stop
         }
         Button::Next => Command::Next,
@@ -1169,7 +1188,7 @@ pub fn run() {
             // before the process goes away.
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
-                cancel_reconnect(&state);
+                cancel_reconnect(app);
                 state.player.quit(EXIT_WAIT);
                 state.volume_watch.lock().unwrap().take();
             }
