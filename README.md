@@ -19,6 +19,7 @@ The engine also runs on its own from the command line:
 ```sh
 cargo run -p mdm-engine --example play -- --list
 cargo run -p mdm-engine --example play -- --device "DX1" album/*.flac
+cargo run -p mdm-analyze --example analyze -- album/*.flac   # cutoff and bits in use
 ```
 
 ## How playback works
@@ -68,6 +69,7 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
 | `crates/mdm-decode` | File decoding: PCM through symphonia, raw DSD from DSF/DFF |
 | `crates/mdm-engine` | Player, format negotiation, DoP, WASAPI and file outputs |
 | `crates/mdm-library` | Tags, cover art, lyrics, folder scanning and playlists |
+| `crates/mdm-analyze` | Spectrograms, cutoff and bits in use, for checking a file by eye |
 | `src-tauri` | The desktop app: Tauri commands and events over the engine |
 | `ui` | The Svelte UI |
 
@@ -87,6 +89,15 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   to a playlist (or to a new one), remove it from the playlist, or show it in
   File Explorer. Tracks that are in a playlist because of a folder can only be
   removed by removing the folder.
+- **Is it really lossless?** Right-click a track and choose Spectrum. MDMusic
+  reads the whole file and draws its spectrogram, with the format, the bits
+  the samples really use, and the cutoff (where the sound stops, if it stops
+  sharply). The verdict is yours: audio that went through MP3 or AAC usually
+  stops at a hard, flat ceiling at 16-20 kHz; a hi-res file made from CD audio
+  has nothing above ~22 kHz; "16 of 24" bits means 16-bit audio padded to 24.
+  The plot is as tall as the sample rate is high (a 96 kHz file twice as tall
+  as a 48 kHz one, at the same detail), so files of any rate compare directly.
+  DSD files are not analysed yet.
 - **Shuffle** (the button left of Previous) plays the queue in random order,
   starting from the track you picked. Every track plays once before the queue
   ends, and tracks of the same format still play gapless.

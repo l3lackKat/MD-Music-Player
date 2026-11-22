@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 mdm-decode.workspace = true
 mdm-engine.workspace = true
 mdm-library.workspace = true
+mdm-analyze.workspace = true
+base64 = "0.23"
 percent-encoding = "2.3"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"

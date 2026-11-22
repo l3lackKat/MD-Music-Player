@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/mdm-decode", "crates/mdm-engine", "crates/mdm-library", "src-tauri"]
-default-members = ["crates/mdm-decode", "crates/mdm-engine", "crates/mdm-library"]
+members = ["crates/mdm-decode", "crates/mdm-engine", "crates/mdm-library", "crates/mdm-analyze", "src-tauri"]
+default-members = ["crates/mdm-decode", "crates/mdm-engine", "crates/mdm-library", "crates/mdm-analyze"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,12 +12,18 @@ license = "MIT"
 mdm-decode = { path = "crates/mdm-decode" }
 mdm-engine = { path = "crates/mdm-engine" }
 mdm-library = { path = "crates/mdm-library" }
+mdm-analyze = { path = "crates/mdm-analyze" }
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.dev.package."*"]
+opt-level = 2
+
+# The spectrum analysis runs an FFT over every frame of a track: unoptimized,
+# a long hi-res file takes 20x longer in `npm run dev`.
+[profile.dev.package.mdm-analyze]
 opt-level = 2
 
 [profile.release]

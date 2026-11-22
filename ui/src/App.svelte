@@ -36,6 +36,7 @@
   import SourceMark from "./lib/SourceMark.svelte";
   import Spinner from "./lib/Spinner.svelte";
   import TrackInfo from "./lib/TrackInfo.svelte";
+  import Spectrum from "./lib/Spectrum.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
   import appIcon from "./assets/app-icon.png";
@@ -123,6 +124,8 @@
   let error = $state<string | null>(null);
   /** The track whose info dialog is open. */
   let infoTrack = $state<TrackMeta | null>(null);
+  /** The track whose spectrum is shown. */
+  let spectrumTrack = $state<TrackMeta | null>(null);
   let dragging = $state(false);
   let showPanel = $state(true);
   /** Below this width the track list and the cover panel do not both fit (a 1080p
@@ -837,7 +840,13 @@
       if (artistName && !onTheirPage) {
         items.push({ label: "Go to artist", action: () => show({ kind: "artist", name: artistName, back: { kind: "artists" } }) });
       }
+      const dsd = /\.(dsf|dff)$/i.test(one.path);
       items.push({ label: "Track info", action: () => (infoTrack = one) }, {
+        label: "Spectrum",
+        disabled: dsd,
+        hint: dsd ? "Not for DSD" : undefined,
+        action: () => (spectrumTrack = one),
+      }, {
         label: "Show in File Explorer",
         action: () => api.showInFolder(one.path).catch(showError),
       });
@@ -1697,6 +1706,10 @@
 
 {#if infoTrack}
   <TrackInfo track={infoTrack} onclose={() => (infoTrack = null)} onerror={showError} />
+{/if}
+
+{#if spectrumTrack}
+  <Spectrum track={spectrumTrack} onclose={() => (spectrumTrack = null)} />
 {/if}
 
 {#if menu}

@@ -12,6 +12,7 @@ cargo test                       # decode, engine and library tests; no audio ha
 cargo clippy --workspace --all-targets
 cargo build -p mdmusic           # the Tauri app; not in default-members, so plain `cargo test` skips it
 cargo run -p mdm-engine --example play -- --list          # command-line player
+cargo run -p mdm-analyze --example analyze -- <files>     # cutoff and bits in use
 ```
 
 Run all four checks (test, clippy, `npm run check`, `cargo build -p mdmusic`) before calling a change done.
@@ -23,6 +24,7 @@ Run all four checks (test, clippy, `npm run check`, `cargo build -p mdmusic`) be
 | `crates/mdm-decode` | Files to samples. PCM via symphonia, raw DSD from DSF/DFF. |
 | `crates/mdm-engine` | Player thread, format negotiation, DoP, outputs (`output/wasapi.rs`, `output/file_sink.rs`). |
 | `crates/mdm-library` | Tags (`tagged.rs` opens every file, DSD too), cover art, lyrics (`.lrc` and embedded), folder scan, playlists, the SQLite library index (`index.rs`). |
+| `crates/mdm-analyze` | Spectrum analysis: a whole track's spectrogram, its cutoff and the bits in use. |
 | `src-tauri` | Tauri commands and events over the two crates above. `capabilities/default.json` lists what the UI may call. |
 | `ui` | Svelte UI. `src/lib/api.ts` is the only place that calls `invoke`. |
 
@@ -182,6 +184,25 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   always in list order. Dragging uses `RowDrag` (pointer events); a row's
   click handler must first check `drag.endedDrag()`, or the release of a drag
   counts as a click.
+
+- **Spectrum analysis reads, never plays, and never judges** (`mdm-analyze`,
+  the Spectrum dialog `Spectrum.svelte` from the track menu). It shows the
+  spectrogram and plain measurements only (format, bits in use, cutoff);
+  saying "lossless or not" is left to the user, so do not add verdicts back.
+  It decodes the whole file on its own (mixing channels to mono is fine
+  there: it is off the playback path). The FFT and the rows grow with the
+  rate (`scale()`: 4096/512 up to 48 kHz, doubling per octave of rate), so a
+  row is ~43 Hz and a column the same time at every rate; the UI draws
+  `PX_PER_KHZ` per kHz, so the plot is as tall as the rate is high. Columns
+  merge in pairs to stay `MIN_COLUMNS`..2x wide; levels go as bytes from
+  `DB_FLOOR` to `DB_TOP`, base64, drawn on a canvas. The cutoff is a cliff in
+  the average spectrum (`find_cutoff`: a 25 dB fall that never climbs back,
+  then placed at the edge). Bits in use are all samples OR'd together (they
+  are left-justified). `analyze_track` reports `analysis://progress`; a new
+  analysis or `cancel_analysis` (closing the dialog) stops the running one
+  through `AppState::analysis`. DSD is refused for now. Check changes against
+  real encodes (ffmpeg is at hand: libmp3lame, aac), not only the synthetic
+  tests.
 
 ## Testing
 

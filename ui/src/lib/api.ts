@@ -219,6 +219,28 @@ export function thumbUrl(path: string, size: "row" | "grid" = "row"): string {
   return `${coverUrl(path)}?thumb${size === "grid" ? "=grid" : ""}`;
 }
 
+/** A whole track's spectrogram and plain measurements (`mdm_analyze::Spectrum`). */
+export interface SpectrumAnalysis {
+  codec: string;
+  sample_rate: number;
+  channels: number;
+  /** The bit depth the file says it has; null for lossy and float sources. */
+  declared_bits: number | null;
+  /** The bits the samples actually use; less than `declared_bits` means padding. */
+  effective_bits: number | null;
+  duration_ms: number;
+  /** Where the average level falls off a cliff and stays down, if anywhere. */
+  cutoff_hz: number | null;
+  width: number;
+  /** Rows from 0 Hz to Nyquist: 512 up to 48 kHz, doubling with the rate (~43 Hz a row at every rate). */
+  height: number;
+  seconds_per_column: number;
+  /** `width * height` levels, base64, row by row from the highest frequency: 0 is `db_floor`, 255 is `db_top`. */
+  pixels: string;
+  db_floor: number;
+  db_top: number;
+}
+
 /** How many tracks the library index holds: every playlist's tracks. */
 export interface LibraryStatus {
   tracks: number;
@@ -228,6 +250,9 @@ export const api = {
   expandPaths: (paths: string[]) => invoke<TrackMeta[]>("expand_paths", { paths }),
   getLyrics: (path: string) => invoke<Lyrics | null>("get_lyrics", { path }),
   trackDetails: (path: string) => invoke<TrackDetails>("track_details", { path }),
+  /** Decode the whole track for its spectrogram. Starting another analysis or `cancelAnalysis` stops this one. */
+  analyzeTrack: (path: string) => invoke<SpectrumAnalysis>("analyze_track", { path }),
+  cancelAnalysis: () => invoke<void>("cancel_analysis"),
   /** What is playing, as the player last reported it: for a window opened mid-track. */
   nowPlaying: () => invoke<NowPlaying>("now_playing"),
   /** Swap the main window for the always-on-top mini player, and back. */
@@ -341,6 +366,11 @@ export async function listenOutput(handlers: OutputHandlers): Promise<UnlistenFn
 /** The library index finished a refresh (after launch, or after the playlists changed). */
 export function listenLibrary(handler: (status: LibraryStatus) => void): Promise<UnlistenFn> {
   return listen<LibraryStatus>("library://updated", (e) => handler(e.payload));
+}
+
+/** A spectrum analysis moved on: `done` is 0 to 1 (stays 0 when the track's length is unknown). */
+export function listenAnalysis(handler: (progress: { path: string; done: number }) => void): Promise<UnlistenFn> {
+  return listen<{ path: string; done: number }>("analysis://progress", (e) => handler(e.payload));
 }
 
 /** Called whenever the selected device's Windows volume changes, wherever it was changed. */

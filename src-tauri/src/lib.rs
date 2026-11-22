@@ -10,6 +10,7 @@ mod media_controls;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -222,6 +223,8 @@ struct AppState {
     /// What the player last reported, for a window that opens mid-track
     /// (the mini player) to start from.
     now: Mutex<NowPlaying>,
+    /// Bumped to call off the spectrum analysis running (see `analyze_track`).
+    analysis: AtomicU64,
 }
 
 /// The player as its events last described it.
@@ -872,6 +875,59 @@ fn playlist_scan(state: State<AppState>, id: u64) -> CommandResult<Vec<TrackMeta
     state.library.scan_playlist(&playlist).map_err(text)
 }
 
+// ---- Spectrum analysis -----------------------------------------------------
+
+#[derive(Serialize)]
+struct SpectrumReply {
+    #[serde(flatten)]
+    spectrum: mdm_analyze::Spectrum,
+    /// The spectrogram's levels (`Spectrum::pixels`), base64.
+    pixels: String,
+    /// The levels pixel 0 and pixel 255 stand for.
+    db_floor: f32,
+    db_top: f32,
+}
+
+#[derive(Clone, Serialize)]
+struct AnalysisProgress {
+    path: String,
+    /// 0 to 1; stays 0 when the track's length is unknown.
+    done: f32,
+}
+
+/// Decode the whole track and return its spectrogram and what it suggests
+/// (a lossy or upsampled source, padded bits). Reports `analysis://progress`
+/// as it goes. Starting another analysis, or `cancel_analysis`, stops this one.
+#[tauri::command(async)]
+fn analyze_track(app: AppHandle, state: State<'_, AppState>, path: String) -> CommandResult<SpectrumReply> {
+    let generation = state.analysis.fetch_add(1, Ordering::SeqCst) + 1;
+    let file = PathBuf::from(&path);
+    if !file.is_file() {
+        return Err("The file no longer exists.".into());
+    }
+    let mut reported = -1.0f32;
+    let mut spectrum = mdm_analyze::analyze(&file, |done| {
+        if state.analysis.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        if done - reported >= 0.01 {
+            reported = done;
+            let _ = app.emit("analysis://progress", AnalysisProgress { path: path.clone(), done });
+        }
+        true
+    })
+    .map_err(text)?;
+    use base64::Engine as _;
+    let pixels = base64::engine::general_purpose::STANDARD.encode(std::mem::take(&mut spectrum.pixels));
+    Ok(SpectrumReply { spectrum, pixels, db_floor: mdm_analyze::DB_FLOOR, db_top: mdm_analyze::DB_TOP })
+}
+
+/// Stop the analysis running, if any. It then fails with "cancelled".
+#[tauri::command]
+fn cancel_analysis(state: State<AppState>) {
+    state.analysis.fetch_add(1, Ordering::SeqCst);
+}
+
 // ---- Library index ---------------------------------------------------------
 
 /// Open the index. If it cannot be opened, set it aside and start a new
@@ -1082,6 +1138,7 @@ pub fn run() {
                     position_ms: 0,
                     duration_ms: None,
                 }),
+                analysis: AtomicU64::new(0),
             });
             watch_volume(app.handle(), &app.state::<AppState>());
             start_refresher(app.handle().clone(), refresh_rx);
@@ -1180,6 +1237,8 @@ pub fn run() {
             show_in_folder,
             playlist_remove_folder,
             playlist_scan,
+            analyze_track,
+            cancel_analysis,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start MDMusic")
