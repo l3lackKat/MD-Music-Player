@@ -128,7 +128,7 @@ fn a_wider_container_only_adds_zero_bits() {
         let (bytes, _) = play_to_file(vec![wav.clone()], sink);
 
         let words: Vec<i32> =
-            bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+            bytes.as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b)).collect();
         assert_eq!(words.len(), samples.len());
         for (w, s) in words.iter().zip(&samples) {
             assert_eq!(*w, s << (32 - bits));
@@ -222,7 +222,7 @@ fn dsd_goes_out_as_dop() {
 
         // 24-bit stereo frames at 176.4 kHz: one PCM frame per two DSD frames.
         assert_eq!(bytes.len(), frames / 2 * 2 * 3);
-        for (n, frame) in bytes.chunks_exact(6).enumerate() {
+        for (n, frame) in bytes.as_chunks::<6>().0.iter().enumerate() {
             let marker = if n % 2 == 0 { 0x05 } else { 0xFA };
             for ch in 0..2 {
                 let s = &frame[ch * 3..ch * 3 + 3];
