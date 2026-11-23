@@ -295,6 +295,29 @@ fn while_stopped_the_track_play_starts_from_is_announced() {
 }
 
 #[test]
+fn seeking_to_the_end_goes_on_to_the_next_track() {
+    let (paths, tracks) = make_long_tracks("seek-end", 2, 1.0);
+    let mut seeked = false;
+    // `run_with` fails on any `Event::Error`: the end is not a broken track.
+    let (heard, samples) = run_with(
+        "seek-end",
+        true,
+        vec![Command::Load { paths: paths.clone(), index: 0 }],
+        |player, event| {
+            if let (Event::Track { index: 0, .. }, false) = (event, seeked) {
+                seeked = true;
+                // Past the end, as a bar dragged to a rounded duration can ask.
+                player.send(Command::Seek(1_500));
+            }
+        },
+    );
+    // A seek announces its track again, then the next one follows.
+    assert_eq!(heard, [0, 0, 1]);
+    assert!(samples.ends_with(&tracks[1]), "the next track plays in full");
+    cleanup(&paths);
+}
+
+#[test]
 fn removing_several_tracks_with_the_heard_one_moves_past_them_all() {
     let (paths, tracks) = make_long_tracks("remove-many", 4, 1.0);
     let mut removed = false;
