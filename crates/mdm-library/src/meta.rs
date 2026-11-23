@@ -51,8 +51,12 @@ pub fn read_meta(path: &Path) -> TrackMeta {
         duration_ms: None,
     };
 
-    // The tag reader does not know DSF or DFF, and some files are just broken.
-    let Ok(file) = lofty::read_from_path(path) else {
+    // DSD tags hold no audio properties: the decoder knows the length from the header.
+    if crate::tagged::is_dsd(path) {
+        meta.duration_ms = mdm_decode::open(path).ok().and_then(|s| s.info().duration_ms);
+    }
+    // Some files are just broken, or have no tags.
+    let Some(file) = crate::tagged::read_tagged(path) else {
         return meta;
     };
     let duration = file.properties().duration();
@@ -75,6 +79,23 @@ pub fn read_meta(path: &Path) -> TrackMeta {
             .and_then(|y| y.parse().ok());
     }
     meta
+}
+
+/// The ReplayGain values in a track's tags, in dB: `(track, album)`. Any tag
+/// of the file counts, since players write them in different places.
+pub fn read_replay_gain(path: &Path) -> (Option<f32>, Option<f32>) {
+    let Some(file) = crate::tagged::read_tagged(path) else { return (None, None) };
+    let find = |key: ItemKey| {
+        file.tags().iter().find_map(|tag| tag.get_string(key).and_then(parse_gain))
+    };
+    (find(ItemKey::ReplayGainTrackGain), find(ItemKey::ReplayGainAlbumGain))
+}
+
+/// "-6.54 dB", "+1.2dB" or "-6.54" as dB.
+fn parse_gain(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let end = text.find(|c: char| !(c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))).unwrap_or(text.len());
+    text[..end].parse::<f32>().ok().filter(|db| db.is_finite())
 }
 
 /// Image names looked for next to a track that has no embedded cover.
@@ -104,7 +125,7 @@ fn folder_cover(track: &Path) -> Option<PathBuf> {
 /// A track's cover: the embedded front cover, else any embedded picture,
 /// else an image such as `cover.jpg` in the same folder.
 pub fn read_cover(path: &Path) -> Option<Cover> {
-    if let Ok(file) = lofty::read_from_path(path) {
+    if let Some(file) = crate::tagged::read_tagged(path) {
         let pictures = file.tags().iter().flat_map(|t| t.pictures());
         let picture = pictures
             .clone()

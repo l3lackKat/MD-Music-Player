@@ -52,7 +52,7 @@ fn main() {
         }
     });
 
-    let player = Player::new(Box::new(WasapiBackend { device_id, mode }));
+    let player = Player::new(Box::new(WasapiBackend { device_id, mode, soft: None }));
     let events = player.events();
     player.send(Command::Load { paths, index: 0 });
 
@@ -86,8 +86,13 @@ fn main() {
                 eprintln!("\nerror: {message}");
                 failed = true;
             }
+            Ok(Event::DeviceLost { message }) => {
+                eprintln!("\nerror: {message}");
+                failed = true;
+                break;
+            }
             Ok(Event::QueueEnded) => break,
-            Ok(Event::State { .. }) => {}
+            Ok(Event::State { .. } | Event::Current { .. } | Event::Cued { .. }) => {}
             Err(_) => {
                 // No event for five seconds: the player is stopped.
                 break;

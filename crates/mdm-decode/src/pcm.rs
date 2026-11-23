@@ -5,7 +5,7 @@ use std::path::Path;
 
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
-use symphonia::core::errors::Error as SymError;
+use symphonia::core::errors::{Error as SymError, SeekErrorKind};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
@@ -24,6 +24,8 @@ pub struct PcmSource {
     /// Frames to drop from the front of the next packets, used after a seek
     /// that landed before the requested position.
     skip_frames: u64,
+    /// A seek went to or past the last frame: nothing more to decode.
+    ended: bool,
 }
 
 fn codec_err(e: SymError) -> DecodeError {
@@ -89,6 +91,7 @@ impl PcmSource {
             },
             buf: Vec::new(),
             skip_frames: 0,
+            ended: false,
         };
 
         // The container does not always say what the decoder will produce
@@ -140,12 +143,21 @@ impl PcmSource {
         Ok(result)
     }
 
+    /// Mark the track as played out after a seek to its end; returns the position reached.
+    fn end_at(&mut self, ms: u64) -> u64 {
+        self.decoder.reset();
+        self.skip_frames = 0;
+        self.ended = true;
+        self.info.duration_ms.map_or(ms, |d| ms.min(d))
+    }
+
     fn rewind(&mut self) -> Result<()> {
         self.format
             .seek(SeekMode::Accurate, SeekTo::Time { time: Time::ZERO, track_id: Some(self.track_id) })
             .map_err(codec_err)?;
         self.decoder.reset();
         self.skip_frames = 0;
+        self.ended = false;
         Ok(())
     }
 }
@@ -156,6 +168,9 @@ impl Source for PcmSource {
     }
 
     fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>> {
+        if self.ended {
+            return Ok(None);
+        }
         let channels = self.info.channels as usize;
         loop {
             let packet = match self.format.next_packet() {
@@ -203,11 +218,23 @@ impl Source for PcmSource {
     fn seek(&mut self, ms: u64) -> Result<u64> {
         let time = Time::try_from_secs_f64(ms as f64 / 1000.0)
             .ok_or_else(|| DecodeError::Codec("seek position out of range".into()))?;
-        let seeked = self
+        let seeked = match self
             .format
             .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })
-            .map_err(codec_err)?;
+        {
+            Ok(seeked) => seeked,
+            // Dragging the bar to the very end lands on (or, with a rounded
+            // duration, just past) the last frame. Readers refuse that as out
+            // of range, and FLAC runs into the end of the file looking for a
+            // packet holding it. Either way the track is over, not broken.
+            Err(SymError::SeekError(SeekErrorKind::OutOfRange)) => return Ok(self.end_at(ms)),
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(self.end_at(ms));
+            }
+            Err(e) => return Err(codec_err(e)),
+        };
         self.decoder.reset();
+        self.ended = false;
         // The reader lands on a packet boundary at or before the target;
         // drop the frames in between so the seek is sample accurate.
         let gap = seeked.required_ts.get() - seeked.actual_ts.get();

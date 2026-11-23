@@ -2,9 +2,12 @@
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { webCovers } from "./webCovers.svelte";
 
 export type PlayState = "stopped" | "playing" | "paused";
 export type OutputMode = "exclusive" | "shared";
+/** After the last track: stop, start over, or (`one`) play the current track again. */
+export type Repeat = "off" | "all" | "one";
 
 export interface DeviceInfo {
   id: string;
@@ -18,10 +21,24 @@ export interface OutputSettings {
   mode: OutputMode;
   /** The mode the user picked; differs from `mode` while exclusive is unavailable. */
   wanted: OutputMode;
-  /** The device's volume works in exclusive mode. Without it, shared mode is used. */
+  /** Exclusive mode can be used: the device has a hardware volume, or the software volume is on. */
   exclusive_available: boolean;
+  /** The device has an adjustable volume of its own. */
+  hardware_volume: boolean;
+  /** The user turned the software volume on (it only acts on devices without a hardware volume). */
+  soft_volume_enabled: boolean;
+  /** The software volume is in use now: the volume bar scales samples, so playback is not bit-perfect. */
+  soft_volume: boolean;
   /** The device was at 100% when chosen (or at launch) and was turned down to 10% first. */
   volume_lowered: boolean;
+  /** At launch: the saved device is not connected, so the system default is used for now. */
+  missing_device: string | null;
+}
+
+/** The device that went away is back and playing again. */
+export interface Reconnected {
+  output: OutputSettings;
+  device: string;
 }
 
 /** The Windows volume of the selected output device. */
@@ -31,6 +48,8 @@ export interface DeviceVolume {
   muted: boolean;
   /** The device applies the level itself, so it also works in exclusive mode. */
   hardware: boolean;
+  /** This is MDMusic's software volume, which scales the samples, not the Windows one. */
+  software: boolean;
 }
 
 export type SampleKind = { type: "pcm"; bits: number } | { type: "float" } | { type: "dsd" };
@@ -55,7 +74,22 @@ export interface SignalPath {
   bit_perfect: boolean;
   /** The equalizer is changing this track's samples. */
   eq: boolean;
+  /** The software volume is scaling this track's samples. */
+  soft_volume: boolean;
+  /** The ReplayGain offset for this track (dB), moving the volume, not the samples. */
+  replay_gain_db: number | null;
 }
+
+export interface NowPlaying {
+  state: PlayState;
+  /** The track heard, or last heard. */
+  path: string | null;
+  position_ms: number;
+  duration_ms: number | null;
+}
+
+/** ReplayGain: off, or evening out loudness by track or by album. */
+export type GainMode = "off" | "track" | "album";
 
 export interface EqBand {
   freq_hz: number;
@@ -107,6 +141,12 @@ export interface PositionEvent {
   duration_ms: number | null;
 }
 
+/** While stopped: where Play starts. Both are null when the queue is empty. */
+export interface CueEvent {
+  index: number | null;
+  path: string | null;
+}
+
 /** A track with its tags, as read by mdm-library. */
 export interface TrackMeta {
   path: string;
@@ -135,22 +175,103 @@ export function holdsFile(playlist: Playlist, path: string): boolean {
   return playlist.files.some((f) => f.toLowerCase() === wanted);
 }
 
+/** An album: tracks sharing an album title and album artist (or folder). */
+export interface AlbumSummary {
+  /** Pass to `albumTracks`. */
+  id: string;
+  title: string;
+  /** `null` for an album of several artists with no album artist. */
+  artist: string | null;
+  year: number | null;
+  track_count: number;
+  duration_ms: number;
+  /** A track to take the album cover from. */
+  cover_path: string;
+}
+
+export interface ArtistSummary {
+  name: string;
+  album_count: number;
+  track_count: number;
+  cover_path: string;
+}
+
+export interface ArtistDetail {
+  name: string;
+  /** Oldest first. */
+  albums: AlbumSummary[];
+  /** Album by album, then the tracks with no album. */
+  tracks: TrackMeta[];
+}
+
 export interface Lyrics {
   /** Every line has a time, in order. */
   synced: boolean;
   lines: { time_ms: number | null; text: string }[];
 }
 
+/** A `cover://` URL with `params`, and `web` while covers from the internet are on. */
+function coverWith(path: string, params: string[]): string {
+  if (webCovers.on) params.push("web");
+  const url = convertFileSrc(path, "cover");
+  return params.length ? `${url}?${params.join("&")}` : url;
+}
+
 /** URL of a track's cover image. It answers 404 when there is none. */
 export function coverUrl(path: string): string {
-  return convertFileSrc(path, "cover");
+  return coverWith(path, []);
+}
+
+/** URL of a track's small cover (JPEG, 96 px), made once and kept in the library index. 404 when there is none. */
+export function thumbUrl(path: string, size: "row" | "grid" = "row"): string {
+  return coverWith(path, [size === "grid" ? "thumb=grid" : "thumb"]);
+}
+
+/** A whole track's spectrogram and plain measurements (`mdm_analyze::Spectrum`). */
+export interface SpectrumAnalysis {
+  codec: string;
+  sample_rate: number;
+  channels: number;
+  /** The bit depth the file says it has; null for lossy and float sources. */
+  declared_bits: number | null;
+  /** The bits the samples actually use; less than `declared_bits` means padding. */
+  effective_bits: number | null;
+  duration_ms: number;
+  /** Where the average level falls off a cliff and stays down, if anywhere. */
+  cutoff_hz: number | null;
+  width: number;
+  /** Rows from 0 Hz to Nyquist: 512 up to 48 kHz, doubling with the rate (~43 Hz a row at every rate). */
+  height: number;
+  seconds_per_column: number;
+  /** `width * height` levels, base64, row by row from the highest frequency: 0 is `db_floor`, 255 is `db_top`. */
+  pixels: string;
+  db_floor: number;
+  db_top: number;
+}
+
+/** How many tracks the library index holds: every playlist's tracks. */
+export interface LibraryStatus {
+  tracks: number;
 }
 
 export const api = {
   expandPaths: (paths: string[]) => invoke<TrackMeta[]>("expand_paths", { paths }),
   getLyrics: (path: string) => invoke<Lyrics | null>("get_lyrics", { path }),
   trackDetails: (path: string) => invoke<TrackDetails>("track_details", { path }),
+  /** Decode the whole track for its spectrogram. Starting another analysis or `cancelAnalysis` stops this one. */
+  analyzeTrack: (path: string) => invoke<SpectrumAnalysis>("analyze_track", { path }),
+  cancelAnalysis: () => invoke<void>("cancel_analysis"),
+  /** What is playing, as the player last reported it: for a window opened mid-track. */
+  nowPlaying: () => invoke<NowPlaying>("now_playing"),
+  /** Swap the main window for the always-on-top mini player, and back. */
+  openMiniPlayer: () => invoke<void>("open_mini_player"),
+  closeMiniPlayer: () => invoke<void>("close_mini_player"),
   getEq: () => invoke<EqSettings>("get_eq"),
+  getReplayGain: () => invoke<GainMode>("get_replay_gain"),
+  setReplayGain: (mode: GainMode) => invoke<GainMode>("set_replay_gain", { mode }),
+  /** Covers from the internet for albums without one (sends only album title and artist). */
+  getWebCovers: () => invoke<boolean>("get_web_covers"),
+  setWebCovers: (enabled: boolean) => invoke<boolean>("set_web_covers", { enabled }),
   /** Apply and save. Returns the settings as applied (values clamped into range). */
   setEq: (settings: EqSettings) => invoke<EqSettings>("set_eq", { settings }),
   playlists: () => invoke<Playlist[]>("playlists"),
@@ -160,11 +281,28 @@ export const api = {
   /** Add folders and audio files; `skipped` lists paths that were neither. */
   playlistAdd: (id: number, paths: string[]) =>
     invoke<{ playlist: Playlist; skipped: string[] }>("playlist_add", { id, paths }),
-  playlistRemoveFile: (id: number, file: string) =>
-    invoke<Playlist>("playlist_remove_file", { id, file }),
+  /** Remove single files; tracks that come from a folder stay. */
+  playlistRemoveFiles: (id: number, files: string[]) =>
+    invoke<Playlist>("playlist_remove_files", { id, files }),
+  /** Put the playlists in this order; returns them all. */
+  playlistReorder: (ids: number[]) => invoke<Playlist[]>("playlist_reorder", { ids }),
+  /** Tracks of any playlist matching every word, accents and case ignored. */
+  search: (query: string) => invoke<TrackMeta[]>("search", { query }),
+  albums: () => invoke<AlbumSummary[]>("albums"),
+  albumTracks: (id: string) => invoke<TrackMeta[]>("album_tracks", { id }),
+  artists: () => invoke<ArtistSummary[]>("artists"),
+  artist: (name: string) => invoke<ArtistDetail | null>("artist", { name }),
+  libraryStatus: () => invoke<LibraryStatus>("library_status"),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   appendFiles: (paths: string[]) => invoke<void>("append_files", { paths }),
+  /** Put tracks at `at` in the queue, to play next (after the current track). */
+  queueInsert: (paths: string[], at: number) => invoke<void>("queue_insert", { paths, at }),
+  /** Take tracks out of the engine's queue; remove them from the UI's `queue` too. */
+  queueRemove: (indexes: number[]) => invoke<void>("queue_remove", { indexes }),
+  /** Put the engine's queue in a new order, `order[new] = old`; reorder the UI's `queue` the same way. */
+  queueReorder: (order: number[]) => invoke<void>("queue_reorder", { order }),
   setShuffle: (on: boolean) => invoke<void>("set_shuffle", { on }),
+  setRepeat: (repeat: Repeat) => invoke<void>("set_repeat", { repeat }),
   playlistRemoveFolder: (id: number, folder: string) =>
     invoke<Playlist>("playlist_remove_folder", { id, folder }),
   playlistScan: (id: number) => invoke<TrackMeta[]>("playlist_scan", { id }),
@@ -173,6 +311,8 @@ export const api = {
   getOutput: () => invoke<OutputSettings>("get_output"),
   setOutput: (deviceId: string | null, mode: OutputMode) =>
     invoke<OutputSettings>("set_output", { deviceId, mode }),
+  /** Turn the software volume on or off; returns the output as it now is. */
+  setSoftVolume: (enabled: boolean) => invoke<OutputSettings>("set_soft_volume", { enabled }),
   getVolume: () => invoke<DeviceVolume>("get_volume"),
   /** Change the level (0 to 1), the mute, or both. Returns the new state. */
   setVolume: (change: { level?: number; muted?: boolean }) =>
@@ -190,8 +330,14 @@ export const api = {
 export interface PlayerHandlers {
   state: (state: PlayState) => void;
   track: (track: TrackEvent) => void;
+  /** The queue was edited: the track being heard is now at `index`. */
+  current: (index: number) => void;
+  /** While stopped: the track Play starts from, or none when the queue is empty. */
+  cued: (cue: CueEvent) => void;
   position: (position: PositionEvent) => void;
   error: (message: string) => void;
+  /** The device stopped while playing. Playback stopped where it was. */
+  deviceLost: (message: string) => void;
   queueEnded: () => void;
 }
 
@@ -200,11 +346,42 @@ export async function listenPlayer(handlers: PlayerHandlers): Promise<UnlistenFn
   const unlisten = await Promise.all([
     listen<{ state: PlayState }>("player://state", (e) => handlers.state(e.payload.state)),
     listen<TrackEvent>("player://track", (e) => handlers.track(e.payload)),
+    listen<{ index: number }>("player://current", (e) => handlers.current(e.payload.index)),
+    listen<CueEvent>("player://cued", (e) => handlers.cued(e.payload)),
     listen<PositionEvent>("player://position", (e) => handlers.position(e.payload)),
     listen<{ message: string }>("player://error", (e) => handlers.error(e.payload.message)),
+    listen<{ message: string }>("player://device-lost", (e) => handlers.deviceLost(e.payload.message)),
     listen("player://queue-ended", () => handlers.queueEnded()),
   ]);
   return () => unlisten.forEach((u) => u());
+}
+
+export interface OutputHandlers {
+  /** The device that stopped is unplugged; playback resumes when it is back. */
+  waiting: (device: string) => void;
+  reconnected: (event: Reconnected) => void;
+  /** The wait was called off by a user choice (play, stop, new queue, new output), in either window. */
+  waitEnded: () => void;
+}
+
+/** Follow a device that went away and came back. Returns a function that unsubscribes. */
+export async function listenOutput(handlers: OutputHandlers): Promise<UnlistenFn> {
+  const unlisten = await Promise.all([
+    listen<string>("output://waiting", (e) => handlers.waiting(e.payload)),
+    listen<Reconnected>("output://reconnected", (e) => handlers.reconnected(e.payload)),
+    listen("output://wait-ended", () => handlers.waitEnded()),
+  ]);
+  return () => unlisten.forEach((u) => u());
+}
+
+/** The library index finished a refresh (after launch, or after the playlists changed). */
+export function listenLibrary(handler: (status: LibraryStatus) => void): Promise<UnlistenFn> {
+  return listen<LibraryStatus>("library://updated", (e) => handler(e.payload));
+}
+
+/** A spectrum analysis moved on: `done` is 0 to 1 (stays 0 when the track's length is unknown). */
+export function listenAnalysis(handler: (progress: { path: string; done: number }) => void): Promise<UnlistenFn> {
+  return listen<{ path: string; done: number }>("analysis://progress", (e) => handler(e.payload));
 }
 
 /** Called whenever the selected device's Windows volume changes, wherever it was changed. */
@@ -223,8 +400,13 @@ export function formatTime(ms: number): string {
 
 /** "44.1 kHz", "192 kHz". */
 export function formatRate(hz: number): string {
+  return `${formatKhz(hz)} kHz`;
+}
+
+/** "44.1", "192": a rate in kHz without the unit, as in "24/96". */
+export function formatKhz(hz: number): string {
   const khz = hz / 1000;
-  return `${Number.isInteger(khz) ? khz : khz.toFixed(1)} kHz`;
+  return `${Number.isInteger(khz) ? khz : khz.toFixed(1)}`;
 }
 
 export function fileName(path: string): string {

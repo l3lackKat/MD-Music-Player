@@ -19,6 +19,7 @@ The engine also runs on its own from the command line:
 ```sh
 cargo run -p mdm-engine --example play -- --list
 cargo run -p mdm-engine --example play -- --device "DX1" album/*.flac
+cargo run -p mdm-analyze --example analyze -- album/*.flac   # cutoff and bits in use
 ```
 
 ## How playback works
@@ -41,6 +42,25 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   device, which gives a short gap.
 - **Shared mode** is there for when other apps must keep playing. Windows then
   resamples and mixes, and the UI says so.
+- **Pause, resume and closing the app fade** the sound out and in. The fade
+  moves the device's own Windows volume, not the samples, so playback stays
+  bit-perfect and DSD fades too. After a pause the level goes back to where you
+  set it, behind the silence. In shared mode a fade also dips other apps on the
+  same device for a moment.
+- **A device with no volume of its own** (HDMI, S/PDIF, some DACs) uses shared
+  mode, since exclusive mode would play it at full volume. Turn on **Software
+  volume** (next to the mode buttons) to use exclusive mode anyway: MDMusic
+  then turns it down by scaling the samples, so the badge says Soft volume
+  instead of Bit-perfect, and DSD is skipped (DoP cannot be scaled). It starts
+  at 10% and remembers each device's level. Devices with a hardware volume
+  never use it.
+- **The output device is remembered.** If it is not connected at launch, the
+  system default is used for that run.
+- **Unplug the DAC mid-track** and playback stops; plug it back in and it
+  carries on from the same spot. A DAC that comes back at 100% is turned down
+  to 10% first.
+- **Media keys** and the Windows media overlay (next to the volume flyout and
+  on the lock screen) show the track and its cover, and control playback.
 
 ## Layout
 
@@ -49,6 +69,7 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
 | `crates/mdm-decode` | File decoding: PCM through symphonia, raw DSD from DSF/DFF |
 | `crates/mdm-engine` | Player, format negotiation, DoP, WASAPI and file outputs |
 | `crates/mdm-library` | Tags, cover art, lyrics, folder scanning and playlists |
+| `crates/mdm-analyze` | Spectrograms, cutoff and bits in use, for checking a file by eye |
 | `src-tauri` | The desktop app: Tauri commands and events over the engine |
 | `ui` | The Svelte UI |
 
@@ -60,30 +81,73 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   buttons, by dropping folders or files onto the playlist, or from the track
   menu. Press Rescan after files change on disk. Deleting a playlist never
   deletes music.
+- **Sort a playlist** by clicking a column heading (Title, Artist, Album or
+  Time): once for A to Z, again for Z to A, a third time (or the # heading)
+  for the playlist's own order. Play follows the order on screen, and each
+  playlist remembers its sort.
 - **Right-click a track** for its menu: play it, add it to the queue, add it
   to a playlist (or to a new one), remove it from the playlist, or show it in
   File Explorer. Tracks that are in a playlist because of a folder can only be
   removed by removing the folder.
+- **Is it really lossless?** Right-click a track and choose Spectrum. MDMusic
+  reads the whole file and draws its spectrogram, with the format, the bits
+  the samples really use, and the cutoff (where the sound stops, if it stops
+  sharply). The verdict is yours: audio that went through MP3 or AAC usually
+  stops at a hard, flat ceiling at 16-20 kHz; a hi-res file made from CD audio
+  has nothing above ~22 kHz; "16 of 24" bits means 16-bit audio padded to 24.
+  The plot is as tall as the sample rate is high (a 96 kHz file twice as tall
+  as a 48 kHz one, at the same detail), so files of any rate compare directly.
+  DSD files are not analysed yet.
 - **Shuffle** (the button left of Previous) plays the queue in random order,
   starting from the track you picked. Every track plays once before the queue
   ends, and tracks of the same format still play gapless.
+- **Repeat** (the button right of Next) goes off, all, one. Repeat all starts
+  the queue over after the last track; repeat one plays the current track again,
+  gapless. Next and Previous still move between tracks.
+- **Edit the queue**: drag tracks to move them, or right-click and choose
+  Remove from queue (or press Delete). Playback carries on.
+- **Select several tracks** in any list: Ctrl+click adds one, Shift+click a
+  range, Ctrl+A all. The right-click menu and Delete then act on all of them.
+- **Search** (the box above Queue, or Ctrl+F) looks through every playlist by
+  title, artist, album, file or folder name. Case and accents do not matter:
+  "hiep si" finds "Hiệp sĩ".
+- **Drag playlists** in the sidebar to put them in the order you like.
 - **Cover art** comes from the picture embedded in the file. Without one, an
   image named `cover`, `folder`, `front` or `album` (jpg, png or webp) in the
-  same folder is used.
+  same folder is used. Track lists show a small copy on every row. Click the
+  cover to turn it into a round record that spins while the music plays; click
+  again for the square cover.
+- **Covers from the internet** (off by default, Settings → Appearance): an
+  album with no cover in its files or folder gets one from MusicBrainz (Cover
+  Art Archive) or Deezer, found by the album's title and artist. Only those
+  two are sent; the cover is kept in `library.db` and your files are never
+  changed.
+- **Themes**: Midnight, Black (for OLED screens), Ocean, Ember and Light, in
+  Settings → Appearance. The mini player and the title bar follow.
+- **DSF and DFF files** show their tags, cover and lyrics like any other file
+  (from their ID3 tag, or a DFF's own title and artist).
 - **Lyrics** come from a `.lrc` file with the same name as the track, or else
   from the lyrics tag. Timed lyrics follow the music, and clicking a line
   jumps to it.
 
-Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`.
+Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`, the
+equalizer in `eq.json` and the output device in `output.json` next to it.
+`library.db` there is an index of every playlist's tracks (tags, small
+covers and covers from the internet), so rescans are quick; it is rebuilt
+from your files if deleted.
 
 ## Status
 
-Working: playback of a queue of files and folders, pause, seek, next and
-previous, shuffle, gapless, device and mode selection, DSD over DoP, a
-signal-path badge, playlists of folders and tracks, a track menu, tags, cover
-art and lyrics.
+Working: playback of a queue of files and folders, pause and resume with
+fades, seek, next and previous, shuffle, repeat (all or one), gapless, moving
+and removing tracks in the queue, selecting several tracks, search across all
+playlists, device and mode selection (remembered), resuming after the DAC is
+replugged, media keys and the Windows media overlay, the device's volume
+(bit-perfect), an opt-in software volume for devices without one, an opt-in
+equalizer, DSD over DoP with tags, a signal-path
+badge, playlists of folders and tracks (in your own order), sorting a playlist
+by column, a track menu, tags, cover art (square, as a spinning record, and
+small in every list), lyrics and colour themes.
 
-Not built yet: search and a full library index, reordering playlists and the
-queue, repeat, tags for DSF/DFF files (they show file names), media keys and tray,
-automatic recovery when a DAC is replugged (playback stops with an error; press
-play to resume), volume control, and an ASIO output for native DSD.
+Not built yet: browsing by artist or album, editing tags, a tray icon, and an
+ASIO output for native DSD (DSD plays over DoP, which needs no special driver).

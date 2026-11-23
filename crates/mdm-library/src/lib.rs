@@ -1,19 +1,26 @@
 //! Everything MDMusic knows about music files besides how to play them:
 //! tags, cover art, lyrics, folder scanning and playlists.
 
+mod browse;
 mod details;
+mod index;
 mod lyrics;
 mod meta;
 mod playlist;
 mod scan;
+mod tagged;
+mod web_cover;
 
+pub use browse::{AlbumSummary, ArtistDetail, ArtistSummary};
 pub use details::{
     read_details, AudioDetails, LyricsDetails, PictureDetails, TagDetails, TagField, TrackDetails,
 };
+pub use index::{fold, make_thumbnail, Library};
 pub use lyrics::{parse_lyrics, read_lyrics, LyricLine, Lyrics};
-pub use meta::{read_cover, read_meta, Cover, TrackMeta};
+pub use meta::{read_cover, read_meta, read_replay_gain, Cover, TrackMeta};
 pub use playlist::{Playlist, PlaylistStore};
 pub use scan::{expand_paths, is_audio_file, scan_folder};
+pub use web_cover::{CoverQuery, CoverSource, OnlineCovers};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LibraryError {
@@ -21,6 +28,8 @@ pub enum LibraryError {
     Io(#[from] std::io::Error),
     #[error("the playlist file is damaged: {0}")]
     Store(#[from] serde_json::Error),
+    #[error("library index: {0}")]
+    Index(#[from] rusqlite::Error),
     #[error("playlist not found")]
     NoSuchPlaylist,
     #[error("{0}")]

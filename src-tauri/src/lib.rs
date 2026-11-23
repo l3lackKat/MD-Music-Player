@@ -3,20 +3,30 @@
 //!
 //! The UI calls the commands below, listens for `player://…` events
 //! forwarded from the player thread, listens for `volume://changed` when the
-//! device's Windows volume changes, and loads cover art through the `cover`
-//! URL scheme.
+//! device's Windows volume changes and `output://…` while a device that went
+//! away is waited for, and loads cover art through the `cover` URL scheme.
 
+mod media_controls;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use mdm_engine::{
-    Command, DeviceInfo, DeviceVolume, EqSettings, Event, OutputMode, Player, VolumeChange,
-    VolumeWatch, WasapiBackend,
+    Command, DeviceInfo, DeviceVolume, EqSettings, Event, GainMode, OutputMode, PlayState, Player,
+    Repeat, ReplayGain, SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
 };
-use mdm_library::{Lyrics, Playlist, PlaylistStore, TrackDetails, TrackMeta};
-use serde::Serialize;
+use mdm_library::{
+    AlbumSummary, ArtistDetail, ArtistSummary, Cover, Library, Lyrics, Playlist, PlaylistStore,
+    TrackDetails, TrackMeta,
+};
+use serde::{Deserialize, Serialize};
 use tauri::http::{header, Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use media_controls::{Button, MediaControls};
 
 #[derive(Debug, Clone, Serialize)]
 struct OutputSettings {
@@ -27,29 +37,42 @@ struct OutputSettings {
     /// The mode the user picked. It differs from `mode` while exclusive is
     /// unavailable, and comes back when a device that allows it is chosen.
     wanted: OutputMode,
-    /// The device has a volume control that works in exclusive mode. Without
-    /// one, the volume would be stuck at full in exclusive mode, so shared
-    /// mode is used instead.
+    /// Exclusive mode can be used: the device has a volume control that works
+    /// in it, or the software volume is on. Otherwise the volume would be stuck
+    /// at full in exclusive mode, so shared mode is used instead.
     exclusive_available: bool,
+    /// The device has an adjustable volume of its own (`DeviceVolume::hardware`).
+    hardware_volume: bool,
+    /// The user turned the software volume on (kept in `output.json`).
+    soft_volume_enabled: bool,
+    /// The software volume is in use now: it is on, the device has no
+    /// hardware volume, and the mode is exclusive. The volume bar then
+    /// scales samples, so playback is not bit-perfect.
+    soft_volume: bool,
     /// The device was at full volume when it was chosen (or at launch), so it
     /// was turned down to `SAFE_LEVEL` before anything played.
     volume_lowered: bool,
+    /// At launch: the name of the saved device, which was not connected, so
+    /// the Windows default is used for now. The saved choice is kept.
+    missing_device: Option<String>,
 }
 
 /// At or above this, a device just chosen counts as being at full volume.
 /// Windows often puts USB DACs back to 100% (on replug, driver reload or
 /// reboot), which is far too loud for headphones on a DAC with real gain.
 const FULL_LEVEL: f32 = 0.995;
-/// What a device found at full volume is turned down to.
+/// What a device found at full volume is turned down to, and where the
+/// software volume starts on a device it has not been used with.
 const SAFE_LEVEL: f32 = 0.10;
 
 impl OutputSettings {
-    /// Settings for `device_id`, falling back to shared mode when the device
-    /// has no adjustable hardware volume (or its volume cannot be read).
+    /// Settings for `device_id`. A device without an adjustable hardware
+    /// volume (or whose volume cannot be read) gets shared mode, unless
+    /// `soft_enabled`: then the software volume makes exclusive mode safe.
     ///
     /// With `guard_full`, a device at full volume is first turned down to
     /// `SAFE_LEVEL`, before the stream opens.
-    fn resolve(device_id: Option<String>, wanted: OutputMode, guard_full: bool) -> Self {
+    fn resolve(device_id: Option<String>, wanted: OutputMode, guard_full: bool, soft_enabled: bool) -> Self {
         let mut volume = mdm_engine::get_volume(device_id.as_deref());
         let mut volume_lowered = false;
         if let Ok(v) = &volume {
@@ -64,25 +87,208 @@ impl OutputSettings {
                 }
             }
         }
-        let exclusive_available = volume.map(|v| v.hardware).unwrap_or(false);
+        let hardware_volume = volume.map(|v| v.hardware).unwrap_or(false);
+        let exclusive_available = hardware_volume || soft_enabled;
         let mode = if exclusive_available { wanted } else { OutputMode::Shared };
-        OutputSettings { device_id, mode, wanted, exclusive_available, volume_lowered }
+        OutputSettings {
+            device_id,
+            mode,
+            wanted,
+            exclusive_available,
+            hardware_volume,
+            soft_volume_enabled: soft_enabled,
+            soft_volume: soft_enabled && !hardware_volume && mode == OutputMode::Exclusive,
+            volume_lowered,
+            missing_device: None,
+        }
     }
 
-    fn backend(&self) -> WasapiBackend {
-        WasapiBackend { device_id: self.device_id.clone(), mode: self.mode }
+    fn backend(&self, soft: &Arc<SoftVolume>) -> WasapiBackend {
+        WasapiBackend {
+            device_id: self.device_id.clone(),
+            mode: self.mode,
+            soft: self.soft_volume.then(|| soft.clone()),
+        }
     }
+
+    /// Where this device's software volume level is kept in `output.json`.
+    fn level_key(&self) -> String {
+        self.device_id.clone().unwrap_or_else(|| "default".into())
+    }
+}
+
+/// The output the user last picked, kept in `output.json` between launches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedOutput {
+    /// `None` follows the Windows default device.
+    #[serde(default)]
+    device_id: Option<String>,
+    /// For telling the user which device is missing.
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default = "exclusive")]
+    mode: OutputMode,
+    /// Use the software volume on devices without a hardware volume.
+    #[serde(default)]
+    soft_volume: bool,
+    /// The software volume's level for each device it was used with
+    /// (`OutputSettings::level_key`).
+    #[serde(default)]
+    soft_levels: BTreeMap<String, f32>,
+    /// Even out loudness with ReplayGain tags, through the volume (not the samples).
+    #[serde(default)]
+    replay_gain: GainMode,
+    /// Look up covers on the internet for albums whose files carry none.
+    #[serde(default)]
+    web_covers: bool,
+}
+
+fn exclusive() -> OutputMode {
+    OutputMode::Exclusive
+}
+
+impl Default for SavedOutput {
+    fn default() -> Self {
+        SavedOutput {
+            device_id: None,
+            device_name: None,
+            mode: OutputMode::Exclusive,
+            soft_volume: false,
+            soft_levels: BTreeMap::new(),
+            replay_gain: GainMode::Off,
+            web_covers: false,
+        }
+    }
+}
+
+fn load_saved_output(path: &Path) -> SavedOutput {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_output(path: &Path, saved: &SavedOutput) {
+    let result = serde_json::to_vec_pretty(saved).map_err(text).and_then(|json| {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(text)?;
+        }
+        std::fs::write(path, json).map_err(text)
+    });
+    if let Err(e) = result {
+        tracing::warn!("could not save the output device: {e}");
+    }
+}
+
+/// The output to start with: the saved device if it is connected, else the
+/// Windows default (keeping the saved mode).
+fn startup_output(saved: &SavedOutput) -> OutputSettings {
+    let mut missing = None;
+    let device_id = match &saved.device_id {
+        Some(id) => {
+            let connected = mdm_engine::list_devices()
+                .map(|list| list.iter().any(|d| &d.id == id))
+                .unwrap_or(false);
+            if connected {
+                Some(id.clone())
+            } else {
+                missing = Some(saved.device_name.clone().unwrap_or_else(|| "The saved output device".into()));
+                None
+            }
+        }
+        None => None,
+    };
+    let mut output = OutputSettings::resolve(device_id, saved.mode, true, saved.soft_volume);
+    output.missing_device = missing;
+    output
 }
 
 struct AppState {
     player: Player,
     output: Mutex<OutputSettings>,
+    output_path: PathBuf,
+    /// What `output.json` holds; written back whenever it changes.
+    saved: Mutex<SavedOutput>,
+    /// The software volume streams scale by while `OutputSettings::soft_volume`.
+    soft: Arc<SoftVolume>,
     /// Follows the selected device's Windows volume, so the UI moves when it
     /// is changed in Windows, by volume keys or on the DAC.
     volume_watch: Mutex<Option<VolumeWatch>>,
+    /// Bumped to call off a wait for a device that went away (see
+    /// `reconnect_when_back`).
+    reconnect: Mutex<u64>,
     playlists: Mutex<PlaylistStore>,
+    /// Tags of every playlist's tracks, for fast rescans, search and small covers.
+    library: Arc<Library>,
+    /// Asks the refresh thread to bring the index in line with the playlists.
+    refresh: Mutex<mpsc::Sender<()>>,
     eq: Mutex<EqSettings>,
     eq_path: PathBuf,
+    /// What the player last reported, for a window that opens mid-track
+    /// (the mini player) to start from.
+    now: Mutex<NowPlaying>,
+    /// Bumped to call off the spectrum analysis running (see `analyze_track`).
+    analysis: AtomicU64,
+}
+
+/// The player as its events last described it.
+#[derive(Debug, Clone, Serialize)]
+struct NowPlaying {
+    state: PlayState,
+    /// The track heard, or while stopped the one `Play` starts from.
+    path: Option<String>,
+    position_ms: u64,
+    duration_ms: Option<u64>,
+}
+
+impl NowPlaying {
+    fn follow(&mut self, event: &Event) {
+        match event {
+            Event::State { state } => self.state = *state,
+            Event::Track { path, .. } => self.path = Some(path.clone()),
+            Event::Cued { path, .. } => {
+                if *path != self.path {
+                    // Not opened yet, so its length is unknown.
+                    self.duration_ms = None;
+                }
+                self.path = path.clone();
+            }
+            Event::Position { ms, duration_ms } => {
+                self.position_ms = *ms;
+                // A position while stopped carries no duration; keep the track's.
+                // While playing, none means the track's length is unknown.
+                if duration_ms.is_some() || self.state != PlayState::Stopped {
+                    self.duration_ms = *duration_ms;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl AppState {
+    /// Refresh the index in the background, after the playlists changed.
+    fn refresh_library(&self) {
+        let _ = self.refresh.lock().unwrap().send(());
+    }
+
+    /// Make `output` the one in use: point the software volume at its level,
+    /// send the player a backend for it, and follow its Windows volume.
+    fn apply_output(&self, app: &AppHandle, output: OutputSettings) {
+        if output.soft_volume {
+            let saved = self.saved.lock().unwrap();
+            // A device the software volume has not been used with starts quiet.
+            self.soft.set_level(saved.soft_levels.get(&output.level_key()).copied().unwrap_or(SAFE_LEVEL));
+            self.soft.set_muted(false);
+        }
+        self.player.send(Command::SetOutput(Box::new(output.backend(&self.soft))));
+        *self.output.lock().unwrap() = output;
+        watch_volume(app, self);
+    }
+
+    fn save_output(&self) {
+        save_output(&self.output_path, &self.saved.lock().unwrap());
+    }
 }
 
 type CommandResult<T> = Result<T, String>;
@@ -114,20 +320,148 @@ fn set_output(
     device_id: Option<String>,
     mode: OutputMode,
 ) -> OutputSettings {
+    cancel_reconnect(&app);
     let device_changed = state.output.lock().unwrap().device_id != device_id;
-    let output = OutputSettings::resolve(device_id, mode, device_changed);
-    state.player.send(Command::SetOutput(Box::new(output.backend())));
-    watch_volume(&app, &state, output.device_id.as_deref());
-    *state.output.lock().unwrap() = output.clone();
+    let soft_enabled = state.saved.lock().unwrap().soft_volume;
+    let output = OutputSettings::resolve(device_id, mode, device_changed, soft_enabled);
+    state.apply_output(&app, output.clone());
+
+    let device_name = output.device_id.as_ref().and_then(|id| {
+        mdm_engine::list_devices().ok()?.into_iter().find(|d| &d.id == id).map(|d| d.name)
+    });
+    {
+        let mut saved = state.saved.lock().unwrap();
+        saved.device_id = output.device_id.clone();
+        saved.device_name = device_name;
+        saved.mode = output.wanted;
+    }
+    state.save_output();
     output
 }
 
-/// Emit `volume://changed` whenever `device_id`'s volume changes, replacing
-/// the watch on the previous device.
-fn watch_volume(app: &AppHandle, state: &AppState, device_id: Option<&str>) {
+/// Turn the software volume on or off. It only acts on a device without a
+/// hardware volume, which then gets (or gives up) exclusive mode; playback
+/// carries on from the same place either way.
+#[tauri::command(async)]
+fn set_soft_volume(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> OutputSettings {
+    cancel_reconnect(&app);
+    state.saved.lock().unwrap().soft_volume = enabled;
+    state.save_output();
+    let current = state.output.lock().unwrap().clone();
+    let output = OutputSettings::resolve(current.device_id, current.wanted, false, enabled);
+    state.apply_output(&app, output.clone());
+    output
+}
+
+// ---- Reconnecting ----------------------------------------------------------
+
+/// How often to look for a device that went away.
+const RECONNECT_POLL: Duration = Duration::from_secs(1);
+/// A device still listed this long after it failed was not unplugged
+/// (driver error, taken by another app): stop waiting for it.
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(4);
+/// Time for a replugged device's driver to settle before it is opened.
+const RECONNECT_SETTLE: Duration = Duration::from_millis(700);
+
+#[derive(Clone, Serialize)]
+struct Reconnected {
+    output: OutputSettings,
+    /// The device that came back.
+    device: String,
+}
+
+/// Stop waiting for a device that went away: the user took over, maybe in
+/// the other window, so both are told (`output://wait-ended`).
+fn cancel_reconnect(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut generation = state.reconnect.lock().unwrap();
+    *generation += 1;
+    // Emitted under the lock, so it cannot overtake a `waiting` of the wait it ends.
+    let _ = app.emit("output://wait-ended", ());
+}
+
+/// The device playing `device_name` stopped mid-stream. Wait for it to come
+/// back and resume there.
+fn start_reconnect(app: &AppHandle, device_name: String) {
+    let state = app.state::<AppState>();
+    let generation = {
+        let mut g = state.reconnect.lock().unwrap();
+        *g += 1;
+        *g
+    };
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("mdm-reconnect".into())
+        .spawn(move || reconnect_when_back(app, generation, device_name));
+    if let Err(e) = spawned {
+        tracing::warn!("not waiting for the device to come back: {e}");
+    }
+}
+
+/// Poll the device list. Once the device has been gone and is back (and, when
+/// following the Windows default, is the default again), reopen it with the
+/// full-volume guard, since Windows tends to reset a replugged DAC to 100%,
+/// and play on from where it stopped. A device that never leaves the list was
+/// not unplugged, and is left alone.
+fn reconnect_when_back(app: AppHandle, generation: u64, device_name: String) {
+    let state = app.state::<AppState>();
+    let current = || *state.reconnect.lock().unwrap() == generation;
+    let started = Instant::now();
+    let mut gone = false;
+    loop {
+        std::thread::sleep(RECONNECT_POLL);
+        if !current() {
+            return;
+        }
+        let output = state.output.lock().unwrap().clone();
+        let devices = mdm_engine::list_devices().unwrap_or_default();
+        let back = devices.iter().any(|d| match &output.device_id {
+            Some(id) => &d.id == id,
+            None => d.is_default && d.name == device_name,
+        });
+        if !back {
+            if !gone {
+                gone = true;
+                // Under the lock: a wait called off meanwhile is not announced.
+                let generation_now = state.reconnect.lock().unwrap();
+                if *generation_now != generation {
+                    return;
+                }
+                let _ = app.emit("output://waiting", &device_name);
+            }
+            continue;
+        }
+        if !gone {
+            if started.elapsed() >= RECONNECT_GIVE_UP {
+                return;
+            }
+            continue;
+        }
+        std::thread::sleep(RECONNECT_SETTLE);
+        if !current() {
+            return;
+        }
+        let soft_enabled = state.saved.lock().unwrap().soft_volume;
+        let output = OutputSettings::resolve(output.device_id, output.wanted, true, soft_enabled);
+        state.apply_output(&app, output.clone());
+        state.player.send(Command::Play);
+        let _ = app.emit("output://reconnected", Reconnected { output, device: device_name });
+        return;
+    }
+}
+
+/// Emit `volume://changed` whenever the output device's Windows volume
+/// changes, replacing the watch on the previous device. While the software
+/// volume is in use, the Windows one has no effect, so it is not followed.
+fn watch_volume(app: &AppHandle, state: &AppState) {
+    let output = state.output.lock().unwrap().clone();
     let mut watch = state.volume_watch.lock().unwrap();
     // Unregister from the old device before listening to the new one.
     *watch = None;
+    if output.soft_volume {
+        return;
+    }
+    let device_id = output.device_id.as_deref();
     let handle = app.clone();
     let emit = move |volume: DeviceVolume| {
         if let Err(e) = handle.emit("volume://changed", volume) {
@@ -141,23 +475,67 @@ fn watch_volume(app: &AppHandle, state: &AppState, device_id: Option<&str>) {
     }
 }
 
-/// The Windows volume of the selected output device.
-#[tauri::command(async)]
-fn get_volume(state: State<'_, AppState>) -> CommandResult<DeviceVolume> {
-    let device_id = state.output.lock().unwrap().device_id.clone();
-    mdm_engine::get_volume(device_id.as_deref()).map_err(text)
+/// The software volume as the UI shows a volume.
+fn soft_reading(soft: &SoftVolume) -> DeviceVolume {
+    DeviceVolume { level: soft.level(), muted: soft.muted(), hardware: false, software: true }
 }
 
-/// Change the Windows volume of the selected output device. This sets the
-/// device's own level; the samples sent to it stay unchanged.
+/// The volume the volume bar controls: the selected device's Windows volume,
+/// or the software volume while it is in use.
+#[tauri::command(async)]
+fn get_volume(state: State<'_, AppState>) -> CommandResult<DeviceVolume> {
+    let output = state.output.lock().unwrap().clone();
+    if output.soft_volume {
+        return Ok(soft_reading(&state.soft));
+    }
+    mdm_engine::get_volume(output.device_id.as_deref()).map_err(text)
+}
+
+/// Change that volume. The Windows volume is the device's own level, which
+/// leaves the samples unchanged; the software volume scales them, and its
+/// level is remembered per device.
 #[tauri::command(async)]
 fn set_volume(
     state: State<'_, AppState>,
     level: Option<f32>,
     muted: Option<bool>,
 ) -> CommandResult<DeviceVolume> {
-    let device_id = state.output.lock().unwrap().device_id.clone();
-    mdm_engine::set_volume(device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
+    let output = state.output.lock().unwrap().clone();
+    if output.soft_volume {
+        if let Some(level) = level {
+            state.soft.set_level(level);
+            state.saved.lock().unwrap().soft_levels.insert(output.level_key(), state.soft.level());
+            state.save_output();
+        }
+        if let Some(muted) = muted {
+            state.soft.set_muted(muted);
+        }
+        return Ok(soft_reading(&state.soft));
+    }
+    mdm_engine::set_volume(output.device_id.as_deref(), VolumeChange { level, muted }).map_err(text)
+}
+
+// ---- ReplayGain ------------------------------------------------------------
+
+#[tauri::command]
+fn get_replay_gain(state: State<AppState>) -> GainMode {
+    state.saved.lock().unwrap().replay_gain
+}
+
+/// Turn ReplayGain off, or on by track or album. It moves the volume, never
+/// the samples; the choice is kept in `output.json`.
+#[tauri::command]
+fn set_replay_gain(state: State<AppState>, mode: GainMode) -> GainMode {
+    state.saved.lock().unwrap().replay_gain = mode;
+    state.save_output();
+    state.player.send(Command::SetReplayGain(mode));
+    mode
+}
+
+/// The engine reads gains through this; tags are the library's business.
+fn read_gain(path: &Path) -> ReplayGain {
+    let (track_db, album_db) = mdm_library::read_replay_gain(path);
+    ReplayGain { track_db, album_db }
 }
 
 // ---- Equalizer -------------------------------------------------------------
@@ -199,7 +577,8 @@ fn supported_extensions() -> Vec<&'static str> {
 }
 
 #[tauri::command]
-fn play_files(state: State<AppState>, paths: Vec<String>, index: usize) {
+fn play_files(app: AppHandle, state: State<AppState>, paths: Vec<String>, index: usize) {
+    cancel_reconnect(&app);
     let paths = paths.into_iter().map(PathBuf::from).collect();
     state.player.send(Command::Load { paths, index });
 }
@@ -210,13 +589,40 @@ fn append_files(state: State<AppState>, paths: Vec<String>) {
     state.player.send(Command::Append(paths.into_iter().map(PathBuf::from).collect()));
 }
 
+/// "Play next": put tracks into the queue at `at`, just after the current
+/// track, to play next (with shuffle on too). The UI inserts them in its own
+/// list at the same place.
+#[tauri::command]
+fn queue_insert(state: State<AppState>, paths: Vec<String>, at: usize) {
+    let paths = paths.into_iter().map(PathBuf::from).collect();
+    state.player.send(Command::Insert { paths, at });
+}
+
+/// Take tracks out of the queue. The UI removes them from its own list too.
+#[tauri::command]
+fn queue_remove(state: State<AppState>, indexes: Vec<usize>) {
+    state.player.send(Command::Remove(indexes));
+}
+
+/// Put the queue in a new order, `order[new] = old`. The UI reorders its own list the same way.
+#[tauri::command]
+fn queue_reorder(state: State<AppState>, order: Vec<usize>) {
+    state.player.send(Command::Reorder(order));
+}
+
 #[tauri::command]
 fn set_shuffle(state: State<AppState>, on: bool) {
     state.player.send(Command::SetShuffle(on));
 }
 
 #[tauri::command]
-fn play(state: State<AppState>) {
+fn set_repeat(state: State<AppState>, repeat: Repeat) {
+    state.player.send(Command::SetRepeat(repeat));
+}
+
+#[tauri::command]
+fn play(app: AppHandle, state: State<AppState>) {
+    cancel_reconnect(&app);
     state.player.send(Command::Play);
 }
 
@@ -226,7 +632,8 @@ fn pause(state: State<AppState>) {
 }
 
 #[tauri::command]
-fn stop(state: State<AppState>) {
+fn stop(app: AppHandle, state: State<AppState>) {
+    cancel_reconnect(&app);
     state.player.send(Command::Stop);
 }
 
@@ -245,14 +652,127 @@ fn previous(state: State<AppState>) {
     state.player.send(Command::Previous);
 }
 
+/// What is playing, as the player last reported it.
+#[tauri::command]
+fn now_playing(state: State<AppState>) -> NowPlaying {
+    state.now.lock().unwrap().clone()
+}
+
+// ---- Mini player -----------------------------------------------------------
+
+/// The mini player's window label. It loads the same page, which shows the
+/// mini player when it finds itself in this window.
+const MINI: &str = "mini";
+const MINI_SIZE: (f64, f64) = (360.0, 104.0);
+/// Gap between the mini player and the screen edges, in logical pixels.
+const MINI_MARGIN: f64 = 24.0;
+
+/// Swap the main window for the mini player: a small window that stays on
+/// top, in the bottom-right corner of the main window's screen. Async:
+/// creating a window from a synchronous command can deadlock on Windows.
+#[tauri::command(async)]
+fn open_mini_player(app: AppHandle) -> CommandResult<()> {
+    let main = app.get_webview_window("main");
+    if let Some(mini) = app.get_webview_window(MINI) {
+        mini.show().map_err(text)?;
+        mini.set_focus().map_err(text)?;
+    } else {
+        let corner = main.as_ref().and_then(|w| w.current_monitor().ok().flatten()).map(|m| {
+            let scale = m.scale_factor();
+            let area = m.work_area();
+            let right = (area.position.x as f64 + area.size.width as f64) / scale;
+            let bottom = (area.position.y as f64 + area.size.height as f64) / scale;
+            (right - MINI_SIZE.0 - MINI_MARGIN, bottom - MINI_SIZE.1 - MINI_MARGIN)
+        });
+        let mut builder = tauri::WebviewWindowBuilder::new(&app, MINI, tauri::WebviewUrl::App("index.html".into()))
+            .title("MDMusic")
+            .inner_size(MINI_SIZE.0, MINI_SIZE.1)
+            .resizable(false)
+            .maximizable(false)
+            .decorations(false)
+            .always_on_top(true)
+            .background_color(tauri::window::Color(13, 14, 18, 255));
+        if let Some((x, y)) = corner {
+            builder = builder.position(x, y);
+        }
+        builder.build().map_err(text)?;
+    }
+    if let Some(main) = main {
+        main.hide().map_err(text)?;
+    }
+    Ok(())
+}
+
+/// Back from the mini player to the main window.
+#[tauri::command(async)]
+fn close_mini_player(app: AppHandle) -> CommandResult<()> {
+    show_main(&app);
+    if let Some(mini) = app.get_webview_window(MINI) {
+        mini.close().map_err(text)?;
+    }
+    Ok(())
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.unminimize();
+        let _ = main.set_focus();
+    }
+}
+
 // ---- Library ---------------------------------------------------------------
 // Commands marked `async` read files, so they run off the main thread.
 
 /// Turn dropped or picked files and folders into tracks with their tags.
 #[tauri::command(async)]
-fn expand_paths(paths: Vec<String>) -> Vec<TrackMeta> {
+fn expand_paths(state: State<'_, AppState>, paths: Vec<String>) -> Vec<TrackMeta> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    mdm_library::expand_paths(&paths)
+    state.library.expand_paths(&paths)
+}
+
+/// Most tracks a search returns.
+const SEARCH_LIMIT: usize = 500;
+
+/// Tracks of any playlist matching every word of `query`, accents and case ignored.
+#[tauri::command(async)]
+fn search(state: State<'_, AppState>, query: String) -> CommandResult<Vec<TrackMeta>> {
+    state.library.search(&query, SEARCH_LIMIT).map_err(text)
+}
+
+/// Every album in the playlists, by artist, year and title.
+#[tauri::command(async)]
+fn albums(state: State<'_, AppState>) -> CommandResult<Vec<AlbumSummary>> {
+    state.library.albums().map_err(text)
+}
+
+/// The tracks of one album (`AlbumSummary::id`), in album order.
+#[tauri::command(async)]
+fn album_tracks(state: State<'_, AppState>, id: String) -> CommandResult<Vec<TrackMeta>> {
+    state.library.album_tracks(&id).map_err(text)
+}
+
+/// Every artist in the playlists, by name.
+#[tauri::command(async)]
+fn artists(state: State<'_, AppState>) -> CommandResult<Vec<ArtistSummary>> {
+    state.library.artists().map_err(text)
+}
+
+/// One artist's albums and tracks; `None` when the library has none of theirs.
+#[tauri::command(async)]
+fn artist(state: State<'_, AppState>, name: String) -> CommandResult<Option<ArtistDetail>> {
+    state.library.artist(&name).map_err(text)
+}
+
+#[derive(Clone, Serialize)]
+struct LibraryStatus {
+    /// Tracks in the index: everything the playlists hold, once scanned.
+    tracks: usize,
+}
+
+#[tauri::command(async)]
+fn library_status(state: State<'_, AppState>) -> LibraryStatus {
+    LibraryStatus { tracks: state.library.track_count() }
 }
 
 /// Everything known about one file, for the track info panel.
@@ -287,7 +807,15 @@ fn playlist_rename(state: State<AppState>, id: u64, name: String) -> CommandResu
 
 #[tauri::command]
 fn playlist_delete(state: State<AppState>, id: u64) -> CommandResult<()> {
-    state.playlists.lock().unwrap().delete(id).map_err(text)
+    state.playlists.lock().unwrap().delete(id).map_err(text)?;
+    state.refresh_library();
+    Ok(())
+}
+
+/// Put the playlists in the order of `ids` and return them all.
+#[tauri::command]
+fn playlist_reorder(state: State<AppState>, ids: Vec<u64>) -> CommandResult<Vec<Playlist>> {
+    state.playlists.lock().unwrap().reorder(&ids).map_err(text)
 }
 
 #[derive(Serialize)]
@@ -302,12 +830,21 @@ struct PlaylistAdded {
 fn playlist_add(state: State<AppState>, id: u64, paths: Vec<String>) -> CommandResult<PlaylistAdded> {
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     let (playlist, skipped) = state.playlists.lock().unwrap().add_paths(id, &paths).map_err(text)?;
+    state.refresh_library();
     Ok(PlaylistAdded { playlist, skipped })
 }
 
+/// Remove single files from a playlist. Tracks that come from a folder stay.
 #[tauri::command]
-fn playlist_remove_file(state: State<AppState>, id: u64, file: String) -> CommandResult<Playlist> {
-    state.playlists.lock().unwrap().remove_file(id, &file).map_err(text)
+fn playlist_remove_files(state: State<AppState>, id: u64, files: Vec<String>) -> CommandResult<Playlist> {
+    let mut store = state.playlists.lock().unwrap();
+    let mut playlist = store.get(id).map_err(text)?.clone();
+    for file in &files {
+        playlist = store.remove_file(id, file).map_err(text)?;
+    }
+    drop(store);
+    state.refresh_library();
+    Ok(playlist)
 }
 
 /// Open File Explorer with the track selected.
@@ -328,21 +865,176 @@ fn show_in_folder(path: String) -> CommandResult<()> {
 
 #[tauri::command]
 fn playlist_remove_folder(state: State<AppState>, id: u64, folder: String) -> CommandResult<Playlist> {
-    state.playlists.lock().unwrap().remove_folder(id, &folder).map_err(text)
+    let playlist = state.playlists.lock().unwrap().remove_folder(id, &folder).map_err(text)?;
+    state.refresh_library();
+    Ok(playlist)
 }
 
-/// Read the playlist's folders from disk and return its tracks.
+/// Read the playlist's folders from disk and return its tracks. Files that
+/// have not changed come from the index, without being opened.
 #[tauri::command(async)]
 fn playlist_scan(state: State<AppState>, id: u64) -> CommandResult<Vec<TrackMeta>> {
     // Copy the playlist out so the lock is not held during the scan.
     let playlist = state.playlists.lock().unwrap().get(id).map_err(text)?.clone();
-    Ok(playlist.scan())
+    state.library.scan_playlist(&playlist).map_err(text)
+}
+
+// ---- Spectrum analysis -----------------------------------------------------
+
+#[derive(Serialize)]
+struct SpectrumReply {
+    #[serde(flatten)]
+    spectrum: mdm_analyze::Spectrum,
+    /// The spectrogram's levels (`Spectrum::pixels`), base64.
+    pixels: String,
+    /// The levels pixel 0 and pixel 255 stand for.
+    db_floor: f32,
+    db_top: f32,
+}
+
+#[derive(Clone, Serialize)]
+struct AnalysisProgress {
+    path: String,
+    /// 0 to 1; stays 0 when the track's length is unknown.
+    done: f32,
+}
+
+/// Decode the whole track and return its spectrogram and what it suggests
+/// (a lossy or upsampled source, padded bits). Reports `analysis://progress`
+/// as it goes. Starting another analysis, or `cancel_analysis`, stops this one.
+#[tauri::command(async)]
+fn analyze_track(app: AppHandle, state: State<'_, AppState>, path: String) -> CommandResult<SpectrumReply> {
+    let generation = state.analysis.fetch_add(1, Ordering::SeqCst) + 1;
+    let file = PathBuf::from(&path);
+    if !file.is_file() {
+        return Err("The file no longer exists.".into());
+    }
+    let mut reported = -1.0f32;
+    let mut spectrum = mdm_analyze::analyze(&file, |done| {
+        if state.analysis.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        if done - reported >= 0.01 {
+            reported = done;
+            let _ = app.emit("analysis://progress", AnalysisProgress { path: path.clone(), done });
+        }
+        true
+    })
+    .map_err(text)?;
+    use base64::Engine as _;
+    let pixels = base64::engine::general_purpose::STANDARD.encode(std::mem::take(&mut spectrum.pixels));
+    Ok(SpectrumReply { spectrum, pixels, db_floor: mdm_analyze::DB_FLOOR, db_top: mdm_analyze::DB_TOP })
+}
+
+/// Stop the analysis running, if any. It then fails with "cancelled".
+#[tauri::command]
+fn cancel_analysis(state: State<AppState>) {
+    state.analysis.fetch_add(1, Ordering::SeqCst);
+}
+
+// ---- Library index ---------------------------------------------------------
+
+/// Open the index. If it cannot be opened, set it aside and start a new
+/// one; failing that, keep it in memory for this run.
+fn open_library(path: &Path) -> Library {
+    Library::open(path)
+        .or_else(|e| {
+            tracing::error!("the library index could not be opened ({e}); starting a new one");
+            let _ = std::fs::rename(path, path.with_extension("db.damaged"));
+            Library::open(path)
+        })
+        .or_else(|_| Library::open_in_memory())
+        .expect("an in-memory index always opens")
+}
+
+/// Keep the index in line with the playlists: one full refresh at launch,
+/// then one after each change (several changes in a row make one refresh).
+/// Each refresh ends with `library://updated`.
+fn start_refresher(app: AppHandle, requests: mpsc::Receiver<()>) {
+    let spawned = std::thread::Builder::new().name("mdm-library".into()).spawn(move || {
+        while requests.recv().is_ok() {
+            while requests.try_recv().is_ok() {}
+            let state = app.state::<AppState>();
+            let playlists = state.playlists.lock().unwrap().list().to_vec();
+            match state.library.refresh(&playlists) {
+                Ok(tracks) => {
+                    let _ = app.emit("library://updated", LibraryStatus { tracks });
+                }
+                Err(e) => tracing::warn!("library refresh failed: {e}"),
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("the library index will not refresh: {e}");
+    }
 }
 
 // ---- Cover art -------------------------------------------------------------
 
-/// Answer `cover://<track path>` with the track's cover image.
-fn cover_response(uri_path: &str) -> Response<Vec<u8>> {
+#[tauri::command]
+fn get_web_covers(state: State<AppState>) -> bool {
+    state.saved.lock().unwrap().web_covers
+}
+
+/// Turn covers from the internet on or off (kept in `output.json`). Only an
+/// album's title and artist are sent, and only for albums without a cover.
+#[tauri::command]
+fn set_web_covers(state: State<AppState>, enabled: bool) -> bool {
+    state.saved.lock().unwrap().web_covers = enabled;
+    state.save_output();
+    enabled
+}
+
+/// A track's full-size cover: its own, else one from the internet when
+/// `web` (the user turned them on). May wait on the network.
+fn track_cover(app: &AppHandle, track: &Path, web: bool) -> Option<Cover> {
+    mdm_library::read_cover(track)
+        .or_else(|| web.then(|| app.state::<AppState>().library.web_cover(track)).flatten())
+}
+
+fn web_covers_on(app: &AppHandle) -> bool {
+    app.state::<AppState>().saved.lock().unwrap().web_covers
+}
+
+/// Small covers are made this many pixels on their longest side: sharp at
+/// 32 CSS pixels up to 300% display scaling.
+const THUMB_PX: u32 = 96;
+/// The larger size, `?thumb=grid`, for the album and artist grids: sharp at
+/// 160 CSS pixels up to 200%.
+const GRID_THUMB_PX: u32 = 320;
+/// Small covers made at once. A screenful of rows asks for many together,
+/// and each decodes a full-size picture.
+const THUMB_WORKERS: usize = 3;
+
+/// A counting lock: at most `THUMB_WORKERS` small covers in the making.
+struct Slots {
+    busy: Mutex<usize>,
+    freed: Condvar,
+}
+
+static THUMB_SLOTS: Slots = Slots { busy: Mutex::new(0), freed: Condvar::new() };
+
+impl Slots {
+    fn run<T>(&self, work: impl FnOnce() -> T) -> T {
+        let mut busy = self.busy.lock().unwrap();
+        while *busy >= THUMB_WORKERS {
+            busy = self.freed.wait(busy).unwrap();
+        }
+        *busy += 1;
+        drop(busy);
+        let out = work();
+        *self.busy.lock().unwrap() -= 1;
+        self.freed.notify_one();
+        out
+    }
+}
+
+/// Answer `cover://<track path>` with the track's cover image, or with a
+/// small JPEG of it when the query holds `thumb` (`thumb=grid` for the
+/// larger size). A track without a cover gets one from the internet when the
+/// user turned them on and the query holds `web`: the UI adds it while the
+/// setting is on, so a picture the webview kept never outlives the setting.
+fn cover_response(app: &AppHandle, uri_path: &str, query: Option<&str>) -> Response<Vec<u8>> {
     let not_found = || {
         Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).expect("static response")
     };
@@ -354,11 +1046,28 @@ fn cover_response(uri_path: &str) -> Response<Vec<u8>> {
     if !mdm_library::is_audio_file(track) {
         return not_found();
     }
-    match mdm_library::read_cover(track) {
-        Some(cover) => Response::builder()
-            .header(header::CONTENT_TYPE, cover.mime)
+    let params: Vec<&str> = query.map(|q| q.split('&').collect()).unwrap_or_default();
+    let thumb = params.iter().find_map(|p| match *p {
+        "thumb" => Some(THUMB_PX),
+        "thumb=grid" => Some(GRID_THUMB_PX),
+        _ => None,
+    });
+    let web = params.contains(&"web") && web_covers_on(app);
+    let cover = if let Some(px) = thumb {
+        let library = app.state::<AppState>().library.clone();
+        THUMB_SLOTS
+            .run(|| library.thumbnail(track, px))
+            // Outside the slots: waiting on the network must not hold up covers at hand.
+            .or_else(|| web.then(|| library.web_thumbnail(track, px)).flatten())
+            .map(|data| ("image/jpeg".to_string(), data))
+    } else {
+        track_cover(app, track, web).map(|c| (c.mime, c.data))
+    };
+    match cover {
+        Some((mime, data)) => Response::builder()
+            .header(header::CONTENT_TYPE, mime)
             .header(header::CACHE_CONTROL, "max-age=600")
-            .body(cover.data)
+            .body(data)
             .unwrap_or_else(|_| not_found()),
         None => not_found(),
     }
@@ -370,11 +1079,36 @@ fn event_name(event: &Event) -> &'static str {
     match event {
         Event::State { .. } => "player://state",
         Event::Track { .. } => "player://track",
+        Event::Current { .. } => "player://current",
+        Event::Cued { .. } => "player://cued",
         Event::Position { .. } => "player://position",
         Event::Error { .. } => "player://error",
+        Event::DeviceLost { .. } => "player://device-lost",
         Event::QueueEnded => "player://queue-ended",
     }
 }
+
+/// A media key or the Windows media overlay was used.
+fn on_media_button(app: &AppHandle, button: Button) {
+    let state = app.state::<AppState>();
+    let command = match button {
+        Button::Play => {
+            cancel_reconnect(app);
+            Command::Play
+        }
+        Button::Pause => Command::Pause,
+        Button::Stop => {
+            cancel_reconnect(app);
+            Command::Stop
+        }
+        Button::Next => Command::Next,
+        Button::Previous => Command::Previous,
+    };
+    state.player.send(command);
+}
+
+/// How long closing the app waits for the fade-out and the device to be let go.
+const EXIT_WAIT: Duration = Duration::from_millis(1500);
 
 /// Open the playlist file. If it cannot be read, set it aside and start
 /// empty rather than refusing to launch.
@@ -392,34 +1126,94 @@ fn open_playlists(path: &Path) -> PlaylistStore {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .register_asynchronous_uri_scheme_protocol("cover", |_ctx, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("cover", |ctx, request, responder| {
             let uri_path = request.uri().path().to_string();
-            std::thread::spawn(move || responder.respond(cover_response(&uri_path)));
+            let query = request.uri().query().map(str::to_string);
+            let app = ctx.app_handle().clone();
+            std::thread::spawn(move || {
+                responder.respond(cover_response(&app, &uri_path, query.as_deref()))
+            });
         })
         .setup(|app| {
-            let output = OutputSettings::resolve(None, OutputMode::Exclusive, true);
-            let player = Player::new(Box::new(output.backend()));
-            let events = player.events();
             let data_dir = app.path().app_data_dir()?;
+            let output_path = data_dir.join("output.json");
+            let saved = load_saved_output(&output_path);
+            let output = startup_output(&saved);
+            let soft = SoftVolume::new(
+                saved.soft_levels.get(&output.level_key()).copied().unwrap_or(SAFE_LEVEL),
+            );
+            let player = Player::new(Box::new(output.backend(&soft)));
+            let events = player.events();
             let playlists = open_playlists(&data_dir.join("playlists.json"));
+            let library = Arc::new(open_library(&data_dir.join("library.db")));
+            let (refresh_tx, refresh_rx) = mpsc::channel();
             let eq_path = data_dir.join("eq.json");
             let eq = load_eq(&eq_path);
             player.send(Command::SetEq(eq.clone()));
-            let device_id = output.device_id.clone();
+            player.send(Command::SetGainReader(Box::new(|path: &Path| read_gain(path))));
+            player.send(Command::SetReplayGain(saved.replay_gain));
             app.manage(AppState {
                 player,
                 output: Mutex::new(output),
+                output_path,
+                saved: Mutex::new(saved),
+                soft,
                 volume_watch: Mutex::new(None),
+                reconnect: Mutex::new(0),
                 playlists: Mutex::new(playlists),
+                library,
+                refresh: Mutex::new(refresh_tx),
                 eq: Mutex::new(eq),
                 eq_path,
+                now: Mutex::new(NowPlaying {
+                    state: PlayState::Stopped,
+                    path: None,
+                    position_ms: 0,
+                    duration_ms: None,
+                }),
+                analysis: AtomicU64::new(0),
             });
-            watch_volume(app.handle(), &app.state::<AppState>(), device_id.as_deref());
+            watch_volume(app.handle(), &app.state::<AppState>());
+            start_refresher(app.handle().clone(), refresh_rx);
+            // The first refresh picks up whatever changed on disk while the app was closed.
+            app.state::<AppState>().refresh_library();
+
+            // Media keys and the Windows media overlay. The app works without them.
+            let media = app.get_webview_window("main").and_then(|window| {
+                let hwnd = window.hwnd().ok()?;
+                let handle = app.handle().clone();
+                let covers = app.handle().clone();
+                MediaControls::new(
+                    hwnd,
+                    move |button| on_media_button(&handle, button),
+                    move |path| track_cover(&covers, path, web_covers_on(&covers)).map(|c| c.data),
+                )
+                    .map_err(|e| tracing::warn!("no media controls: {e}"))
+                    .ok()
+            });
 
             // Forward player events to the UI for as long as the player lives.
             let handle = app.handle().clone();
             std::thread::Builder::new().name("mdm-events".into()).spawn(move || {
+                // The device of the track being heard, to wait for if it goes away.
+                let mut device = String::new();
                 for event in events {
+                    handle.state::<AppState>().now.lock().unwrap().follow(&event);
+                    match &event {
+                        Event::State { state } => {
+                            if let Some(m) = &media {
+                                m.set_state(*state);
+                            }
+                        }
+                        Event::Track { path, signal_path, .. } => {
+                            device = signal_path.device.clone();
+                            if let Some(m) = &media {
+                                m.set_track(path);
+                            }
+                        }
+                        Event::DeviceLost { .. } => start_reconnect(&handle, device.clone()),
+                        _ => {}
+                    }
                     if let Err(e) = handle.emit(event_name(&event), &event) {
                         tracing::warn!("could not emit a player event: {e}");
                     }
@@ -427,24 +1221,43 @@ pub fn run() {
             })?;
             Ok(())
         })
+        // The mini player closed some other way (Alt+F4): bring the main window back,
+        // or the app would be left running with no window.
+        .on_window_event(|window, event| {
+            if window.label() == MINI && matches!(event, tauri::WindowEvent::Destroyed) {
+                show_main(window.app_handle());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             list_devices,
             get_output,
             set_output,
+            set_soft_volume,
             get_volume,
             set_volume,
             get_eq,
             set_eq,
+            get_replay_gain,
+            set_replay_gain,
+            get_web_covers,
+            set_web_covers,
             supported_extensions,
             play_files,
             append_files,
+            queue_insert,
+            queue_remove,
+            queue_reorder,
             set_shuffle,
+            set_repeat,
             play,
             pause,
             stop,
             seek,
             next,
             previous,
+            now_playing,
+            open_mini_player,
+            close_mini_player,
             expand_paths,
             get_lyrics,
             track_details,
@@ -453,18 +1266,29 @@ pub fn run() {
             playlist_rename,
             playlist_delete,
             playlist_add,
-            playlist_remove_file,
+            playlist_remove_files,
+            playlist_reorder,
+            search,
+            albums,
+            album_tracks,
+            artists,
+            artist,
+            library_status,
             show_in_folder,
             playlist_remove_folder,
             playlist_scan,
+            analyze_track,
+            cancel_analysis,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start MDMusic")
         .run(|app, event| {
-            // Release the audio device before the process goes away.
+            // The window is gone: fade out and release the audio device
+            // before the process goes away.
             if let tauri::RunEvent::Exit = event {
                 let state = app.state::<AppState>();
-                state.player.send(Command::Stop);
+                cancel_reconnect(app);
+                state.player.quit(EXIT_WAIT);
                 state.volume_watch.lock().unwrap().take();
             }
         });

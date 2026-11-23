@@ -14,6 +14,73 @@
   --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
 }
 
+/* Themes (`lib/theme.ts`), set on <html> or on any element, so a preview in
+   Settings shows a theme inside another one. Each sets every colour, Midnight
+   too (the @theme above is what shows before the script runs). In the light
+   theme the accent is dark enough for light text (`text-base`) on it. */
+:root {
+  color-scheme: dark;
+}
+[data-theme="midnight"],
+[data-theme="black"],
+[data-theme="ocean"],
+[data-theme="ember"] {
+  color-scheme: dark;
+  --color-good: #6ee7b7;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+}
+[data-theme="midnight"] {
+  --color-base: #0d0e12;
+  --color-panel: #15171c;
+  --color-raised: #1d2027;
+  --color-line: #2a2e37;
+  --color-ink: #eceef2;
+  --color-muted: #8b919e;
+  --color-accent: #a78bfa;
+}
+[data-theme="black"] {
+  --color-base: #000000;
+  --color-panel: #0a0a0c;
+  --color-raised: #17171a;
+  --color-line: #26262b;
+  --color-ink: #ededf0;
+  --color-muted: #8c8c96;
+  --color-accent: #f472b6;
+}
+[data-theme="ocean"] {
+  --color-base: #0a111d;
+  --color-panel: #0f1828;
+  --color-raised: #162236;
+  --color-line: #233249;
+  --color-ink: #e6edf7;
+  --color-muted: #8797ad;
+  --color-accent: #38bdf8;
+}
+[data-theme="ember"] {
+  --color-base: #13100d;
+  --color-panel: #1a1612;
+  --color-raised: #241e19;
+  --color-line: #362d25;
+  --color-ink: #f1ebe3;
+  --color-muted: #a39584;
+  --color-accent: #fb923c;
+  --color-warn: #facc15;
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --color-base: #f3f4f7;
+  --color-panel: #fbfbfd;
+  --color-raised: #e8eaef;
+  --color-line: #d6d9e0;
+  --color-ink: #16181d;
+  --color-muted: #5c6270;
+  --color-accent: #6d3fe0;
+  --color-good: #047857;
+  --color-warn: #b45309;
+  --color-bad: #c81e1e;
+}
+
 html,
 body,
 #app {
@@ -46,22 +113,30 @@ select option {
   color: var(--color-ink);
 }
 
-/* Seek bar: a thin track that fills up to the thumb. */
+/* Seek bar: a thin track that fills up to the thumb. `--fill` is 0..1.
+   The thumb's centre sits on the end of the fill: at 0 it is on the bar's
+   very start (half the circle sticking out) with no fill showing, at 1 on
+   its end. The thumb's own track reaches half a thumb past each end, since
+   the browser keeps the whole thumb inside it. */
 input[type="range"].seek {
+  --thumb: 12px;
   appearance: none;
   height: 4px;
   border-radius: 2px;
   background: linear-gradient(
     to right,
-    var(--color-accent) var(--fill, 0%),
-    var(--color-line) var(--fill, 0%)
+    var(--color-accent) calc(100% * var(--fill, 0)),
+    var(--color-line) calc(100% * var(--fill, 0))
   );
   cursor: pointer;
 }
+input[type="range"].seek::-webkit-slider-runnable-track {
+  margin-inline: calc(var(--thumb) / -2);
+}
 input[type="range"].seek::-webkit-slider-thumb {
   appearance: none;
-  width: 12px;
-  height: 12px;
+  width: var(--thumb);
+  height: var(--thumb);
   border-radius: 50%;
   background: var(--color-ink);
   opacity: 0;
@@ -101,8 +176,79 @@ input[type="range"].eq-slider::-webkit-slider-thumb {
   box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
 }
 
+/* The row of the track being heard: three bars that rise and fall. Still bars when
+   the system asks for less motion. */
+.playing-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+.playing-bars > span {
+  width: 3px;
+  height: 100%;
+  border-radius: 1px;
+  background: currentColor;
+  transform-origin: bottom;
+  animation: playing-bar 0.9s ease-in-out infinite alternate;
+}
+.playing-bars > span:nth-child(2) {
+  animation-delay: -0.45s;
+}
+.playing-bars > span:nth-child(3) {
+  animation-delay: -0.2s;
+}
+@keyframes playing-bar {
+  from {
+    transform: scaleY(0.25);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .playing-bars > span {
+    animation: none;
+    transform: scaleY(0.6);
+  }
+}
+
+/* Loading marks wait a moment before they show, so a quick load does not flash one. */
+@keyframes appear-late {
+  from {
+    opacity: 0;
+  }
+}
+.appear-late {
+  animation: appear-late 0.2s ease-out 0.15s backwards;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Keyboard focus: one accent ring everywhere. In the base layer, so a
+   component that draws its own focus (`outline-none` plus a border) still wins. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  /* Rows sit flush in a scrolling list: an outside ring would be clipped. */
+  [data-row]:focus-visible {
+    outline-offset: -2px;
+  }
+}
+
+/* Short windows: lower EQ sliders, so the panel fits between the header and the transport. */
+@media (max-height: 640px) {
+  input[type="range"].eq-slider {
+    height: 72px;
+  }
 }
 ::-webkit-scrollbar-thumb {
   background: var(--color-line);

@@ -14,16 +14,13 @@
 </script>
 
 <script lang="ts">
-  // The equalizer panel. Changes are sent as they are made, one request in
+  // The equalizer, shown in Settings. Changes are sent as they are made, one request in
   // flight at a time, and the player saves them. While the EQ is on, PCM
   // tracks are not bit-perfect; DSD always passes untouched.
   import { api, type EqBand, type EqSettings } from "./api";
+  import Switch from "./Switch.svelte";
 
-  let {
-    settings = $bindable(),
-    onclose,
-    onerror,
-  }: { settings: EqSettings; onclose: () => void; onerror: (e: unknown) => void } = $props();
+  let { settings = $bindable(), onerror }: { settings: EqSettings; onerror: (e: unknown) => void } = $props();
 
   const MAX_GAIN = 12;
   const PREAMP_MIN = -24;
@@ -159,40 +156,17 @@
   }
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-  class="fixed bottom-28 right-5 z-40 w-[580px] max-w-[calc(100vw-2.5rem)] rounded-2xl border border-line bg-panel p-5 shadow-2xl shadow-black/60"
-  role="dialog"
-  aria-label="Equalizer"
-  tabindex="-1"
-  onkeydown={(e) => {
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      onclose();
-    }
-  }}
->
-  <div class="flex items-center gap-3">
-    <h2 class="text-[15px] font-semibold">Equalizer</h2>
-    <button
-      role="switch"
-      aria-checked={settings.enabled}
-      aria-label="Equalizer on"
-      class="relative h-5 w-9 rounded-full transition-colors {settings.enabled ? 'bg-accent' : 'bg-line'}"
-      onclick={() => update({ enabled: !settings.enabled })}
-    >
-      <span
-        class="absolute top-0.5 h-4 w-4 rounded-full bg-ink transition-[left] {settings.enabled
-          ? 'left-[18px]'
-          : 'left-0.5'}"
-      ></span>
-    </button>
-    <span class="text-xs {settings.enabled ? 'text-warn' : 'text-muted'}">
-      {settings.enabled ? "On: PCM is no longer bit-perfect" : "Off: bit-perfect"}
-    </span>
-
+<div>
+  <div class="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-base/40 p-3.5">
+    <Switch checked={settings.enabled} label="Equalizer on" onchange={() => update({ enabled: !settings.enabled })} />
+    <div class="min-w-0 flex-1">
+      <p class="text-sm font-medium">{settings.enabled ? "Equalizer is on" : "Equalizer is off"}</p>
+      <p class="text-xs {settings.enabled ? 'text-warn' : 'text-muted'}">
+        {settings.enabled ? "PCM tracks are no longer bit-perfect. DSD is never equalized." : "Every sample reaches the DAC unchanged."}
+      </p>
+    </div>
     <select
-      class="ml-auto rounded-lg border border-line bg-raised px-2.5 py-1 text-sm outline-none focus:border-accent"
+      class="rounded-lg border border-line bg-raised px-2.5 py-1.5 text-sm outline-none focus:border-accent"
       value={presetName}
       onchange={(e) => applyPreset(e.currentTarget.value)}
       aria-label="Preset"
@@ -202,13 +176,6 @@
         <option value={preset.name}>{preset.name}</option>
       {/each}
     </select>
-    <button
-      class="grid h-7 w-7 place-items-center rounded-lg text-muted hover:bg-raised hover:text-ink"
-      onclick={onclose}
-      aria-label="Close equalizer"
-    >
-      ✕
-    </button>
   </div>
 
   <!-- Response: the bands plus the preamp -->
@@ -274,7 +241,7 @@
     {#if headroomDb > 0.05}
       <span class="text-warn">Boosts exceed the preamp by {headroomDb.toFixed(1)} dB: loud passages may clip.</span>
     {:else}
-      <span class="text-muted">Changes reach your ears in under a second. DSD is never equalized.</span>
+      <span class="text-muted">Changes reach your ears in under a second. Double-click a slider for 0 dB.</span>
     {/if}
     <span class="ml-auto flex shrink-0 gap-1">
       <button

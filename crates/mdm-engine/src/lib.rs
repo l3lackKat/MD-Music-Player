@@ -7,24 +7,28 @@
 //!
 //! Samples are only ever shifted into a container that holds all of their
 //! bits. Nothing scales, dithers, resamples or mixes them, unless the user
-//! turns on the equalizer (`eq`), which then marks the path not bit-perfect.
+//! turns on the equalizer (`eq`) or, for a device with no volume of its own,
+//! the software volume (`output::SoftVolume`); either marks the path not
+//! bit-perfect.
 
 pub mod dop;
 pub mod eq;
 pub mod format;
+pub mod gain;
 pub mod output;
 mod player;
 
 pub use eq::{EqBand, EqSettings};
 pub use format::{Container, FormatRequest, StreamFormat};
+pub use gain::{GainMode, GainReader, ReplayGain};
 pub use mdm_decode::{SampleKind, SourceInfo};
-pub use output::{Backend, DeviceInfo, FileSink, OutputMode};
+pub use output::{taper, Backend, DeviceInfo, Fader, FileSink, OutputMode, SoftFader, SoftVolume};
 #[cfg(windows)]
 pub use output::{
-    get_volume, list_devices, set_volume, watch_volume, DeviceVolume, VolumeChange, VolumeWatch,
-    WasapiBackend,
+    get_volume, list_devices, set_volume, watch_volume, DeviceVolume, EndpointFader, VolumeChange,
+    VolumeWatch, WasapiBackend,
 };
-pub use player::{Command, Event, PlayState, Player, SignalPath};
+pub use player::{Command, Event, PlayState, Player, Repeat, SignalPath};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

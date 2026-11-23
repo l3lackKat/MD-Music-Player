@@ -7,14 +7,15 @@ use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use mdm_decode::{Chunk, SampleKind, Source, SourceInfo};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::dop::DopPacker;
 use crate::eq::{EqSettings, Equalizer};
 use crate::format::{pack, FormatRequest, StreamFormat};
-use crate::output::{Backend, Stream};
+use crate::gain::{GainMode, GainReader, ReplayGain};
+use crate::output::{Backend, Fader, Stream};
 use crate::{EngineError, Result};
 
 /// How often a position event goes out while playing.
@@ -24,15 +25,40 @@ const DRAIN_GRACE: Duration = Duration::from_millis(150);
 /// "Previous" restarts the track when further in than this.
 const PREVIOUS_RESTARTS_AFTER_MS: u64 = 3000;
 
+/// Fade lengths, for a fade over the whole range; a fade that starts part
+/// way (pausing during a fade-in) takes its share of it.
+const FADE_OUT: Duration = Duration::from_millis(400);
+const FADE_IN: Duration = Duration::from_millis(300);
+const FADE_EXIT: Duration = Duration::from_millis(600);
+/// After a fade-out, time for the device to play out what it still holds
+/// before the level goes back up behind the silence.
+const FADE_SETTLE: Duration = Duration::from_millis(150);
+/// A fade moves the level at most this often.
+const FADE_STEP: Duration = Duration::from_millis(10);
+
 pub enum Command {
     /// Replace the queue and start playing at `index`.
     Load { paths: Vec<PathBuf>, index: usize },
     /// Add tracks to the end of the queue without interrupting playback.
     Append(Vec<PathBuf>),
+    /// "Play next": put tracks into the queue at `at` (clamped to its end),
+    /// normally just after the current track, and make them the next ones
+    /// to play, in the order given, with shuffle on too. What is playing
+    /// carries on.
+    Insert { paths: Vec<PathBuf>, at: usize },
+    /// Take tracks out of the queue. Removing the track being heard moves
+    /// on to the next one that stays.
+    Remove(Vec<usize>),
+    /// Put the queue in a new order: `order[new] = old`, each old index
+    /// exactly once. What is playing carries on. Anything else is ignored.
+    Reorder(Vec<usize>),
     /// Play the queue in random order. The current track keeps playing and
     /// the order of the rest is drawn again each time this is turned on.
     SetShuffle(bool),
+    SetRepeat(Repeat),
+    /// Start, or resume from pause with a fade-in.
     Play,
+    /// Pause after a short fade-out.
     Pause,
     Stop,
     Seek(u64),
@@ -44,6 +70,14 @@ pub enum Command {
     /// at the same position, since the stream format may change; other
     /// changes apply to the audio not yet queued for the device.
     SetEq(EqSettings),
+    /// Even out loudness with the tracks' ReplayGain tags, through the
+    /// fader's offset (the device volume), so the samples stay exact.
+    SetReplayGain(GainMode),
+    /// How to read a track's ReplayGain tags. Without one, no track has any.
+    SetGainReader(GainReader),
+    /// Fade out what is playing, release the device, answer on the channel
+    /// and end the player thread. See [`Player::quit`].
+    Quit(Sender<()>),
     Shutdown,
 }
 
@@ -53,6 +87,19 @@ pub enum PlayState {
     Stopped,
     Playing,
     Paused,
+}
+
+/// What happens when a track or the queue ends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Repeat {
+    /// Stop after the last track.
+    #[default]
+    Off,
+    /// Start the queue over after the last track (in the same order).
+    All,
+    /// Play the current track again. Next and Previous still move on.
+    One,
 }
 
 /// What happens to the audio between the file and the device.
@@ -67,6 +114,11 @@ pub struct SignalPath {
     pub bit_perfect: bool,
     /// The equalizer is changing this track's samples.
     pub eq: bool,
+    /// The software volume is scaling this track's samples.
+    pub soft_volume: bool,
+    /// The ReplayGain offset for this track, in dB, when ReplayGain is on and
+    /// the track has a gain. It moves the volume, not the samples.
+    pub replay_gain_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,9 +127,18 @@ pub enum Event {
     State { state: PlayState },
     /// The track now being heard.
     Track { index: usize, path: String, signal_path: SignalPath },
+    /// The queue was edited: the track being heard is now at `index`.
+    Current { index: usize },
+    /// While stopped: the track `Play` starts from, moved by Stop, the end
+    /// of the queue, Next, Previous or a queue edit. `None` when the queue
+    /// is empty.
+    Cued { index: Option<usize>, path: Option<String> },
     Position { ms: u64, duration_ms: Option<u64> },
     /// A track or the device failed. Playback moves on or stops.
     Error { message: String },
+    /// The device stopped while playing (unplugged, driver reset, ...).
+    /// Playback stopped; `Play` resumes from where it was.
+    DeviceLost { message: String },
     /// The last track of the queue finished.
     QueueEnded,
 }
@@ -104,6 +165,14 @@ impl Player {
         let _ = self.tx.send(command);
     }
 
+    /// Fade out, release the device and end the player thread, waiting at
+    /// most `timeout`. Commands sent afterwards are ignored.
+    pub fn quit(&self, timeout: Duration) {
+        let (done_tx, done_rx) = bounded(1);
+        self.send(Command::Quit(done_tx));
+        let _ = done_rx.recv_timeout(timeout);
+    }
+
     /// The event stream. Every receiver cloned from it competes for the same
     /// events, so use one consumer.
     pub fn events(&self) -> Receiver<Event> {
@@ -128,6 +197,9 @@ struct Decoding {
     packer: Option<DopPacker>,
     /// Samples go through the equalizer.
     eq: bool,
+    /// The track gave at least one frame.
+    produced: bool,
+    gain: ReplayGain,
 }
 
 /// Where a track starts in the stream of frames pushed to the device.
@@ -138,6 +210,24 @@ struct Mark {
     base_ms: u64,
     info: SourceInfo,
     eq: bool,
+    gain: ReplayGain,
+}
+
+/// A fade of the fader's level in progress.
+struct Ramp {
+    from: f32,
+    to: f32,
+    start: Instant,
+    length: Duration,
+    then: AfterRamp,
+}
+
+enum AfterRamp {
+    Nothing,
+    /// Silence the stream, then put the level back.
+    Pause,
+    /// Close the stream, put the level back and answer.
+    Quit(Sender<()>),
 }
 
 struct Engine {
@@ -173,11 +263,31 @@ struct Engine {
     /// when shuffle is off.
     order: Vec<usize>,
     shuffle: bool,
+    repeat: Repeat,
     rng: Rng,
-    /// The last track the decoder finished, so tracks appended after the
-    /// end of the queue was reached can still follow on.
-    last_decoded: Option<usize>,
+    /// Tracks in a row that ended without giving a frame. Stops repeat from
+    /// spinning through a queue of empty files.
+    empty_run: usize,
     eq: Equalizer,
+
+    fader: Option<Box<dyn Fader>>,
+    /// The backend scales PCM by a software volume (see `Backend::soft_volume`).
+    soft: bool,
+    /// Where the fader stands, as a share of the captured level. 1.0 is the
+    /// user's own level.
+    fade_level: f32,
+    ramp: Option<Ramp>,
+    /// After a fade-out to pause: when to put the level back.
+    restore_at: Option<Instant>,
+    last_step: Instant,
+    gain_mode: GainMode,
+    gain_reader: Option<GainReader>,
+    /// The ReplayGain offset the fader holds now, in dB.
+    offset_db: f32,
+    /// `Quit` arrived: take no more commands.
+    quitting: bool,
+    /// `Quit` is done: leave the loop.
+    finished: bool,
 }
 
 /// xorshift64*: plenty for picking a play order, no extra dependency.
@@ -207,14 +317,25 @@ impl Rng {
     }
 }
 
-/// Open a track and work out the stream it needs. With the equalizer on,
-/// PCM gets at least 24 bits so the filtered samples keep their detail, and
-/// may fall back to a narrower container since they are no longer exact.
-fn open_source(path: &Path, eq: bool) -> Result<(Box<dyn Source>, FormatRequest, bool)> {
+/// Open a track and work out the stream it needs. With the equalizer or the
+/// software volume on, PCM gets at least 24 bits so the changed samples keep
+/// their detail, and may fall back to a narrower container since they are no
+/// longer exact. DSD cannot be scaled, so with the software volume on it is
+/// refused: on a device with no volume of its own it would play at full level.
+fn open_source(path: &Path, eq: bool, soft: bool) -> Result<(Box<dyn Source>, FormatRequest, bool)> {
     let source = mdm_decode::open(path)?;
+    let dsd = source.info().kind == SampleKind::Dsd;
+    if dsd && soft {
+        return Err(EngineError::Format(
+            "DSD cannot be turned down by the software volume, and this device has no volume of its \
+             own, so it would play at full level. Turn the software volume off and use a device with a \
+             hardware volume for DSD"
+                .into(),
+        ));
+    }
     let mut req = FormatRequest::for_source(source.info())?;
-    let eq = eq && source.info().kind != SampleKind::Dsd;
-    if eq {
+    let eq = eq && !dsd;
+    if eq || soft {
         req.bits = req.bits.max(24);
         req.exact = false;
     }
@@ -223,6 +344,8 @@ fn open_source(path: &Path, eq: bool) -> Result<(Box<dyn Source>, FormatRequest,
 
 impl Engine {
     fn new(backend: Box<dyn Backend>, events: Sender<Event>) -> Self {
+        let fader = backend.fader();
+        let soft = backend.soft_volume();
         Engine {
             backend,
             events,
@@ -243,14 +366,26 @@ impl Engine {
             last_position: Instant::now(),
             order: Vec::new(),
             shuffle: false,
+            repeat: Repeat::Off,
             rng: Rng::from_clock(),
-            last_decoded: None,
+            empty_run: 0,
             eq: Equalizer::new(EqSettings::default()),
+            fader,
+            soft,
+            fade_level: 1.0,
+            ramp: None,
+            restore_at: None,
+            last_step: Instant::now(),
+            gain_mode: GainMode::Off,
+            gain_reader: None,
+            offset_db: 0.0,
+            quitting: false,
+            finished: false,
         }
     }
 
     /// Redraw the play order. `keep` goes first, in the order given: the
-    /// track being heard, then one the decoder may already be on.
+    /// track being heard, then the ones already lined up after it.
     fn rebuild_order(&mut self, keep: &[usize]) {
         let mut rest: Vec<usize> =
             (0..self.queue.len()).filter(|i| !keep.contains(i)).collect();
@@ -268,16 +403,37 @@ impl Engine {
         }
     }
 
-    /// The track that plays after `index`.
+    /// The track after `index` in the play order.
     fn after(&self, index: usize) -> Option<usize> {
         let pos = self.order.iter().position(|i| *i == index)?;
         self.order.get(pos + 1).copied()
     }
 
-    /// The track that played before `index`.
+    /// The track before `index` in the play order.
     fn before(&self, index: usize) -> Option<usize> {
         let pos = self.order.iter().position(|i| *i == index)?;
         pos.checked_sub(1).map(|p| self.order[p])
+    }
+
+    /// The track that plays after `index`, with repeat applied. `ended`:
+    /// `index` played to its end, so repeat one plays it again; otherwise
+    /// the listener (or a failing track) moves on.
+    fn following(&self, index: usize, ended: bool) -> Option<usize> {
+        if ended && self.repeat == Repeat::One && index < self.queue.len() {
+            return Some(index);
+        }
+        self.after(index).or_else(|| match self.repeat {
+            Repeat::Off => None,
+            Repeat::All | Repeat::One => self.order.first().copied(),
+        })
+    }
+
+    /// The track that played before `index`, wrapping round with repeat on.
+    fn preceding(&self, index: usize) -> Option<usize> {
+        self.before(index).or_else(|| match self.repeat {
+            Repeat::Off => None,
+            Repeat::All | Repeat::One => self.order.last().copied(),
+        })
     }
 
     /// The track the player is on, or would start from when stopped.
@@ -296,6 +452,10 @@ impl Engine {
             }
             let progressed = self.pump();
             self.tick();
+            self.step_fade();
+            if self.finished {
+                return;
+            }
             if !progressed {
                 match rx.recv_timeout(Duration::from_millis(5)) {
                     Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
@@ -324,18 +484,21 @@ impl Engine {
     }
 
     fn handle(&mut self, command: Command) {
+        if self.quitting {
+            return;
+        }
         match command {
             Command::Load { paths, index } => {
                 self.close_stream();
                 self.queue = paths;
                 self.resume = (0, 0);
-                self.last_decoded = None;
                 self.rebuild_order(&[index]);
                 if index < self.queue.len() {
                     self.set_state(PlayState::Playing);
                     self.play_from(index, 0);
                 } else {
-                    self.set_state(PlayState::Stopped);
+                    // An empty queue clears the queue: nothing is cued any more.
+                    self.stop(0, 0);
                 }
             }
             Command::Append(paths) => {
@@ -346,37 +509,37 @@ impl Engine {
                     self.rng.shuffle(&mut added);
                 }
                 self.order.extend(added);
-                // The decoder already ran out of queue: carry on into the new tracks.
-                let ran_out = self.stream.is_some()
-                    && self.decoding.is_none()
-                    && self.switch_to.is_none()
-                    && self.pending_pos >= self.pending.len();
-                if let (true, Some(last)) = (ran_out, self.last_decoded) {
-                    if let Some(s) = &self.stream {
-                        s.shared.draining.store(false, Ordering::Release);
-                    }
-                    self.drained_at = None;
-                    self.line_up_after(last);
+                // The decoder may already have run out of queue: carry on into the new tracks.
+                self.fix_line_up(false);
+                if self.state == PlayState::Stopped {
+                    // An empty queue had nothing cued; now it has.
+                    self.announce_cued();
                 }
             }
+            Command::Insert { paths, at } => self.insert(paths, at),
+            Command::Remove(indexes) => self.remove(&indexes),
+            Command::Reorder(order) => self.reorder(&order),
             Command::SetShuffle(on) => {
                 self.shuffle = on;
+                // What the ring already holds keeps its place, in the order it plays.
                 let mut keep = vec![self.current()];
+                keep.extend(self.upcoming.iter().map(|m| m.index));
                 if let Some(d) = &self.decoding {
                     keep.push(d.index);
                 }
                 if let Some(next) = self.switch_to {
                     keep.push(next);
                 }
-                keep.extend(self.upcoming.iter().map(|m| m.index));
                 self.rebuild_order(&keep);
+            }
+            Command::SetRepeat(repeat) => {
+                self.repeat = repeat;
+                self.fix_line_up(false);
             }
             Command::Play => match self.state {
                 PlayState::Paused => {
-                    if let Some(s) = &self.stream {
-                        s.shared.paused.store(false, Ordering::Release);
-                    }
                     self.set_state(PlayState::Playing);
+                    self.resume_with_fade();
                 }
                 PlayState::Stopped if self.resume.0 < self.queue.len() => {
                     let (index, ms) = self.resume;
@@ -387,10 +550,12 @@ impl Engine {
             },
             Command::Pause => {
                 if self.state == PlayState::Playing {
-                    if let Some(s) = &self.stream {
-                        s.shared.paused.store(true, Ordering::Release);
-                    }
                     self.set_state(PlayState::Paused);
+                    if self.can_fade() {
+                        self.fade_to(0.0, FADE_OUT, AfterRamp::Pause);
+                    } else {
+                        self.hold(true);
+                    }
                 }
             }
             Command::Stop => {
@@ -406,7 +571,7 @@ impl Engine {
                 _ => {}
             },
             Command::Next => {
-                let Some(next) = self.after(self.current()) else { return };
+                let Some(next) = self.following(self.current(), false) else { return };
                 if self.state == PlayState::Stopped {
                     self.resume = (next, 0);
                     self.announce_stopped_track();
@@ -416,7 +581,7 @@ impl Engine {
             }
             Command::Previous => {
                 let index = self.current();
-                let target = match self.before(index) {
+                let target = match self.preceding(index) {
                     Some(prev) if self.position_ms() <= PREVIOUS_RESTARTS_AFTER_MS => prev,
                     _ => index,
                 };
@@ -428,11 +593,19 @@ impl Engine {
                 }
             }
             Command::SetOutput(backend) => {
+                let playing = self.heard.as_ref().map(|h| (h.index, self.position_ms()));
+                self.stream = None;
+                self.stream_req = None;
+                // Put the old device's level back before letting go of it.
+                // Dropping its fader takes the ReplayGain offset off too.
+                self.end_fade();
+                self.fader = backend.fader();
+                self.offset_db = 0.0;
+                self.soft = backend.soft_volume();
                 self.backend = backend;
-                if let Some(index) = self.heard.as_ref().map(|h| h.index) {
-                    let ms = self.position_ms();
-                    self.stream = None;
-                    self.stream_req = None;
+                if let Some((index, ms)) = playing {
+                    // Reopen even the track being heard: its format depends on the software volume.
+                    self.decoding = None;
                     self.play_from(index, ms);
                 }
             }
@@ -448,13 +621,66 @@ impl Engine {
                     }
                 }
             }
+            Command::SetReplayGain(mode) => {
+                self.gain_mode = mode;
+                // Tags are only read while it is on: read them now for what is lined up.
+                if let Some(h) = &self.heard {
+                    let gain = self.read_gain(h.index);
+                    self.heard.as_mut().expect("checked above").gain = gain;
+                }
+                let gains: Vec<ReplayGain> = self.upcoming.iter().map(|m| self.read_gain(m.index)).collect();
+                for (mark, gain) in self.upcoming.iter_mut().zip(gains) {
+                    mark.gain = gain;
+                }
+                // A seek takes the heard track's gain from here.
+                if let Some(index) = self.decoding.as_ref().map(|d| d.index) {
+                    let gain = self.read_gain(index);
+                    self.decoding.as_mut().expect("checked above").gain = gain;
+                }
+                self.apply_gain();
+                self.announce_track();
+            }
+            Command::SetGainReader(reader) => self.gain_reader = Some(reader),
+            Command::Quit(done) => self.begin_quit(done),
             Command::Shutdown => {}
         }
     }
 
-    /// Tell listeners the position moved while nothing is playing.
+    /// The ReplayGain tags of the queue's track `index`, read only while
+    /// ReplayGain is on.
+    fn read_gain(&self, index: usize) -> ReplayGain {
+        match (&self.gain_reader, self.gain_mode, self.queue.get(index)) {
+            (Some(read), mode, Some(path)) if mode != GainMode::Off => read(path),
+            _ => ReplayGain::default(),
+        }
+    }
+
+    /// The offset the track being heard calls for: none when nothing plays.
+    fn wanted_offset(&self) -> f32 {
+        self.heard.as_ref().and_then(|h| h.gain.pick(self.gain_mode)).unwrap_or(0.0)
+    }
+
+    /// Bring the fader's offset in line with the track being heard.
+    fn apply_gain(&mut self) {
+        let want = self.wanted_offset();
+        if want != self.offset_db {
+            if let Some(f) = &mut self.fader {
+                f.set_offset(want);
+            }
+            self.offset_db = want;
+        }
+    }
+
+    /// Tell listeners where `Play` starts from, while nothing is playing.
     fn announce_stopped_track(&self) {
         self.emit(Event::Position { ms: self.resume.1, duration_ms: None });
+        self.announce_cued();
+    }
+
+    fn announce_cued(&self) {
+        let index = (self.resume.0 < self.queue.len()).then_some(self.resume.0);
+        let path = index.map(|i| self.queue[i].to_string_lossy().into_owned());
+        self.emit(Event::Cued { index, path });
     }
 
     fn close_stream(&mut self) {
@@ -468,13 +694,17 @@ impl Engine {
         self.pending.clear();
         self.pending_pos = 0;
         self.pushed_frames = 0;
+        // Nothing is audible any more: no fade left to finish.
+        self.end_fade();
     }
 
     fn stop(&mut self, resume_index: usize, resume_ms: u64) {
         self.close_stream();
+        // Nothing plays: the user's own level, without a track's gain.
+        self.apply_gain();
         self.resume = (resume_index, resume_ms);
         self.set_state(PlayState::Stopped);
-        self.emit(Event::Position { ms: resume_ms, duration_ms: None });
+        self.announce_stopped_track();
     }
 
     /// Start playing at `index`, skipping tracks that cannot be played.
@@ -482,6 +712,8 @@ impl Engine {
     fn play_from(&mut self, index: usize, ms: u64) {
         let mut next = (index < self.queue.len()).then_some(index);
         let mut ms = ms;
+        // With repeat on, the order never runs out: give up after one round.
+        let mut tries = self.queue.len();
         while let Some(index) = next {
             match self.start_track(index, ms) {
                 Ok(()) => return,
@@ -492,13 +724,10 @@ impl Engine {
                     return;
                 }
                 Err(e) => {
-                    let name = self.queue[index]
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.error(format!("{name}: {e}"));
+                    self.error(format!("{}: {e}", self.file_name(index)));
                     self.decoding = None;
-                    next = self.after(index);
+                    tries = tries.saturating_sub(1);
+                    next = if tries == 0 { None } else { self.following(index, false) };
                     ms = 0;
                 }
             }
@@ -507,13 +736,18 @@ impl Engine {
         self.emit(Event::QueueEnded);
     }
 
+    fn file_name(&self, index: usize) -> String {
+        self.queue[index].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
     /// Point the decoder and the stream at `index`, at position `ms`.
     fn start_track(&mut self, index: usize, ms: u64) -> Result<()> {
         let same_track = matches!(&self.decoding, Some(d) if d.index == index);
         if !same_track {
-            let (source, req, eq) = open_source(&self.queue[index], self.eq.enabled())?;
+            let (source, req, eq) = open_source(&self.queue[index], self.eq.enabled(), self.soft)?;
             let packer = req.dop.then(|| DopPacker::new(req.channels));
-            self.decoding = Some(Decoding { index, source, req, packer, eq });
+            let gain = self.read_gain(index);
+            self.decoding = Some(Decoding { index, source, req, packer, eq, produced: false, gain });
         }
         let decoding = self.decoding.as_mut().expect("decoding was just set");
         let base_ms = if ms > 0 || same_track { decoding.source.seek(ms)? } else { 0 };
@@ -522,6 +756,7 @@ impl Engine {
         }
         let req = decoding.req;
         let eq = decoding.eq;
+        let gain = decoding.gain;
         let info = decoding.source.info().clone();
         if eq {
             self.eq.configure(req.sample_rate, req.channels);
@@ -542,7 +777,9 @@ impl Engine {
             self.stream_req = Some(req);
         }
         if let Some(s) = &self.stream {
-            s.shared.paused.store(self.state == PlayState::Paused, Ordering::Release);
+            // A fade-out still running keeps the stream going until it ends.
+            let silent = self.state == PlayState::Paused && self.ramp.is_none();
+            s.shared.paused.store(silent, Ordering::Release);
             s.shared.draining.store(false, Ordering::Release);
         }
 
@@ -552,7 +789,9 @@ impl Engine {
         self.upcoming.clear();
         self.switch_to = None;
         self.drained_at = None;
-        self.heard = Some(Mark { index, start_frame: 0, base_ms, info, eq });
+        self.empty_run = 0;
+        self.heard = Some(Mark { index, start_frame: 0, base_ms, info, eq, gain });
+        self.apply_gain();
         self.announce_track();
         Ok(())
     }
@@ -577,8 +816,10 @@ impl Engine {
             output: s.format,
             device: s.device_name.clone(),
             exclusive: s.exclusive,
-            bit_perfect: s.exclusive && h.info.kind != SampleKind::Float && !h.eq,
+            bit_perfect: s.exclusive && h.info.kind != SampleKind::Float && !h.eq && !self.soft,
             eq: h.eq,
+            soft_volume: self.soft,
+            replay_gain_db: h.gain.pick(self.gain_mode),
         };
         self.emit(Event::Track {
             index: h.index,
@@ -598,6 +839,349 @@ impl Engine {
             _ => self.resume.1,
         }
     }
+
+    // ---- Editing the queue ---------------------------------------------------
+
+    fn insert(&mut self, paths: Vec<PathBuf>, at: usize) {
+        if paths.is_empty() {
+            return;
+        }
+        let len = self.queue.len();
+        let at = at.min(len);
+        let count = paths.len();
+        // Tracks from `at` on move up to make room.
+        let map: Vec<Option<usize>> = (0..len).map(|i| Some(if i < at { i } else { i + count })).collect();
+        self.queue.splice(at..at, paths);
+        self.reindex(&map);
+        if self.shuffle {
+            // Without shuffle the order is the queue's, where they already
+            // sit after the current track; shuffled, put them there by hand.
+            let added = at..at + count;
+            self.order.retain(|i| !added.contains(i));
+            let current = self.current();
+            let slot = self.order.iter().position(|i| *i == current).map_or(0, |p| p + 1);
+            self.order.splice(slot..slot, added);
+        }
+        self.fix_line_up(false);
+        self.announce_current();
+    }
+
+    fn remove(&mut self, indexes: &[usize]) {
+        let len = self.queue.len();
+        let mut gone = vec![false; len];
+        for i in indexes.iter().filter(|i| **i < len) {
+            gone[*i] = true;
+        }
+        if !gone.contains(&true) {
+            return;
+        }
+        let mut map = vec![None; len];
+        let mut kept = 0;
+        for (i, slot) in map.iter_mut().enumerate() {
+            if !gone[i] {
+                *slot = Some(kept);
+                kept += 1;
+            }
+        }
+        let heard = self.heard.as_ref().map(|h| h.index).filter(|h| gone[*h]);
+        // Worked out before the order loses the tracks: the first one after
+        // the heard track that stays.
+        let next = heard.and_then(|h| {
+            let mut candidate = self.following(h, false);
+            for _ in 0..len {
+                match candidate {
+                    Some(c) if gone[c] => candidate = self.following(c, false),
+                    _ => break,
+                }
+            }
+            candidate.filter(|c| !gone[*c])
+        });
+        let mut i = 0;
+        self.queue.retain(|_| {
+            i += 1;
+            !gone[i - 1]
+        });
+        if let Some(h) = heard {
+            self.heard = None;
+            self.upcoming.clear();
+            self.decoding = None;
+            self.switch_to = None;
+            self.reindex(&map);
+            match next.and_then(|n| map[n]) {
+                Some(n) => self.play_from(n, 0),
+                None => {
+                    // Where the heard track was, among the tracks left.
+                    let at = (0..h).filter(|i| !gone[*i]).count();
+                    self.stop(at.min(self.queue.len().saturating_sub(1)), 0);
+                }
+            }
+        } else {
+            let lost = self.reindex(&map);
+            self.fix_line_up(lost);
+        }
+        self.announce_current();
+    }
+
+    fn reorder(&mut self, order: &[usize]) {
+        let len = self.queue.len();
+        let mut map = vec![None; len];
+        for (new, old) in order.iter().enumerate() {
+            match map.get_mut(*old) {
+                Some(slot @ None) => *slot = Some(new),
+                // Out of range or named twice: not a new order of this queue.
+                _ => return,
+            }
+        }
+        if order.len() != len || order.iter().enumerate().all(|(new, old)| new == *old) {
+            return;
+        }
+        self.queue = order.iter().map(|old| self.queue[*old].clone()).collect();
+        let lost = self.reindex(&map);
+        self.fix_line_up(lost);
+        self.announce_current();
+    }
+
+    /// Point every queue index at where its track is after an edit.
+    /// `map[old]` is the new index, `None` for a removed track (never the
+    /// one being heard: the caller deals with that). Returns true when
+    /// audio of a removed track was already lined up.
+    fn reindex(&mut self, map: &[Option<usize>]) -> bool {
+        let to = |i: usize| map.get(i).copied().flatten();
+        if self.shuffle {
+            self.order = self.order.iter().filter_map(|i| to(*i)).collect();
+        } else {
+            self.order = (0..self.queue.len()).collect();
+        }
+        let mut lost = false;
+        if let Some(h) = &mut self.heard {
+            if let Some(n) = to(h.index) {
+                h.index = n;
+            }
+        }
+        for mark in &mut self.upcoming {
+            match to(mark.index) {
+                Some(n) => mark.index = n,
+                None => lost = true,
+            }
+        }
+        if let Some(d) = &mut self.decoding {
+            match to(d.index) {
+                Some(n) => d.index = n,
+                None => lost = true,
+            }
+        }
+        if lost {
+            self.decoding = None;
+            self.upcoming.retain(|m| to(m.index).is_some());
+        }
+        self.switch_to = self.switch_to.and_then(to);
+        self.resume = match to(self.resume.0) {
+            Some(n) => (n, self.resume.1),
+            // The track Play would start from is gone: the one after it takes its place.
+            None => {
+                let kept_before = (0..self.resume.0).filter(|i| to(*i).is_some()).count();
+                (kept_before.min(self.queue.len().saturating_sub(1)), 0)
+            }
+        };
+        lost
+    }
+
+    /// After the queue, the order or repeat changed: make sure what plays
+    /// after the current track is what `following` now says. Audio already
+    /// in the ring that should not play restarts the current track where it
+    /// is, which is only heard as a tiny skip.
+    fn fix_line_up(&mut self, lost: bool) {
+        let Some(heard) = self.heard.as_ref().map(|h| h.index) else { return };
+        let mut tail = heard;
+        let mut wrong = lost;
+        for mark in &self.upcoming {
+            if self.following(tail, true) != Some(mark.index) {
+                wrong = true;
+            }
+            tail = mark.index;
+        }
+        if wrong {
+            self.restart_heard();
+            return;
+        }
+        if self.decoding.is_some() {
+            // Still decoding `tail`: the next track is picked when it ends.
+            return;
+        }
+        let expected = self.following(tail, true);
+        if self.switch_to == expected {
+            return;
+        }
+        self.switch_to = None;
+        if let Some(s) = &self.stream {
+            s.shared.draining.store(false, Ordering::Release);
+        }
+        self.drained_at = None;
+        self.line_up_after(tail);
+    }
+
+    /// Play the current track again from where it is, dropping what was
+    /// lined up after it.
+    fn restart_heard(&mut self) {
+        let Some(index) = self.heard.as_ref().map(|h| h.index) else { return };
+        let ms = self.position_ms();
+        self.decoding = None;
+        self.play_from(index, ms);
+    }
+
+    fn announce_current(&self) {
+        if let Some(h) = &self.heard {
+            self.emit(Event::Current { index: h.index });
+        } else if self.state == PlayState::Stopped {
+            self.announce_cued();
+        }
+    }
+
+    // ---- Fading --------------------------------------------------------------
+
+    /// A fade can be heard: there is a fader and a working stream.
+    fn can_fade(&self) -> bool {
+        self.fader.is_some()
+            && self.stream.as_ref().is_some_and(|s| !s.shared.failed.load(Ordering::Acquire))
+    }
+
+    /// Silence the stream at once, or let it play again.
+    fn hold(&self, paused: bool) {
+        if let Some(s) = &self.stream {
+            s.shared.paused.store(paused, Ordering::Release);
+        }
+    }
+
+    /// The fader is at the user's level, with no fade under way.
+    fn fade_at_rest(&self) -> bool {
+        self.fade_level >= 1.0 && self.ramp.is_none() && self.restore_at.is_none()
+    }
+
+    /// Fade from where the level is now to `to`, then do `then`.
+    fn fade_to(&mut self, to: f32, full: Duration, then: AfterRamp) {
+        if self.fade_at_rest() {
+            if let Some(f) = &mut self.fader {
+                f.capture();
+            }
+        }
+        self.restore_at = None;
+        let from = self.fade_level;
+        self.ramp = Some(Ramp {
+            from,
+            to,
+            start: Instant::now(),
+            length: full.mul_f32((to - from).abs()),
+            then,
+        });
+    }
+
+    /// Leave pause: turn the level down (if the pause already put it back),
+    /// let the audio through, and fade in.
+    fn resume_with_fade(&mut self) {
+        if !self.can_fade() {
+            self.end_fade();
+            self.hold(false);
+            return;
+        }
+        if self.fade_at_rest() {
+            if let Some(f) = &mut self.fader {
+                f.capture();
+                f.set(0.0);
+                // The level must be down before the first sample plays.
+                f.sync();
+            }
+            self.fade_level = 0.0;
+        }
+        self.restore_at = None;
+        self.hold(false);
+        self.fade_to(1.0, FADE_IN, AfterRamp::Nothing);
+    }
+
+    /// Move the fade on, and finish it when it is done.
+    fn step_fade(&mut self) {
+        let now = Instant::now();
+        if self.restore_at.is_some_and(|at| now >= at) {
+            self.restore_at = None;
+            self.restore_level();
+        }
+        let Some(ramp) = &self.ramp else { return };
+        let t = if ramp.length.is_zero() {
+            1.0
+        } else {
+            (now.duration_since(ramp.start).as_secs_f32() / ramp.length.as_secs_f32()).min(1.0)
+        };
+        let level = ramp.from + (ramp.to - ramp.from) * t;
+        if t >= 1.0 || now.duration_since(self.last_step) >= FADE_STEP {
+            self.last_step = now;
+            self.fade_level = level;
+            if let Some(f) = &mut self.fader {
+                f.set(level);
+            }
+        }
+        if t < 1.0 {
+            return;
+        }
+        match self.ramp.take().map(|r| r.then) {
+            Some(AfterRamp::Pause) => {
+                self.hold(true);
+                self.restore_at = Some(now + FADE_SETTLE);
+                let duration_ms = self.heard.as_ref().and_then(|h| h.info.duration_ms);
+                self.emit(Event::Position { ms: self.position_ms(), duration_ms });
+            }
+            Some(AfterRamp::Quit(done)) => self.finish_quit(done),
+            Some(AfterRamp::Nothing) | None => {}
+        }
+    }
+
+    /// Put the level back to the user's.
+    fn restore_level(&mut self) {
+        if self.fade_level < 1.0 {
+            self.fade_level = 1.0;
+            if let Some(f) = &mut self.fader {
+                f.set(1.0);
+            }
+        }
+    }
+
+    /// Drop any fade under way and put the level back. Only call once the
+    /// audio has stopped (or the fade's job no longer matters).
+    fn end_fade(&mut self) {
+        self.restore_at = None;
+        match self.ramp.take() {
+            Some(Ramp { then: AfterRamp::Quit(done), .. }) => self.finish_quit(done),
+            _ => self.restore_level(),
+        }
+    }
+
+    fn begin_quit(&mut self, done: Sender<()>) {
+        self.quitting = true;
+        let audible = self.state == PlayState::Playing || self.ramp.is_some();
+        if audible && self.can_fade() {
+            self.fade_to(0.0, FADE_EXIT, AfterRamp::Quit(done));
+        } else {
+            self.finish_quit(done);
+        }
+    }
+
+    fn finish_quit(&mut self, done: Sender<()>) {
+        self.ramp = None;
+        self.restore_at = None;
+        // Let go of the device first, so putting the level back is silent.
+        self.stream = None;
+        self.restore_level();
+        if let Some(f) = &mut self.fader {
+            // Leave the device at the user's own level, not a track's.
+            if self.offset_db != 0.0 {
+                f.set_offset(0.0);
+                self.offset_db = 0.0;
+            }
+            f.sync();
+        }
+        let _ = done.send(());
+        self.finished = true;
+    }
+
+    // ---- Feeding the device --------------------------------------------------
 
     /// Move audio one step towards the ring. Returns false when there was
     /// nothing to do, so the caller can sleep.
@@ -654,6 +1238,9 @@ impl Engine {
                 finished = true;
             }
         }
+        if let (false, Some(d)) = (self.pending.is_empty(), &mut self.decoding) {
+            d.produced = true;
+        }
         let bpf = self.stream.as_ref().map(|s| s.format.bytes_per_frame()).unwrap_or(1);
         self.pushed_frames += (self.pending.len() / bpf) as u64;
         if finished {
@@ -664,30 +1251,44 @@ impl Engine {
 
     /// The decoder reached the end of a track: line up the next one.
     fn track_finished(&mut self) {
-        if let Some(d) = self.decoding.take() {
-            self.last_decoded = Some(d.index);
-            self.line_up_after(d.index);
+        let Some(d) = self.decoding.take() else { return };
+        self.empty_run = if d.produced { 0 } else { self.empty_run + 1 };
+        if self.empty_run >= self.queue.len().max(1) {
+            // A whole round without a single frame: let the stream end.
+            self.set_draining();
+            return;
+        }
+        self.line_up_after(d.index);
+    }
+
+    fn set_draining(&self) {
+        if let Some(s) = &self.stream {
+            s.shared.draining.store(true, Ordering::Release);
         }
     }
 
-    /// Point the decoder at the track after `index`, skipping unplayable
-    /// ones. With nothing left, let the stream drain.
+    /// Point the decoder at the track that follows `index` once it ends,
+    /// skipping unplayable ones. With nothing left, let the stream drain.
     fn line_up_after(&mut self, index: usize) {
-        let mut candidate = self.after(index);
+        let mut candidate = self.following(index, true);
+        let mut tries = self.queue.len();
         while let Some(next) = candidate {
-            match open_source(&self.queue[next], self.eq.enabled()) {
+            match open_source(&self.queue[next], self.eq.enabled(), self.soft) {
                 Ok((source, req, eq)) if Some(req) == self.stream_req => {
                     // Same format: keep feeding the same stream, with no gap.
                     // The EQ's state carries on too, so there is no click.
                     let info = source.info().clone();
                     let packer = req.dop.then(|| DopPacker::new(req.channels));
-                    self.decoding = Some(Decoding { index: next, source, req, packer, eq });
+                    let gain = self.read_gain(next);
+                    self.decoding =
+                        Some(Decoding { index: next, source, req, packer, eq, produced: false, gain });
                     self.upcoming.push_back(Mark {
                         index: next,
                         start_frame: self.pushed_frames,
                         base_ms: 0,
                         info,
                         eq,
+                        gain,
                     });
                     return;
                 }
@@ -698,18 +1299,13 @@ impl Engine {
                     break;
                 }
                 Err(e) => {
-                    let name = self.queue[next]
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.error(format!("{name}: {e}"));
-                    candidate = self.after(next);
+                    self.error(format!("{}: {e}", self.file_name(next)));
+                    tries = tries.saturating_sub(1);
+                    candidate = if tries == 0 { None } else { self.following(next, false) };
                 }
             }
         }
-        if let Some(s) = &self.stream {
-            s.shared.draining.store(true, Ordering::Release);
-        }
+        self.set_draining();
     }
 
     /// Follow what the device has played: track changes, position, the end
@@ -719,8 +1315,10 @@ impl Engine {
         if stream.shared.failed.load(Ordering::Acquire) {
             let index = self.heard.as_ref().map(|h| h.index).unwrap_or(0);
             let ms = self.position_ms();
-            self.error("The output device stopped responding or was disconnected.");
+            let message = "The output device stopped responding or was disconnected.".to_string();
+            tracing::warn!("{message}");
             self.stop(index, ms);
+            self.emit(Event::DeviceLost { message });
             return;
         }
 
@@ -731,6 +1329,8 @@ impl Engine {
             changed = true;
         }
         if changed {
+            // The next track is coming out of the device now: its gain with it.
+            self.apply_gain();
             self.announce_track();
         }
 

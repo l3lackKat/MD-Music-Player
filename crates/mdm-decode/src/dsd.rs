@@ -154,7 +154,8 @@ impl DsdSource {
                             b"FS  " => sample_rate = u32::from_be_bytes(read_exact(&mut r)?),
                             b"CHNL" => channels = u16::from_be_bytes(read_exact(&mut r)?) as u32,
                             b"CMPR" => {
-                                if &read_exact::<4>(&mut r)? != b"DSD " {
+                                let compression: [u8; 4] = read_exact(&mut r)?;
+                                if &compression != b"DSD " {
                                     return Err(DecodeError::Unsupported(
                                         "DST-compressed DFF is not supported".into(),
                                     ));

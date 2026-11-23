@@ -5,6 +5,7 @@
 //! the ring; the backend thread pulls them through a [`Feeder`].
 
 mod file_sink;
+mod soft_volume;
 #[cfg(windows)]
 mod volume;
 #[cfg(windows)]
@@ -21,8 +22,12 @@ use crate::format::{FormatRequest, StreamFormat};
 use crate::Result;
 
 pub use file_sink::FileSink;
+pub use soft_volume::{taper, SoftFader, SoftVolume};
+use soft_volume::Scaler;
 #[cfg(windows)]
-pub use volume::{get_volume, set_volume, watch_volume, DeviceVolume, VolumeChange, VolumeWatch};
+pub use volume::{
+    get_volume, set_volume, watch_volume, DeviceVolume, EndpointFader, VolumeChange, VolumeWatch,
+};
 #[cfg(windows)]
 pub use wasapi::{list_devices, WasapiBackend};
 
@@ -49,6 +54,35 @@ pub enum OutputMode {
 pub trait Backend: Send {
     /// Open a stream for the request, negotiating the container with the device.
     fn open(&self, req: &FormatRequest) -> Result<Stream>;
+
+    /// A level control after the samples, used to fade around pause, resume
+    /// and exit. `None` pauses and resumes at once.
+    fn fader(&self) -> Option<Box<dyn Fader>> {
+        None
+    }
+
+    /// Streams from this backend scale PCM by a software volume. The player
+    /// then asks for room to do it cleanly (24 bits or more), marks the path
+    /// not bit-perfect, and refuses DSD, which cannot be scaled.
+    fn soft_volume(&self) -> bool {
+        false
+    }
+}
+
+/// Turns the level down and back up without touching a sample: the device's
+/// own volume for WASAPI. Calls must not block for long; they run on the
+/// player thread.
+pub trait Fader: Send {
+    /// Take the level as it is now as the full level of the fades that follow.
+    fn capture(&mut self);
+    /// Set the level to `fraction` (0 to 1) of the captured level.
+    fn set(&mut self, fraction: f32);
+    /// Wait until the changes sent so far have been applied.
+    fn sync(&mut self) {}
+    /// Hold the level `db` away from the user's own level (ReplayGain).
+    /// Fades work on top of it; `0.0` puts the user's level back. Dropping
+    /// the fader must put the user's level back too.
+    fn set_offset(&mut self, _db: f32) {}
 }
 
 /// State shared between the player and a backend thread.
@@ -98,7 +132,8 @@ impl Drop for Stream {
     }
 }
 
-/// Pulls frames out of the ring for a backend thread.
+/// Pulls frames out of the ring for a backend thread, applying the software
+/// volume when there is one.
 ///
 /// Nothing here allocates or locks, so it is safe on a real-time thread.
 pub struct Feeder {
@@ -109,6 +144,8 @@ pub struct Feeder {
     /// Audio has flowed since the stream opened or was flushed. Until then an
     /// empty ring is start-up, not an underrun.
     started: bool,
+    /// The software volume, when the backend uses one.
+    scaler: Option<Scaler>,
 }
 
 impl Feeder {
@@ -116,8 +153,16 @@ impl Feeder {
         consumer: rtrb::Consumer<u8>,
         shared: Arc<StreamShared>,
         format: StreamFormat,
+        soft: Option<Arc<SoftVolume>>,
     ) -> Self {
-        Feeder { consumer, shared, format, stamper: MarkerStamper::default(), started: false }
+        Feeder {
+            consumer,
+            shared,
+            format,
+            stamper: MarkerStamper::default(),
+            started: false,
+            scaler: soft.map(Scaler::new),
+        }
     }
 
     /// Copy as many whole frames as are ready into the front of `out` and
@@ -146,6 +191,9 @@ impl Feeder {
                 out[..a.len()].copy_from_slice(a);
                 out[a.len()..n].copy_from_slice(b);
                 chunk.commit_all();
+            }
+            if let Some(scaler) = &mut self.scaler {
+                scaler.apply(&mut out[..n], &self.format);
             }
             if self.format.dop {
                 self.stamper.stamp(&mut out[..n], &self.format);
