@@ -1624,7 +1624,7 @@
           max={durationMs ?? 0}
           step="any"
           value={shownMs}
-          style="--fill: {fill}%"
+          style="--fill: {fill / 100}"
           disabled={!durationMs || playState === "stopped"}
           aria-label="Seek"
           oninput={(e) => (scrubMs = Math.round(Number(e.currentTarget.value)))}

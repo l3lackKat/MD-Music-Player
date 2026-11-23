@@ -113,22 +113,30 @@ select option {
   color: var(--color-ink);
 }
 
-/* Seek bar: a thin track that fills up to the thumb. */
+/* Seek bar: a thin track that fills up to the thumb. `--fill` is 0..1.
+   The thumb's centre sits on the end of the fill: at 0 it is on the bar's
+   very start (half the circle sticking out) with no fill showing, at 1 on
+   its end. The thumb's own track reaches half a thumb past each end, since
+   the browser keeps the whole thumb inside it. */
 input[type="range"].seek {
+  --thumb: 12px;
   appearance: none;
   height: 4px;
   border-radius: 2px;
   background: linear-gradient(
     to right,
-    var(--color-accent) var(--fill, 0%),
-    var(--color-line) var(--fill, 0%)
+    var(--color-accent) calc(100% * var(--fill, 0)),
+    var(--color-line) calc(100% * var(--fill, 0))
   );
   cursor: pointer;
 }
+input[type="range"].seek::-webkit-slider-runnable-track {
+  margin-inline: calc(var(--thumb) / -2);
+}
 input[type="range"].seek::-webkit-slider-thumb {
   appearance: none;
-  width: 12px;
-  height: 12px;
+  width: var(--thumb);
+  height: var(--thumb);
   border-radius: 50%;
   background: var(--color-ink);
   opacity: 0;

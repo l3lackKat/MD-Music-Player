@@ -155,7 +155,7 @@
     max="1"
     step="0.01"
     value={level}
-    style="--fill: {volume?.muted ? 0 : percent}%"
+    style="--fill: {volume?.muted ? 0 : level}"
     disabled={volume === null}
     aria-label="Volume"
     oninput={(e) => onInput(Number(e.currentTarget.value))}
