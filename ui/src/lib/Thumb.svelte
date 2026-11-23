@@ -11,9 +11,11 @@
     class: className = "",
   }: { path: string; size?: "row" | "grid"; class?: string } = $props();
 
+  const src = $derived(thumbUrl(path, size));
   let failed = $state(false);
+  // A new track, or the cover setting switched: try again.
   $effect(() => {
-    void path;
+    void src;
     failed = false;
   });
 </script>
@@ -25,7 +27,7 @@
     </svg>
   {:else}
     <img
-      src={thumbUrl(path, size)}
+      {src}
       alt=""
       loading="lazy"
       decoding="async"

@@ -19,8 +19,8 @@ use mdm_engine::{
     Repeat, ReplayGain, SoftVolume, VolumeChange, VolumeWatch, WasapiBackend,
 };
 use mdm_library::{
-    AlbumSummary, ArtistDetail, ArtistSummary, Library, Lyrics, Playlist, PlaylistStore, TrackDetails,
-    TrackMeta,
+    AlbumSummary, ArtistDetail, ArtistSummary, Cover, Library, Lyrics, Playlist, PlaylistStore,
+    TrackDetails, TrackMeta,
 };
 use serde::{Deserialize, Serialize};
 use tauri::http::{header, Response, StatusCode};
@@ -138,6 +138,9 @@ struct SavedOutput {
     /// Even out loudness with ReplayGain tags, through the volume (not the samples).
     #[serde(default)]
     replay_gain: GainMode,
+    /// Look up covers on the internet for albums whose files carry none.
+    #[serde(default)]
+    web_covers: bool,
 }
 
 fn exclusive() -> OutputMode {
@@ -153,6 +156,7 @@ impl Default for SavedOutput {
             soft_volume: false,
             soft_levels: BTreeMap::new(),
             replay_gain: GainMode::Off,
+            web_covers: false,
         }
     }
 }
@@ -967,6 +971,31 @@ fn start_refresher(app: AppHandle, requests: mpsc::Receiver<()>) {
 
 // ---- Cover art -------------------------------------------------------------
 
+#[tauri::command]
+fn get_web_covers(state: State<AppState>) -> bool {
+    state.saved.lock().unwrap().web_covers
+}
+
+/// Turn covers from the internet on or off (kept in `output.json`). Only an
+/// album's title and artist are sent, and only for albums without a cover.
+#[tauri::command]
+fn set_web_covers(state: State<AppState>, enabled: bool) -> bool {
+    state.saved.lock().unwrap().web_covers = enabled;
+    state.save_output();
+    enabled
+}
+
+/// A track's full-size cover: its own, else one from the internet when
+/// `web` (the user turned them on). May wait on the network.
+fn track_cover(app: &AppHandle, track: &Path, web: bool) -> Option<Cover> {
+    mdm_library::read_cover(track)
+        .or_else(|| web.then(|| app.state::<AppState>().library.web_cover(track)).flatten())
+}
+
+fn web_covers_on(app: &AppHandle) -> bool {
+    app.state::<AppState>().saved.lock().unwrap().web_covers
+}
+
 /// Small covers are made this many pixels on their longest side: sharp at
 /// 32 CSS pixels up to 300% display scaling.
 const THUMB_PX: u32 = 96;
@@ -1002,7 +1031,9 @@ impl Slots {
 
 /// Answer `cover://<track path>` with the track's cover image, or with a
 /// small JPEG of it when the query holds `thumb` (`thumb=grid` for the
-/// larger size).
+/// larger size). A track without a cover gets one from the internet when the
+/// user turned them on and the query holds `web`: the UI adds it while the
+/// setting is on, so a picture the webview kept never outlives the setting.
 fn cover_response(app: &AppHandle, uri_path: &str, query: Option<&str>) -> Response<Vec<u8>> {
     let not_found = || {
         Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new()).expect("static response")
@@ -1015,20 +1046,22 @@ fn cover_response(app: &AppHandle, uri_path: &str, query: Option<&str>) -> Respo
     if !mdm_library::is_audio_file(track) {
         return not_found();
     }
-    let thumb = query.and_then(|q| {
-        q.split('&').find_map(|p| match p {
-            "thumb" => Some(THUMB_PX),
-            "thumb=grid" => Some(GRID_THUMB_PX),
-            _ => None,
-        })
+    let params: Vec<&str> = query.map(|q| q.split('&').collect()).unwrap_or_default();
+    let thumb = params.iter().find_map(|p| match *p {
+        "thumb" => Some(THUMB_PX),
+        "thumb=grid" => Some(GRID_THUMB_PX),
+        _ => None,
     });
+    let web = params.contains(&"web") && web_covers_on(app);
     let cover = if let Some(px) = thumb {
         let library = app.state::<AppState>().library.clone();
         THUMB_SLOTS
             .run(|| library.thumbnail(track, px))
+            // Outside the slots: waiting on the network must not hold up covers at hand.
+            .or_else(|| web.then(|| library.web_thumbnail(track, px)).flatten())
             .map(|data| ("image/jpeg".to_string(), data))
     } else {
-        mdm_library::read_cover(track).map(|c| (c.mime, c.data))
+        track_cover(app, track, web).map(|c| (c.mime, c.data))
     };
     match cover {
         Some((mime, data)) => Response::builder()
@@ -1149,7 +1182,12 @@ pub fn run() {
             let media = app.get_webview_window("main").and_then(|window| {
                 let hwnd = window.hwnd().ok()?;
                 let handle = app.handle().clone();
-                MediaControls::new(hwnd, move |button| on_media_button(&handle, button))
+                let covers = app.handle().clone();
+                MediaControls::new(
+                    hwnd,
+                    move |button| on_media_button(&handle, button),
+                    move |path| track_cover(&covers, path, web_covers_on(&covers)).map(|c| c.data),
+                )
                     .map_err(|e| tracing::warn!("no media controls: {e}"))
                     .ok()
             });
@@ -1201,6 +1239,8 @@ pub fn run() {
             set_eq,
             get_replay_gain,
             set_replay_gain,
+            get_web_covers,
+            set_web_covers,
             supported_extensions,
             play_files,
             append_files,

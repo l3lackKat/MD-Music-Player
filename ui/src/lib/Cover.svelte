@@ -22,22 +22,18 @@
     title?: string;
   } = $props();
 
-  // The path whose image failed to load, so a new track gets a fresh try.
-  let failedPath = $state<string | null>(null);
-  const show = $derived(path !== null && failedPath !== path);
+  // The URL that failed to load, so a new track (or the cover setting
+  // switched) gets a fresh try.
+  const src = $derived(path === null ? null : coverUrl(path));
+  let failedSrc = $state<string | null>(null);
+  const show = $derived(src !== null && failedSrc !== src);
 </script>
 
 <!-- The frame keeps the shadow and the round edge still; only the picture inside turns. -->
 {#snippet inside()}
   <span class="picture absolute inset-0 grid place-items-center" class:turning={disc} class:paused={!spinning}>
-    {#if show && path}
-      <img
-        src={coverUrl(path)}
-        alt=""
-        class="h-full w-full object-cover"
-        draggable="false"
-        onerror={() => (failedPath = path)}
-      />
+    {#if show && src}
+      <img {src} alt="" class="h-full w-full object-cover" draggable="false" onerror={() => (failedSrc = src)} />
     {:else}
       <svg viewBox="0 0 24 24" class="h-2/5 w-2/5" fill="none" stroke="currentColor" stroke-width="1.5">
         <circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="2.5" />

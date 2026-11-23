@@ -5,14 +5,17 @@
 //! - **Search** over title, artist, album, album artist, file and folder
 //!   name. Matching ignores case and accents ("hiep si" finds "Hiệp sĩ").
 //! - **Small covers** for track lists, made once per file and kept.
+//! - **Covers from the internet** (when the app asks), one per album, kept
+//!   with their small versions; see `web_cover`.
 //!
 //! The index only ever holds what the playlists hold: `refresh` scans them
 //! all and drops rows for anything else. Losing the database loses nothing
 //! but time; it is rebuilt from the files.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use unicode_normalization::char::is_combining_mark;
@@ -21,13 +24,18 @@ use unicode_normalization::UnicodeNormalization;
 use crate::browse::{
     album_id, artist_detail, group_albums, list_artists, AlbumSummary, ArtistDetail, ArtistSummary,
 };
-use crate::meta::{read_cover, read_meta, TrackMeta};
+use crate::meta::{read_cover, read_meta, Cover, TrackMeta};
 use crate::playlist::Playlist;
 use crate::scan::expand_paths_with;
+use crate::web_cover::{CoverQuery, CoverSource, OnlineCovers};
 use crate::Result;
 
 /// Bump when the tables change: an older database is then rebuilt.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+/// An album no source had a cover for is looked up again after this long.
+const WEB_RETRY_MISSING_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+/// An album whose lookup failed (offline, a source busy) waits this long.
+const WEB_RETRY_FAILED: Duration = Duration::from_secs(10 * 60);
 /// Search words past this many are ignored.
 const MAX_WORDS: usize = 8;
 
@@ -55,12 +63,28 @@ const SCHEMA: &str = "
         data BLOB NOT NULL,         -- JPEG; empty when the track has no cover
         PRIMARY KEY (key, px)
     ) WITHOUT ROWID;
+    CREATE TABLE web_covers (
+        album TEXT PRIMARY KEY,     -- `album_id` of its tracks
+        fetched INTEGER NOT NULL,   -- milliseconds since 1970
+        data BLOB NOT NULL          -- JPEG, PNG or WebP; empty when none was found
+    ) WITHOUT ROWID;
+    CREATE TABLE web_thumbs (
+        album TEXT NOT NULL,
+        px INTEGER NOT NULL,
+        data BLOB NOT NULL,         -- JPEG
+        PRIMARY KEY (album, px)
+    ) WITHOUT ROWID;
 ";
 
 const COLUMNS: &str = "path, title, artist, album, album_artist, track_no, disc_no, year, duration_ms";
 
 pub struct Library {
     conn: Mutex<Connection>,
+    /// Where covers from the internet come from.
+    web: Box<dyn CoverSource>,
+    /// Albums whose lookup failed, and when. Held during a lookup, so albums
+    /// are looked up one at a time and a screenful of one album's rows asks once.
+    web_failed: Mutex<HashMap<String, Instant>>,
 }
 
 /// A track read from its file, waiting to be written to the index.
@@ -82,6 +106,20 @@ fn stamp(path: &Path) -> Option<(i64, i64)> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
     Some((meta.len() as i64, mtime))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A picture from the internet as a `Cover`, its type read from the bytes.
+fn web_picture(data: Vec<u8>) -> Cover {
+    let mime = match image::guess_format(&data) {
+        Ok(image::ImageFormat::Png) => "image/png",
+        Ok(image::ImageFormat::WebP) => "image/webp",
+        _ => "image/jpeg",
+    };
+    Cover { mime: mime.into(), data }
 }
 
 /// Lower case without accents, so a search matches however it is typed.
@@ -157,11 +195,24 @@ impl Library {
     fn init(conn: Connection) -> Result<Self> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != SCHEMA_VERSION {
-            conn.execute_batch("DROP TABLE IF EXISTS tracks; DROP TABLE IF EXISTS thumbs;")?;
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS tracks; DROP TABLE IF EXISTS thumbs;
+                 DROP TABLE IF EXISTS web_covers; DROP TABLE IF EXISTS web_thumbs;",
+            )?;
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        Ok(Library { conn: Mutex::new(conn) })
+        Ok(Library {
+            conn: Mutex::new(conn),
+            web: Box::new(OnlineCovers::default()),
+            web_failed: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Take covers from `source` instead of the internet: for tests.
+    pub fn with_cover_source(mut self, source: impl CoverSource + 'static) -> Self {
+        self.web = Box::new(source);
+        self
     }
 
     /// The tags kept for `key`, if the file has not changed since.
@@ -242,7 +293,8 @@ impl Library {
     }
 
     /// Scan every playlist into the index, and drop every row (and small
-    /// cover) of a file no playlist holds any more. Returns the track count.
+    /// cover) of a file no playlist holds any more, and the covers from the
+    /// internet of albums none of them is on. Returns the track count.
     pub fn refresh(&self, playlists: &[Playlist]) -> Result<usize> {
         let mut keys = Vec::new();
         for playlist in playlists {
@@ -264,6 +316,25 @@ impl Library {
             "DELETE FROM tracks WHERE key NOT IN (SELECT key FROM keep);
              DELETE FROM thumbs WHERE key NOT IN (SELECT key FROM keep);
              DELETE FROM keep;",
+        )?;
+        let albums: Vec<String> = {
+            let mut stmt = tx.prepare(&format!("SELECT {COLUMNS} FROM tracks"))?;
+            let rows = stmt.query_map([], meta_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.iter().filter_map(album_id).collect()
+        };
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS keep_albums (album TEXT PRIMARY KEY); DELETE FROM keep_albums;",
+        )?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO keep_albums (album) VALUES (?1)")?;
+            for album in &albums {
+                stmt.execute([album])?;
+            }
+        }
+        tx.execute_batch(
+            "DELETE FROM web_covers WHERE album NOT IN (SELECT album FROM keep_albums);
+             DELETE FROM web_thumbs WHERE album NOT IN (SELECT album FROM keep_albums);
+             DELETE FROM keep_albums;",
         )?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
         tx.commit()?;
@@ -376,5 +447,82 @@ impl Library {
             }
         };
         (!data.is_empty()).then_some(data)
+    }
+
+    /// A cover from the internet for the album `path` is on. The caller
+    /// checks that the user wants one and that the track has none of its own.
+    /// Looked up once per album and kept; an album none was found for is
+    /// looked up again after `WEB_RETRY_MISSING_MS`, one whose lookup failed
+    /// after `WEB_RETRY_FAILED`. Blocks while it looks.
+    pub fn web_cover(&self, path: &Path) -> Option<Cover> {
+        let meta = self.read(path, None);
+        let album = album_id(&meta)?;
+        let query = CoverQuery::for_track(&meta)?;
+        if let Some(kept) = self.kept_web_cover(&album) {
+            return kept.map(web_picture);
+        }
+        let mut failed = self.web_failed.lock().unwrap();
+        // Another row of the album may have looked it up meanwhile.
+        if let Some(kept) = self.kept_web_cover(&album) {
+            return kept.map(web_picture);
+        }
+        if failed.get(&album).is_some_and(|at| at.elapsed() < WEB_RETRY_FAILED) {
+            return None;
+        }
+        match self.web.find(&query) {
+            Ok(found) => {
+                failed.remove(&album);
+                let conn = self.conn.lock().unwrap();
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO web_covers (album, fetched, data) VALUES (?1, ?2, ?3)",
+                    params![album, now_ms(), found.as_deref().unwrap_or_default()],
+                );
+                let _ = conn.execute("DELETE FROM web_thumbs WHERE album = ?1", [&album]);
+                found.map(web_picture)
+            }
+            Err(_) => {
+                failed.insert(album, Instant::now());
+                None
+            }
+        }
+    }
+
+    /// The kept cover from the internet: `Some(None)` when the album was
+    /// looked up lately and none was found, `None` when it is due a lookup.
+    fn kept_web_cover(&self, album: &str) -> Option<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let (fetched, data): (i64, Vec<u8>) = conn
+            .query_row("SELECT fetched, data FROM web_covers WHERE album = ?1", [album], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
+            .ok()??;
+        if !data.is_empty() {
+            return Some(Some(data));
+        }
+        (now_ms() - fetched < WEB_RETRY_MISSING_MS).then_some(None)
+    }
+
+    /// `web_cover` cut down to `px` (JPEG), made once per album and kept.
+    pub fn web_thumbnail(&self, path: &Path, px: u32) -> Option<Vec<u8>> {
+        let album = album_id(&self.read(path, None))?;
+        let kept: Option<Vec<u8>> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row("SELECT data FROM web_thumbs WHERE album = ?1 AND px = ?2", params![album, px], |r| {
+                r.get(0)
+            })
+            .optional()
+            .ok()?
+        };
+        if let Some(data) = kept {
+            return Some(data);
+        }
+        let data = make_thumbnail(&self.web_cover(path)?.data, px)?;
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO web_thumbs (album, px, data) VALUES (?1, ?2, ?3)",
+            params![album, px, data],
+        );
+        Some(data)
     }
 }

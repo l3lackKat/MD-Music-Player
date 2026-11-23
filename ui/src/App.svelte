@@ -39,6 +39,7 @@
   import Spectrum from "./lib/Spectrum.svelte";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
+  import { webCovers } from "./lib/webCovers.svelte";
   import appIcon from "./assets/app-icon.png";
 
   // ---- Player ----
@@ -113,6 +114,15 @@
   async function changeReplayGain(mode: GainMode) {
     replayGain = mode;
     await api.setReplayGain(mode).catch(showError);
+  }
+
+  async function changeWebCovers(on: boolean) {
+    // Saved before the cover URLs change, so the covers they ask for see it.
+    try {
+      webCovers.on = await api.setWebCovers(on);
+    } catch (e) {
+      showError(e);
+    }
   }
 
   // ---- Window ----
@@ -1683,6 +1693,7 @@
     {softVolumeEnabled}
     {replayGain}
     {disc}
+    webCovers={webCovers.on}
     {showPanel}
     signal={signalPath && playState !== "stopped"
       ? { bitPerfect: signalPath.bit_perfect, badge: badgeLabel, details: badgeTitle }
@@ -1695,6 +1706,7 @@
     ondisc={(on) => {
       if (on !== disc) toggleDisc();
     }}
+    onwebcovers={(on) => void changeWebCovers(on)}
     onpanel={(on) => {
       showPanel = on;
       panelAutoHidden = false;

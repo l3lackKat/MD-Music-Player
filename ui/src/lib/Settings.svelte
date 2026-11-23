@@ -4,7 +4,8 @@
 
 <script lang="ts">
   // Every setting in one place: the output device and mode, the software
-  // volume, ReplayGain, the equalizer and how the cover looks. The state lives
+  // volume, ReplayGain, the equalizer, how the cover looks and whether covers
+  // may come from the internet. The state lives
   // in App, which applies each change; this dialog only shows it and asks.
   // Closes on Escape, the close button or a click outside.
   import { onMount } from "svelte";
@@ -28,6 +29,7 @@
     replayGain,
     eq = $bindable(),
     disc,
+    webCovers,
     showPanel,
     signal,
     onrefreshdevices,
@@ -36,6 +38,7 @@
     onsoftvolume,
     onreplaygain,
     ondisc,
+    onwebcovers,
     onpanel,
     onclose,
     onerror,
@@ -53,6 +56,8 @@
     replayGain: GainMode;
     eq: EqSettings | null;
     disc: boolean;
+    /** Covers from the internet for albums without one. */
+    webCovers: boolean;
     showPanel: boolean;
     /** What the DAC receives right now, or `null` when nothing is playing. */
     signal: { bitPerfect: boolean; badge: string; details: string } | null;
@@ -62,6 +67,7 @@
     onsoftvolume: () => void;
     onreplaygain: (mode: GainMode) => void;
     ondisc: (disc: boolean) => void;
+    onwebcovers: (on: boolean) => void;
     onpanel: (show: boolean) => void;
     onclose: () => void;
     onerror: (e: unknown) => void;
@@ -358,6 +364,15 @@
                     </button>
                   {/each}
                 </div>
+              </section>
+              <section class="flex items-start gap-4 rounded-xl border border-line p-4">
+                <div class="min-w-0 flex-1">
+                  {@render section(
+                    "Covers from the internet",
+                    "For albums with no cover in their files or folder, look one up on MusicBrainz and Deezer. Only the album's title and artist are sent. Covers found are kept on this PC; your music files are never changed.",
+                  )}
+                </div>
+                <Switch checked={webCovers} label="Covers from the internet" onchange={() => onwebcovers(!webCovers)} />
               </section>
               <section class="flex items-start gap-4 rounded-xl border border-line p-4">
                 <div class="min-w-0 flex-1">

@@ -556,6 +556,76 @@ fn thumbnails_are_small_jpegs_made_once() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Answers every lookup with `answer`, counting the lookups.
+struct FakeCovers {
+    asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    answer: Result<Option<Vec<u8>>, String>,
+}
+
+impl mdm_library::CoverSource for FakeCovers {
+    fn find(&self, query: &mdm_library::CoverQuery) -> Result<Option<Vec<u8>>, String> {
+        assert_eq!(query.album, "Album");
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answer.clone()
+    }
+}
+
+fn fake_covers(answer: Result<Option<Vec<u8>>, String>) -> (Library, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let library = Library::open_in_memory().unwrap().with_cover_source(FakeCovers { asked: asked.clone(), answer });
+    (library, asked)
+}
+
+#[test]
+fn covers_from_the_internet_are_looked_up_once_per_album() {
+    let dir = temp_dir("web-covers");
+    let mut png = Vec::new();
+    image::RgbImage::from_pixel(400, 400, image::Rgb([10, 200, 90]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let one = dir.join("album/1.wav");
+    let two = dir.join("album/2.wav");
+    write_tagged(&one, Tags { title: "One", artist: "Artist", album: "Album", track: 1, lyrics: None, cover: None });
+    write_tagged(&two, Tags { title: "Two", artist: "Artist", album: "Album", track: 2, lyrics: None, cover: None });
+    let untagged = dir.join("untagged.wav");
+    write_wav(&untagged);
+
+    let (library, asked) = fake_covers(Ok(Some(png.clone())));
+    let cover = library.web_cover(&one).expect("found");
+    assert_eq!((cover.mime.as_str(), cover.data.as_slice()), ("image/png", png.as_slice()));
+    assert_eq!(library.web_cover(&two).unwrap().data, png, "the same album");
+    let thumb = library.web_thumbnail(&two, 64).expect("a small one");
+    assert_eq!(image::load_from_memory(&thumb).unwrap().width(), 64);
+    assert_eq!(library.web_thumbnail(&one, 64).unwrap(), thumb);
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "asked once for the album");
+    assert!(library.web_cover(&untagged).is_none(), "no album, nothing to ask");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Kept while a playlist holds the album; dropped with it.
+    let mut store = PlaylistStore::open(dir.join("playlists.json")).unwrap();
+    let id = store.create("P").unwrap().id;
+    let playlist = store.add_folder(id, &dir.join("album")).unwrap();
+    library.refresh(std::slice::from_ref(&playlist)).unwrap();
+    library.web_cover(&one).unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    library.refresh(&[]).unwrap();
+    library.web_cover(&one).unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "looked up again");
+
+    // None found is an answer too, and kept.
+    let (library, asked) = fake_covers(Ok(None));
+    assert!(library.web_cover(&one).is_none());
+    assert!(library.web_thumbnail(&two, 64).is_none());
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A failed lookup waits before the next try.
+    let (library, asked) = fake_covers(Err("offline".into()));
+    assert!(library.web_cover(&one).is_none());
+    assert!(library.web_cover(&two).is_none());
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn playlists_can_be_put_in_a_new_order() {
     let dir = temp_dir("reorder");

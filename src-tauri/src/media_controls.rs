@@ -43,10 +43,12 @@ pub struct MediaControls {
 
 impl MediaControls {
     /// Register `window` with the controls. `on_button` runs on a Windows
-    /// thread: keep it short.
+    /// thread: keep it short. `cover` gives a track's cover picture; it runs
+    /// on the controls' own thread and may take its time.
     pub fn new(
         window: HWND,
         on_button: impl Fn(Button) + Send + 'static,
+        cover: impl Fn(&Path) -> Option<Vec<u8>> + Send + 'static,
     ) -> windows::core::Result<Self> {
         let interop = windows::core::factory::<
             SystemMediaTransportControls,
@@ -89,7 +91,7 @@ impl MediaControls {
                             PlayState::Paused => MediaPlaybackStatus::Paused,
                             PlayState::Stopped => MediaPlaybackStatus::Stopped,
                         }),
-                        Update::Track(path) => show_track(&smtc, Path::new(&path)),
+                        Update::Track(path) => show_track(&smtc, Path::new(&path), &cover),
                     };
                     if let Err(e) = result {
                         tracing::warn!("media controls: {e}");
@@ -113,7 +115,11 @@ impl MediaControls {
     }
 }
 
-fn show_track(smtc: &SystemMediaTransportControls, path: &Path) -> windows::core::Result<()> {
+fn show_track(
+    smtc: &SystemMediaTransportControls,
+    path: &Path,
+    cover: &dyn Fn(&Path) -> Option<Vec<u8>>,
+) -> windows::core::Result<()> {
     let meta = mdm_library::read_meta(path);
     let updater = smtc.DisplayUpdater()?;
     updater.ClearAll()?;
@@ -129,14 +135,19 @@ fn show_track(smtc: &SystemMediaTransportControls, path: &Path) -> windows::core
     if let Some(album_artist) = &meta.album_artist {
         music.SetAlbumArtist(&HSTRING::from(album_artist.as_str()))?;
     }
-    if let Some(cover) = mdm_library::read_cover(path) {
+    // The words first: a cover from the internet can take a while.
+    updater.Update()?;
+    if let Some(cover) = cover(path) {
         // A bad picture still leaves the title and artist showing.
-        match picture(&cover.data) {
-            Ok(thumbnail) => updater.SetThumbnail(&thumbnail)?,
+        match picture(&cover) {
+            Ok(thumbnail) => {
+                updater.SetThumbnail(&thumbnail)?;
+                updater.Update()?;
+            }
             Err(e) => tracing::warn!("media controls: cover not shown: {e}"),
         }
     }
-    updater.Update()
+    Ok(())
 }
 
 /// An in-memory image the controls can show.

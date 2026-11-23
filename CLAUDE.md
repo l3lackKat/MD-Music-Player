@@ -13,6 +13,7 @@ cargo clippy --workspace --all-targets
 cargo build -p mdmusic           # the Tauri app; not in default-members, so plain `cargo test` skips it
 cargo run -p mdm-engine --example play -- --list          # command-line player
 cargo run -p mdm-analyze --example analyze -- <files>     # cutoff and bits in use
+cargo run -p mdm-library --example web_cover -- <files>   # what the internet lookup finds (uses the network)
 ```
 
 Run all four checks (test, clippy, `npm run check`, `cargo build -p mdmusic`) before calling a change done.
@@ -23,7 +24,7 @@ Run all four checks (test, clippy, `npm run check`, `cargo build -p mdmusic`) be
 |---|---|
 | `crates/mdm-decode` | Files to samples. PCM via symphonia, raw DSD from DSF/DFF. |
 | `crates/mdm-engine` | Player thread, format negotiation, DoP, outputs (`output/wasapi.rs`, `output/file_sink.rs`). |
-| `crates/mdm-library` | Tags (`tagged.rs` opens every file, DSD too), cover art, lyrics (`.lrc` and embedded), folder scan, playlists, the SQLite library index (`index.rs`). |
+| `crates/mdm-library` | Tags (`tagged.rs` opens every file, DSD too), cover art (`web_cover.rs` for the internet), lyrics (`.lrc` and embedded), folder scan, playlists, the SQLite library index (`index.rs`). |
 | `crates/mdm-analyze` | Spectrum analysis: a whole track's spectrogram, its cutoff and the bits in use. |
 | `src-tauri` | Tauri commands and events over the two crates above. `capabilities/default.json` lists what the UI may call. |
 | `ui` | Svelte UI. `src/lib/api.ts` is the only place that calls `invoke`. |
@@ -178,6 +179,26 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
   `Library::thumbnail`, kept in the `thumbs` table, at most `THUMB_WORKERS`
   made at once. Rows load them lazily (`Thumb.svelte`). The album and artist
   grids use `?thumb=grid` (320 px).
+- **Covers from the internet are opt-in and per album** (`web_cover.rs`,
+  `web_covers` in `output.json`, off by default). Only a track with no cover
+  of its own (embedded or folder image) asks, and only its album title and
+  artist leave the machine. MusicBrainz (`release-group` search, picture from
+  the Cover Art Archive, `front-1200` else `front-500`; at most one request a
+  second, 503 retried) comes first, then Deezer. A found album must match
+  (`CoverQuery::accepts`): same title as folded words (else without bracketed
+  parts) and the same artist or one named in its credit; an album artist like
+  "VA" means a compilation, matched on the title alone. Loose guesses are
+  worse than no cover, so do not relax this. Results are kept by `album_id`
+  in `web_covers` (empty = none found, asked again after 14 days; a failed
+  lookup waits 10 minutes, in memory) with `web_thumbs`, pruned with the
+  playlists like `thumbs`. Lookups run one at a time (`web_failed` is held),
+  outside `THUMB_SLOTS`. `cover://` serves them only when the setting is on
+  **and** the URL has `web`: `coverUrl`/`thumbUrl` add it from
+  `webCovers.on` (`webCovers.svelte.ts`, read in `main.ts` before mount), so
+  switching reloads every cover and the webview cache never outlives the
+  setting; `Cover`/`Thumb` therefore key their failed state by URL. The
+  media overlay gets them through `track_cover`. Tests use
+  `Library::with_cover_source` with a fake `CoverSource`, never the network.
 - **Selection is by track object** (`Selection` in
   `ui/src/lib/selection.svelte.ts`), so it survives moves and sorting. Track
   lists report rows (`onmenu(rows)`, `ondelete(rows)`, `onmove(rows, slot)`),

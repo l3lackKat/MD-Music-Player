@@ -117,6 +117,11 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   same folder is used. Track lists show a small copy on every row. Click the
   cover to turn it into a round record that spins while the music plays; click
   again for the square cover.
+- **Covers from the internet** (off by default, Settings → Appearance): an
+  album with no cover in its files or folder gets one from MusicBrainz (Cover
+  Art Archive) or Deezer, found by the album's title and artist. Only those
+  two are sent; the cover is kept in `library.db` and your files are never
+  changed.
 - **DSF and DFF files** show their tags, cover and lyrics like any other file
   (from their ID3 tag, or a DFF's own title and artist).
 - **Lyrics** come from a `.lrc` file with the same name as the track, or else
@@ -125,8 +130,9 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
 
 Playlists are stored in `%APPDATA%\com.mdmusic.app\playlists.json`, the
 equalizer in `eq.json` and the output device in `output.json` next to it.
-`library.db` there is an index of every playlist's tracks (tags and small
-covers), so rescans are quick; it is rebuilt from your files if deleted.
+`library.db` there is an index of every playlist's tracks (tags, small
+covers and covers from the internet), so rescans are quick; it is rebuilt
+from your files if deleted.
 
 ## Status
 

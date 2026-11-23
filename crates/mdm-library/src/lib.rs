@@ -9,6 +9,7 @@ mod meta;
 mod playlist;
 mod scan;
 mod tagged;
+mod web_cover;
 
 pub use browse::{AlbumSummary, ArtistDetail, ArtistSummary};
 pub use details::{
@@ -19,6 +20,7 @@ pub use lyrics::{parse_lyrics, read_lyrics, LyricLine, Lyrics};
 pub use meta::{read_cover, read_meta, read_replay_gain, Cover, TrackMeta};
 pub use playlist::{Playlist, PlaylistStore};
 pub use scan::{expand_paths, is_audio_file, scan_folder};
+pub use web_cover::{CoverQuery, CoverSource, OnlineCovers};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LibraryError {

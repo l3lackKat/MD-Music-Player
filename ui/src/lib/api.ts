@@ -2,6 +2,7 @@
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { webCovers } from "./webCovers.svelte";
 
 export type PlayState = "stopped" | "playing" | "paused";
 export type OutputMode = "exclusive" | "shared";
@@ -209,14 +210,21 @@ export interface Lyrics {
   lines: { time_ms: number | null; text: string }[];
 }
 
+/** A `cover://` URL with `params`, and `web` while covers from the internet are on. */
+function coverWith(path: string, params: string[]): string {
+  if (webCovers.on) params.push("web");
+  const url = convertFileSrc(path, "cover");
+  return params.length ? `${url}?${params.join("&")}` : url;
+}
+
 /** URL of a track's cover image. It answers 404 when there is none. */
 export function coverUrl(path: string): string {
-  return convertFileSrc(path, "cover");
+  return coverWith(path, []);
 }
 
 /** URL of a track's small cover (JPEG, 96 px), made once and kept in the library index. 404 when there is none. */
 export function thumbUrl(path: string, size: "row" | "grid" = "row"): string {
-  return `${coverUrl(path)}?thumb${size === "grid" ? "=grid" : ""}`;
+  return coverWith(path, [size === "grid" ? "thumb=grid" : "thumb"]);
 }
 
 /** A whole track's spectrogram and plain measurements (`mdm_analyze::Spectrum`). */
@@ -261,6 +269,9 @@ export const api = {
   getEq: () => invoke<EqSettings>("get_eq"),
   getReplayGain: () => invoke<GainMode>("get_replay_gain"),
   setReplayGain: (mode: GainMode) => invoke<GainMode>("set_replay_gain", { mode }),
+  /** Covers from the internet for albums without one (sends only album title and artist). */
+  getWebCovers: () => invoke<boolean>("get_web_covers"),
+  setWebCovers: (enabled: boolean) => invoke<boolean>("set_web_covers", { enabled }),
   /** Apply and save. Returns the settings as applied (values clamped into range). */
   setEq: (settings: EqSettings) => invoke<EqSettings>("set_eq", { settings }),
   playlists: () => invoke<Playlist[]>("playlists"),
