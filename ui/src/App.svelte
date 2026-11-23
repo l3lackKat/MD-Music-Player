@@ -37,6 +37,7 @@
   import Spinner from "./lib/Spinner.svelte";
   import TrackInfo from "./lib/TrackInfo.svelte";
   import Spectrum from "./lib/Spectrum.svelte";
+  import { saveTheme, savedTheme, type ThemeId } from "./lib/theme";
   import TrackTable from "./lib/TrackTable.svelte";
   import VolumeControl from "./lib/VolumeControl.svelte";
   import { webCovers } from "./lib/webCovers.svelte";
@@ -138,6 +139,7 @@
   let spectrumTrack = $state<TrackMeta | null>(null);
   let dragging = $state(false);
   let showPanel = $state(true);
+  let theme = $state<ThemeId>(savedTheme());
   /** Below this width the track list and the cover panel do not both fit (a 1080p
    *  screen split in half is 960 px), so the panel steps aside. */
   const NARROW_WIDTH = 1100;
@@ -1694,6 +1696,7 @@
     {replayGain}
     {disc}
     webCovers={webCovers.on}
+    {theme}
     {showPanel}
     signal={signalPath && playState !== "stopped"
       ? { bitPerfect: signalPath.bit_perfect, badge: badgeLabel, details: badgeTitle }
@@ -1707,6 +1710,10 @@
       if (on !== disc) toggleDisc();
     }}
     onwebcovers={(on) => void changeWebCovers(on)}
+    ontheme={(id) => {
+      theme = id;
+      saveTheme(id);
+    }}
     onpanel={(on) => {
       showPanel = on;
       panelAutoHidden = false;

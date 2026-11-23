@@ -269,8 +269,18 @@ a typed wrapper in `ui/src/lib/api.ts`, then the component.
 
 - Tailwind theme colours are named `base`, `panel`, `raised`, `line`, `ink`,
   `muted`, `accent`, `good`, `warn`, `bad` (`ui/src/app.css`). So **`text-base`
-  is the dark background colour here, not a font size**. Use `text-[15px]` or
-  `text-sm`/`text-lg` for size; `text-base` is only for dark text on a light button.
+  is the background colour here, not a font size**. Use `text-[15px]` or
+  `text-sm`/`text-lg` for size; `text-base` is only for text on an accent or
+  ink button.
+- **Themes** (`ui/src/lib/theme.ts`) set every one of those colours under
+  `[data-theme=…]` in `app.css`, Midnight too; a new colour needs a value in
+  every block, since a Settings preview puts `data-theme` on an element inside
+  another theme. Do not hardcode UI colours (black shadows, scrims and the
+  spectrum canvas are fine). The Light theme swaps base and ink, so its accent
+  is dark enough for `text-base` on it. The choice is in localStorage
+  (`theme`), applied in `main.ts` before mount, also to the native title bar
+  and window background (`setTheme`, `setBackgroundColor`); the other window
+  follows through the `storage` event.
 - `wasapi` 0.27 and `symphonia` 0.6 differ from older examples online. Read the
   crate source under `~/.cargo/registry/src` instead of guessing.
 - In lofty, ID3v2 lyrics (USLT) are `ItemKey::UnsyncLyrics`; Vorbis and MP4

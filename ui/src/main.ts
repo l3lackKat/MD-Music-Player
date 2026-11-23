@@ -4,7 +4,10 @@ import "./app.css";
 import App from "./App.svelte";
 import MiniPlayer from "./lib/MiniPlayer.svelte";
 import { api } from "./lib/api";
+import { startTheme } from "./lib/theme";
 import { webCovers } from "./lib/webCovers.svelte";
+
+startTheme();
 
 // Both windows load this page: the mini player's window gets the mini player.
 // The cover setting is read first, so the first covers asked for carry it.

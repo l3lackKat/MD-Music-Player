@@ -14,6 +14,73 @@
   --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
 }
 
+/* Themes (`lib/theme.ts`), set on <html> or on any element, so a preview in
+   Settings shows a theme inside another one. Each sets every colour, Midnight
+   too (the @theme above is what shows before the script runs). In the light
+   theme the accent is dark enough for light text (`text-base`) on it. */
+:root {
+  color-scheme: dark;
+}
+[data-theme="midnight"],
+[data-theme="black"],
+[data-theme="ocean"],
+[data-theme="ember"] {
+  color-scheme: dark;
+  --color-good: #6ee7b7;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+}
+[data-theme="midnight"] {
+  --color-base: #0d0e12;
+  --color-panel: #15171c;
+  --color-raised: #1d2027;
+  --color-line: #2a2e37;
+  --color-ink: #eceef2;
+  --color-muted: #8b919e;
+  --color-accent: #a78bfa;
+}
+[data-theme="black"] {
+  --color-base: #000000;
+  --color-panel: #0a0a0c;
+  --color-raised: #17171a;
+  --color-line: #26262b;
+  --color-ink: #ededf0;
+  --color-muted: #8c8c96;
+  --color-accent: #f472b6;
+}
+[data-theme="ocean"] {
+  --color-base: #0a111d;
+  --color-panel: #0f1828;
+  --color-raised: #162236;
+  --color-line: #233249;
+  --color-ink: #e6edf7;
+  --color-muted: #8797ad;
+  --color-accent: #38bdf8;
+}
+[data-theme="ember"] {
+  --color-base: #13100d;
+  --color-panel: #1a1612;
+  --color-raised: #241e19;
+  --color-line: #362d25;
+  --color-ink: #f1ebe3;
+  --color-muted: #a39584;
+  --color-accent: #fb923c;
+  --color-warn: #facc15;
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --color-base: #f3f4f7;
+  --color-panel: #fbfbfd;
+  --color-raised: #e8eaef;
+  --color-line: #d6d9e0;
+  --color-ink: #16181d;
+  --color-muted: #5c6270;
+  --color-accent: #6d3fe0;
+  --color-good: #047857;
+  --color-warn: #b45309;
+  --color-bad: #c81e1e;
+}
+
 html,
 body,
 #app {

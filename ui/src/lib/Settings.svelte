@@ -16,6 +16,7 @@
   import EqPanel from "./EqPanel.svelte";
   import Icon, { type IconName } from "./Icon.svelte";
   import Switch from "./Switch.svelte";
+  import { THEMES, type ThemeId } from "./theme";
 
   let {
     tab = $bindable(),
@@ -30,6 +31,7 @@
     eq = $bindable(),
     disc,
     webCovers,
+    theme,
     showPanel,
     signal,
     onrefreshdevices,
@@ -39,6 +41,7 @@
     onreplaygain,
     ondisc,
     onwebcovers,
+    ontheme,
     onpanel,
     onclose,
     onerror,
@@ -58,6 +61,7 @@
     disc: boolean;
     /** Covers from the internet for albums without one. */
     webCovers: boolean;
+    theme: ThemeId;
     showPanel: boolean;
     /** What the DAC receives right now, or `null` when nothing is playing. */
     signal: { bitPerfect: boolean; badge: string; details: string } | null;
@@ -68,6 +72,7 @@
     onreplaygain: (mode: GainMode) => void;
     ondisc: (disc: boolean) => void;
     onwebcovers: (on: boolean) => void;
+    ontheme: (theme: ThemeId) => void;
     onpanel: (show: boolean) => void;
     onclose: () => void;
     onerror: (e: unknown) => void;
@@ -339,6 +344,50 @@
             {/if}
           {:else if tab === "appearance"}
             <div class="space-y-7">
+              <section>
+                {@render section("Theme", "The colours of the whole app, the mini player too.")}
+                <div class="mt-3 grid grid-cols-3 gap-3" role="radiogroup" aria-label="Theme">
+                  {#each THEMES as item (item.id)}
+                    <button
+                      role="radio"
+                      aria-checked={theme === item.id}
+                      class="flex flex-col gap-2.5 rounded-xl border p-2.5 text-left transition-colors duration-150 {theme ===
+                      item.id
+                        ? 'border-accent/60 bg-accent/10'
+                        : 'border-line hover:border-muted/40 hover:bg-raised/60'}"
+                      onclick={() => ontheme(item.id)}
+                    >
+                      <!-- A small app in the theme's own colours. -->
+                      <span
+                        data-theme={item.id}
+                        class="flex aspect-[16/10] w-full overflow-hidden rounded-lg border border-line bg-base"
+                        aria-hidden="true"
+                      >
+                        <span class="flex w-1/4 flex-col gap-1.5 bg-panel p-1.5">
+                          <span class="h-1 w-3/4 rounded-full bg-accent"></span>
+                          <span class="h-1 w-full rounded-full bg-muted/40"></span>
+                          <span class="h-1 w-2/3 rounded-full bg-muted/40"></span>
+                        </span>
+                        <span class="flex min-w-0 flex-1 flex-col gap-1.5 p-2">
+                          <span class="h-1.5 w-1/2 rounded-full bg-ink/85"></span>
+                          <span class="h-1 w-3/4 rounded-full bg-muted/50"></span>
+                          <span class="h-1 w-2/3 rounded-full bg-muted/50"></span>
+                          <span class="mt-auto flex items-center gap-1.5 rounded-md bg-raised p-1">
+                            <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-ink"></span>
+                            <span class="h-1 flex-1 rounded-full bg-line">
+                              <span class="block h-full w-2/5 rounded-full bg-accent"></span>
+                            </span>
+                          </span>
+                        </span>
+                      </span>
+                      <span class="px-0.5">
+                        <span class="block text-sm font-medium">{item.name}</span>
+                        <span class="block text-xs text-muted">{item.text}</span>
+                      </span>
+                    </button>
+                  {/each}
+                </div>
+              </section>
               <section>
                 {@render section("Cover style", "You can also click any cover to switch.")}
                 <div class="mt-3 grid grid-cols-2 gap-3" role="radiogroup" aria-label="Cover style">

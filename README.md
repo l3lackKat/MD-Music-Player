@@ -122,6 +122,8 @@ file ─► mdm-decode ─► pack / DoP ─► lock-free ring ─► render thr
   Art Archive) or Deezer, found by the album's title and artist. Only those
   two are sent; the cover is kept in `library.db` and your files are never
   changed.
+- **Themes**: Midnight, Black (for OLED screens), Ocean, Ember and Light, in
+  Settings → Appearance. The mini player and the title bar follow.
 - **DSF and DFF files** show their tags, cover and lyrics like any other file
   (from their ID3 tag, or a DFF's own title and artist).
 - **Lyrics** come from a `.lrc` file with the same name as the track, or else
@@ -145,7 +147,7 @@ replugged, media keys and the Windows media overlay, the device's volume
 equalizer, DSD over DoP with tags, a signal-path
 badge, playlists of folders and tracks (in your own order), sorting a playlist
 by column, a track menu, tags, cover art (square, as a spinning record, and
-small in every list) and lyrics.
+small in every list), lyrics and colour themes.
 
 Not built yet: browsing by artist or album, editing tags, a tray icon, and an
 ASIO output for native DSD (DSD plays over DoP, which needs no special driver).
