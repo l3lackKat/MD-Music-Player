@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "mdm-analyze"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hound",
  "mdm-decode",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "mdm-decode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hound",
  "serde",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "mdm-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "hound",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "mdm-library"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "lofty",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "mdmusic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "mdm-analyze",
