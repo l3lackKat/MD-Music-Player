@@ -72,6 +72,41 @@
     dragLevel = null;
   }
 
+  // The mouse wheel over the control moves the level like the slider:
+  // WHEEL_STEP (1%) per notch. Deltas are added
+  // up, so a touchpad's small ones still step. While the wheel turns it holds
+  // the level like a drag, then lets go after WHEEL_IDLE_MS.
+  const WHEEL_STEP = 0.01;
+  const NOTCH_PX = 100;
+  const WHEEL_IDLE_MS = 400;
+  let wheelDelta = 0;
+  let wheelIdle: ReturnType<typeof setTimeout> | undefined;
+
+  function wheel(node: HTMLElement) {
+    const onWheel = (e: WheelEvent) => {
+      if (volume === null || e.deltaY === 0) return;
+      // Not passive, so the page behind does not scroll as well.
+      e.preventDefault();
+      wheelDelta += e.deltaMode === WheelEvent.DOM_DELTA_LINE ? e.deltaY * 33 : e.deltaY;
+      const notches = Math.round(wheelDelta / NOTCH_PX);
+      if (notches === 0) return;
+      wheelDelta -= notches * NOTCH_PX;
+      // Scrolling up (negative delta) turns it up.
+      const next = Math.round(Math.min(1, Math.max(0, level - notches * WHEEL_STEP)) * 100) / 100;
+      clearTimeout(wheelIdle);
+      wheelIdle = setTimeout(() => {
+        wheelDelta = 0;
+        if (dragLevel !== null) onRelease(dragLevel);
+      }, WHEEL_IDLE_MS);
+      if (next !== level) onInput(next);
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      node.removeEventListener("wheel", onWheel);
+      clearTimeout(wheelIdle);
+    };
+  }
+
   async function toggleMute() {
     if (!volume) return;
     try {
@@ -92,7 +127,7 @@
   );
 </script>
 
-<div class="flex shrink-0 items-center gap-1.5" {title}>
+<div class="flex shrink-0 items-center gap-1.5" {title} {@attach wheel}>
   <button
     class="relative grid h-8 w-8 place-items-center rounded-lg hover:bg-raised disabled:opacity-40 {volume?.muted
       ? 'text-bad'
